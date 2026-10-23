@@ -1,0 +1,10 @@
+[package]
+name = "prism-fx"
+description = "Audio effects written once, for MultiGrainLive and idMLab."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies, on purpose. Both hosts build this crate: one natively, one
+# for wasm32 in an AudioWorklet, and neither takes outside crates.
+[dependencies]
