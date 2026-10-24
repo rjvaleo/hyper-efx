@@ -49,6 +49,15 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::sh_bubbler::DESCRIPTOR, make: boxed::<effects::ShBubbler> },
     Entry { descriptor: &effects::sh_chebyshev::DESCRIPTOR, make: boxed::<effects::ShChebyshev> },
     Entry { descriptor: &effects::sh_compand::DESCRIPTOR, make: boxed::<effects::ShCompand> },
+    Entry { descriptor: &effects::hp_pan::DESCRIPTOR, make: boxed::<effects::HpPan> },
+    Entry { descriptor: &effects::hp_auto_pan::DESCRIPTOR, make: boxed::<effects::HpAutoPan> },
+    Entry { descriptor: &effects::hp_stereo_dynamics::DESCRIPTOR, make: boxed::<effects::HpStereoDynamics> },
+    Entry { descriptor: &effects::hp_quasi_stereo::DESCRIPTOR, make: boxed::<effects::HpQuasiStereo> },
+    Entry { descriptor: &effects::hp_ms_matrix::DESCRIPTOR, make: boxed::<effects::HpMsMatrix> },
+    Entry { descriptor: &effects::hp_hyper_stereo::DESCRIPTOR, make: boxed::<effects::HpHyperStereo> },
+    Entry { descriptor: &effects::hp_noise_gate::DESCRIPTOR, make: boxed::<effects::HpNoiseGate> },
+    Entry { descriptor: &effects::hp_compressor::DESCRIPTOR, make: boxed::<effects::HpCompressor> },
+    Entry { descriptor: &effects::hp_sonic_decimator::DESCRIPTOR, make: boxed::<effects::HpSonicDecimator> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {
