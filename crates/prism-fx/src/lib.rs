@@ -49,6 +49,10 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::sh_bubbler::DESCRIPTOR, make: boxed::<effects::ShBubbler> },
     Entry { descriptor: &effects::sh_chebyshev::DESCRIPTOR, make: boxed::<effects::ShChebyshev> },
     Entry { descriptor: &effects::sh_compand::DESCRIPTOR, make: boxed::<effects::ShCompand> },
+    Entry { descriptor: &effects::lxp_chamber::DESCRIPTOR, make: boxed::<effects::LxpChamber> },
+    Entry { descriptor: &effects::lxp_hall::DESCRIPTOR, make: boxed::<effects::LxpHall> },
+    Entry { descriptor: &effects::lxp_plate::DESCRIPTOR, make: boxed::<effects::LxpPlate> },
+    Entry { descriptor: &effects::lxp_room::DESCRIPTOR, make: boxed::<effects::LxpRoom> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {

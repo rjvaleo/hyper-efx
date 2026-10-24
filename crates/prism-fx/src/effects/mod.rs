@@ -34,3 +34,14 @@ pub use sh_pitchdelay::ShPitchDelay;
 pub use spectral_dynamics::SpectralDynamics;
 pub use stereo_matrix::StereoMatrix;
 pub use tremolo::Tremolo;
+
+// Lexicon LXP Native Reverb, on prism-fx's own engine.
+pub mod lxp;
+pub mod lxp_chamber;
+pub mod lxp_hall;
+pub mod lxp_plate;
+pub mod lxp_room;
+pub use lxp_chamber::LxpChamber;
+pub use lxp_hall::LxpHall;
+pub use lxp_plate::LxpPlate;
+pub use lxp_room::LxpRoom;
