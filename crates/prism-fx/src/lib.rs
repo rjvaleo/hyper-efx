@@ -49,6 +49,14 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::sh_bubbler::DESCRIPTOR, make: boxed::<effects::ShBubbler> },
     Entry { descriptor: &effects::sh_chebyshev::DESCRIPTOR, make: boxed::<effects::ShChebyshev> },
     Entry { descriptor: &effects::sh_compand::DESCRIPTOR, make: boxed::<effects::ShCompand> },
+    Entry { descriptor: &effects::hp_chorus::DESCRIPTOR, make: boxed::<effects::HpChorus> },
+    Entry { descriptor: &effects::hp_flanger::DESCRIPTOR, make: boxed::<effects::HpFlanger> },
+    Entry { descriptor: &effects::hp_ring_modulator::DESCRIPTOR, make: boxed::<effects::HpRingModulator> },
+    Entry { descriptor: &effects::hp_vibrato::DESCRIPTOR, make: boxed::<effects::HpVibrato> },
+    Entry { descriptor: &effects::hp_tremolo::DESCRIPTOR, make: boxed::<effects::HpTremolo> },
+    Entry { descriptor: &effects::hp_frequency_modulator::DESCRIPTOR, make: boxed::<effects::HpFrequencyModulator> },
+    Entry { descriptor: &effects::hp_phaser::DESCRIPTOR, make: boxed::<effects::HpPhaser> },
+    Entry { descriptor: &effects::hp_pitch_shifter::DESCRIPTOR, make: boxed::<effects::HpPitchShifter> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {
