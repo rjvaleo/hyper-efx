@@ -56,6 +56,12 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::hp_more_stereo::DESCRIPTOR, make: boxed::<effects::HpMoreStereo> },
     Entry { descriptor: &effects::hp_medium_room::DESCRIPTOR, make: boxed::<effects::HpMediumRoom> },
     Entry { descriptor: &effects::hp_hall::DESCRIPTOR, make: boxed::<effects::HpHall> },
+    Entry { descriptor: &effects::hp_single_delay::DESCRIPTOR, make: boxed::<effects::HpSingleDelay> },
+    Entry { descriptor: &effects::hp_echo::DESCRIPTOR, make: boxed::<effects::HpEcho> },
+    Entry { descriptor: &effects::hp_echotranz::DESCRIPTOR, make: boxed::<effects::HpEchoTranz> },
+    Entry { descriptor: &effects::hp_multi_delay::DESCRIPTOR, make: boxed::<effects::HpMultiDelay> },
+    Entry { descriptor: &effects::hp_comb_filter::DESCRIPTOR, make: boxed::<effects::HpCombFilter> },
+    Entry { descriptor: &effects::hp_doppler::DESCRIPTOR, make: boxed::<effects::HpDoppler> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {
