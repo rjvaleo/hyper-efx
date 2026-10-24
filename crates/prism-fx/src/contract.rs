@@ -208,7 +208,7 @@ pub fn block_size_does_not_matter(make: Make) -> Result<(), String> {
 /// every switch on and the rest at their defaults: a granulator's tuning
 /// waits for keys other than the root to be held.
 /// A glide time acts only on a move, so it is
-/// tried while the control it glides moves halfway through; a control that
+/// tried while the control it glides moves half a second in; a control that
 /// applies only in one setting of another is tried in that setting. A
 /// control is deaf only if it changes nothing from any of these.
 ///
@@ -216,12 +216,15 @@ pub fn block_size_does_not_matter(make: Make) -> Result<(), String> {
 /// that stores a value and applies it only when some other control next moves
 /// would look like a glide, and it is a fault.
 ///
-/// It listens for a second, long enough for an echo's default repeats.
+/// It listens for two seconds, long enough for an echo's default repeats:
+/// Hyperprism's delays start at a second, so their first fed-back repeat
+/// lands two seconds in at the defaults, and one second in at a quarter of
+/// the delay's travel.
 ///
 /// Parameters are set after `new` and never reset, so a kernel that stores a
 /// value and forgets to act on it is caught.
 pub fn every_control_reaches_the_output(make: Make) -> Result<(), String> {
-    let frames = SAMPLE_RATE as usize;
+    let frames = 2 * SAMPLE_RATE as usize;
     let input = signal(frames, 3);
     let params = make().descriptor().params;
     let far = |spec: &ParamSpec| if spec.to_unit(spec.default) < 0.5 { spec.max } else { spec.min };
@@ -229,7 +232,7 @@ pub fn every_control_reaches_the_output(make: Make) -> Result<(), String> {
     let render_with = |start: &[(usize, f32)], halfway: &[(usize, f32)]| {
         let mut k = make();
         let (mut left, mut right) = (input.0.clone(), input.1.clone());
-        let half = frames / 2;
+        let half = SAMPLE_RATE as usize / 2;
         for (part, settings) in [(0..half, start), (half..frames, halfway)] {
             for &(i, v) in settings {
                 k.set_param(i, v);
