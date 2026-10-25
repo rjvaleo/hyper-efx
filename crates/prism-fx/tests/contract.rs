@@ -478,3 +478,86 @@ fn a_kernel_whose_descriptor_does_not_match_its_entry_is_caught() {
     let wrong = [Entry { descriptor: &OTHER, make }];
     assert!(!contract::check_catalog(&wrong).is_empty());
 }
+
+// ---- inert controls: kept for documents, held to doing nothing -----------------
+
+static SPARE_PARAMS: &[ParamSpec] = &[
+    ParamSpec::new("gainDb", "Gain", -24.0, 24.0, 0.0).unit("dB"),
+    ParamSpec::new("pan", "Pan", -1.0, 1.0, 0.0),
+    ParamSpec::new("spare", "Spare", 0.0, 1.0, 0.0).inert(),
+];
+
+static SPARE: Descriptor = Descriptor {
+    id: "test-spare",
+    params: SPARE_PARAMS,
+    panel: Panel {
+        groups: &[Group { label: "Level", keys: &["gainDb", "pan"] }],
+        primary: &["gainDb"],
+        displays: &[],
+        pad: None,
+    },
+    ..GAIN
+};
+
+/// The gain, with a third control it stores and never reads.
+struct Spare(Gain, f32);
+impl Kernel for Spare {
+    fn new(sr: f32) -> Self { Spare(Gain::new(sr), 0.0) }
+    fn descriptor() -> &'static Descriptor { &SPARE }
+    fn set_param(&mut self, i: usize, v: f32) {
+        if i == 2 { self.1 = SPARE_PARAMS[2].clamp(v) } else { self.0.set_param(i, v) }
+    }
+    fn param(&self, i: usize) -> f32 { if i == 2 { self.1 } else { self.0.param(i) } }
+    fn reset(&mut self) { self.0.reset() }
+    fn tick(&mut self, f: &mut [f32; 2]) { self.0.tick(f) }
+}
+
+#[test]
+fn an_inert_control_that_does_nothing_passes() {
+    let make = || -> Boxed { Box::new(Spare::new(contract::SAMPLE_RATE)) };
+    assert_eq!(contract::check_descriptor(&SPARE), Vec::<String>::new());
+    assert_eq!(contract::every_control_reaches_the_output(&make), Ok(()));
+}
+
+/// Marks its pan inert, and pans anyway.
+static LYING_PARAMS: &[ParamSpec] = &[
+    ParamSpec::new("gainDb", "Gain", -24.0, 24.0, 0.0).unit("dB"),
+    ParamSpec::new("pan", "Pan", -1.0, 1.0, 0.0).inert(),
+];
+static LYING: Descriptor = Descriptor {
+    id: "test-lying",
+    params: LYING_PARAMS,
+    panel: Panel { groups: &[], primary: &["gainDb"], displays: &[], pad: None },
+    ..GAIN
+};
+struct Lying(Gain);
+impl Kernel for Lying {
+    fn new(sr: f32) -> Self { Lying(Gain::new(sr)) }
+    fn descriptor() -> &'static Descriptor { &LYING }
+    fn set_param(&mut self, i: usize, v: f32) { self.0.set_param(i, v) }
+    fn param(&self, i: usize) -> f32 { self.0.param(i) }
+    fn reset(&mut self) { self.0.reset() }
+    fn tick(&mut self, f: &mut [f32; 2]) { self.0.tick(f) }
+}
+
+#[test]
+fn an_inert_control_that_changes_the_output_is_caught() {
+    let make = || -> Boxed { Box::new(Lying::new(contract::SAMPLE_RATE)) };
+    let err = contract::every_control_reaches_the_output(&make).unwrap_err();
+    assert!(err.contains("inert") && err.contains("pan"), "{err}");
+}
+
+#[test]
+fn an_inert_control_on_the_panel_is_caught() {
+    static ON_PANEL: Descriptor = Descriptor {
+        panel: Panel {
+            groups: &[Group { label: "Level", keys: &["gainDb", "pan", "spare"] }],
+            primary: &["gainDb"],
+            displays: &[],
+            pad: None,
+        },
+        ..SPARE
+    };
+    let errors = contract::check_descriptor(&ON_PANEL);
+    assert!(errors.iter().any(|e| e.contains("inert")), "{errors:?}");
+}

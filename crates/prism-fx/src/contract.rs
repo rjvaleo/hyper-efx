@@ -87,11 +87,19 @@ pub fn check_descriptor(d: &Descriptor) -> Vec<String> {
         }
     }
     if !d.panel.groups.is_empty() {
-        for p in d.params {
+        for p in d.params.iter().filter(|p| !p.inert) {
             let n = d.panel.groups.iter().flat_map(|g| g.keys.iter()).filter(|k| **k == p.key).count();
             if n != 1 {
                 errors.push(format!("{id}.{}: appears in {n} panel groups, not one", p.key));
             }
+        }
+    }
+    // An inert control is kept for documents, not for people: it stays off the panel.
+    for p in d.params.iter().filter(|p| p.inert) {
+        let grouped = d.panel.groups.iter().any(|g| g.keys.contains(&p.key));
+        let pad = d.panel.pad.is_some_and(|pad| pad.x == p.key || pad.y == p.key);
+        if grouped || d.panel.primary.contains(&p.key) || pad {
+            errors.push(format!("{id}.{}: is inert but on the panel", p.key));
         }
     }
     for key in d.panel.primary {
@@ -210,7 +218,9 @@ pub fn block_size_does_not_matter(make: Make) -> Result<(), String> {
 /// A glide time acts only on a move, so it is
 /// tried while the control it glides moves half a second in; a control that
 /// applies only in one setting of another is tried in that setting. A
-/// control is deaf only if it changes nothing from any of these.
+/// control is deaf only if it changes nothing from any of these. A control
+/// marked inert is held to the opposite: it must change nothing from all of
+/// them.
 ///
 /// The move is only ever the glided control's, never a general one: a kernel
 /// that stores a value and applies it only when some other control next moves
@@ -244,6 +254,7 @@ pub fn every_control_reaches_the_output(make: Make) -> Result<(), String> {
         (left, right)
     };
     let mut deaf = Vec::new();
+    let mut audible = Vec::new();
     for (i, spec) in params.iter().enumerate() {
         let voiced: Vec<(usize, f32)> =
             params.iter().enumerate().filter(|&(j, _)| j != i).map(|(j, s)| (j, far(s))).collect();
@@ -273,14 +284,23 @@ pub fn every_control_reaches_the_output(make: Make) -> Result<(), String> {
                 first_difference(&reference, &render_with(&start, halfway), 1e-6).is_some()
             })
         });
-        if !moved {
+        if spec.inert && moved {
+            audible.push(spec.key);
+        } else if !spec.inert && !moved {
             deaf.push(spec.key);
         }
     }
-    if deaf.is_empty() {
+    let mut errors = Vec::new();
+    if !deaf.is_empty() {
+        errors.push(format!("{}: controls that change nothing: {}", id(make), deaf.join(", ")));
+    }
+    if !audible.is_empty() {
+        errors.push(format!("{}: controls marked inert that change the output: {}", id(make), audible.join(", ")));
+    }
+    if errors.is_empty() {
         Ok(())
     } else {
-        Err(format!("{}: controls that change nothing: {}", id(make), deaf.join(", ")))
+        Err(errors.join("; "))
     }
 }
 
