@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/prism-fx"]
+members = ["crates/prism-fx", "crates/prism-grain"]
 resolver = "2"
 
 [workspace.package]

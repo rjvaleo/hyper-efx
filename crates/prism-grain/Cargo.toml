@@ -1,0 +1,10 @@
+[package]
+name = "prism-grain"
+description = "MultiGrainLive's sound engine — granular, WSOLA, phase vocoder, PVSOLA and hybrid streamers, the stretcher and the block renderer — shared with idMLab."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# No dependencies, as prism-fx: it builds for wasm32 for idMLab as it is.
+[dependencies]
