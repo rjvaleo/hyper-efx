@@ -83,6 +83,11 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::hp_noise_gate::DESCRIPTOR, make: boxed::<effects::HpNoiseGate> },
     Entry { descriptor: &effects::hp_compressor::DESCRIPTOR, make: boxed::<effects::HpCompressor> },
     Entry { descriptor: &effects::hp_sonic_decimator::DESCRIPTOR, make: boxed::<effects::HpSonicDecimator> },
+    Entry { descriptor: &effects::schroeder_reverb::DESCRIPTOR, make: boxed::<effects::SchroederReverb> },
+    Entry { descriptor: &effects::moorer_reverb::DESCRIPTOR, make: boxed::<effects::MoorerReverb> },
+    Entry { descriptor: &effects::phaser::DESCRIPTOR, make: boxed::<effects::Phaser> },
+    Entry { descriptor: &effects::eq::DESCRIPTOR, make: boxed::<effects::Eq> },
+    Entry { descriptor: &effects::compressor::DESCRIPTOR, make: boxed::<effects::Compressor> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {
