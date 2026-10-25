@@ -1,0 +1,4 @@
+input ed4eb6aea2682b0f
+defaults d52f2bb35587293a
+bright-slow 28c2518e9c270a38
+off-then-on 9cc2e36db56281db
