@@ -46,6 +46,11 @@ pub struct ParamSpec {
     /// a gate's reduction, when the type is Gate: that control and value.
     /// Hosts may dim it otherwise, as SoundHack swapped its labels.
     pub when: Option<(&'static str, f32)>,
+    /// Kept only so the documents that store it still open: the original
+    /// effect had this control and it did nothing. Hosts hide it, panels leave
+    /// it out, and the contract holds it to changing nothing rather than to
+    /// reaching the output.
+    pub inert: bool,
 }
 
 impl ParamSpec {
@@ -62,6 +67,7 @@ impl ParamSpec {
             smooth_ms: 5.0,
             glides: None,
             when: None,
+            inert: false,
         }
     }
 
@@ -94,6 +100,12 @@ impl ParamSpec {
     /// Mark this as the glide time for moves of `key`.
     pub const fn glides(mut self, key: &'static str) -> Self {
         self.glides = Some(key);
+        self
+    }
+
+    /// Mark this as a control the original had and never read.
+    pub const fn inert(mut self) -> Self {
+        self.inert = true;
         self
     }
 
