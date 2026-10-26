@@ -83,6 +83,18 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::hp_noise_gate::DESCRIPTOR, make: boxed::<effects::HpNoiseGate> },
     Entry { descriptor: &effects::hp_compressor::DESCRIPTOR, make: boxed::<effects::HpCompressor> },
     Entry { descriptor: &effects::hp_sonic_decimator::DESCRIPTOR, make: boxed::<effects::HpSonicDecimator> },
+    Entry { descriptor: &effects::invert::DESCRIPTOR, make: boxed::<effects::Invert> },
+    Entry { descriptor: &effects::swap::DESCRIPTOR, make: boxed::<effects::Swap> },
+    Entry { descriptor: &effects::width::DESCRIPTOR, make: boxed::<effects::Width> },
+    Entry { descriptor: &effects::dc::DESCRIPTOR, make: boxed::<effects::Dc> },
+    Entry { descriptor: &effects::ring::DESCRIPTOR, make: boxed::<effects::Ring> },
+    Entry { descriptor: &effects::rappify::DESCRIPTOR, make: boxed::<effects::Rappify> },
+    Entry { descriptor: &effects::boomerang::DESCRIPTOR, make: boxed::<effects::Boomerang> },
+    Entry { descriptor: &effects::fit::DESCRIPTOR, make: boxed::<effects::Fit> },
+    Entry { descriptor: &effects::gate::DESCRIPTOR, make: boxed::<effects::Gate> },
+    Entry { descriptor: &effects::utility::DESCRIPTOR, make: boxed::<effects::Utility> },
+    Entry { descriptor: &effects::maximizer::DESCRIPTOR, make: boxed::<effects::Maximizer> },
+    Entry { descriptor: &effects::gain::DESCRIPTOR, make: boxed::<effects::Gain> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {

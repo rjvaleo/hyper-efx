@@ -1,0 +1,4 @@
+input ed4eb6aea2682b0f
+defaults 9025887e44e886fd
+fast-half 51c73722256a7b75
+slow 9d4e25902ca24768
