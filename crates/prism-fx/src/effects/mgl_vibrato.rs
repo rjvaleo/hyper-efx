@@ -14,7 +14,7 @@
 //! those controls are set, as the original's does.
 
 use super::mgl_dattorro_common::{spec, store, whole_rate, ModDelay, ModMode};
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec};
+use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 
 static PARAMS: &[ParamSpec] = &[
     spec("delayMs", "Delay", 0.1, 100.0, 8.0).log().unit("ms"),
@@ -24,7 +24,7 @@ static PARAMS: &[ParamSpec] = &[
     spec("wet", "Wet", 0.0, 1.0, 1.0),
     spec("dry", "Dry", 0.0, 1.0, 0.0),
     spec("stereo", "Stereo phase", 0.0, 1.0, 0.5),
-    spec("allpass", "All-pass interp", 0.0, 1.0, 1.0),
+    spec("allpass", "All-pass interp", 0.0, 1.0, 1.0).kind(ParamKind::Toggle),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {

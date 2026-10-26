@@ -11,22 +11,22 @@
 //! running them in turn on each frame.
 
 use super::mgl_dattorro_common::{damping_coefficient, spec, store, whole_rate, FilterMode, Musical};
-use crate::{Category, Descriptor, Display, Group, Kernel, Panel, ParamSpec};
+use crate::{Category, Descriptor, Display, Group, Kernel, Panel, ParamKind, ParamSpec};
 
 static PARAMS: &[ParamSpec] = &[
-    spec("notchOn", "Notch", 0.0, 1.0, 1.0),
+    spec("notchOn", "Notch", 0.0, 1.0, 1.0).kind(ParamKind::Toggle),
     spec("notchHz", "Notch frequency", 20.0, 20000.0, 500.0).log().unit("Hz"),
     spec("notchQ", "Notch Q", 0.2, 18.0, 4.0),
     spec("notchAmp", "Notch amplitude", 0.0, 1.0, 1.0),
-    spec("resonatorOn", "Resonator", 0.0, 1.0, 1.0),
+    spec("resonatorOn", "Resonator", 0.0, 1.0, 1.0).kind(ParamKind::Toggle),
     spec("resonatorHz", "Resonator frequency", 20.0, 20000.0, 1200.0).log().unit("Hz"),
     spec("resonatorQ", "Resonator Q", 0.2, 18.0, 5.0),
     spec("resonatorAmp", "Resonator amplitude", 0.0, 1.0, 0.7),
-    spec("regaliaOn", "Regalia-Mitra", 0.0, 1.0, 1.0),
+    spec("regaliaOn", "Regalia-Mitra", 0.0, 1.0, 1.0).kind(ParamKind::Toggle),
     spec("regaliaHz", "Regalia frequency", 20.0, 20000.0, 3000.0).log().unit("Hz"),
     spec("regaliaQ", "Regalia Q", 0.2, 18.0, 2.0),
     spec("regaliaAmp", "Regalia amplitude", 0.0, 1.0, 0.7),
-    spec("dampingOn", "Damping", 0.0, 1.0, 1.0),
+    spec("dampingOn", "Damping", 0.0, 1.0, 1.0).kind(ParamKind::Toggle),
     spec("dampingHz", "Damping cutoff", 20.0, 20000.0, 6000.0).log().unit("Hz"),
     spec("dampingQ", "Damping Q", 0.2, 18.0, 0.7),
     spec("dampingAmp", "Damping amplitude", 0.0, 1.0, 1.0),

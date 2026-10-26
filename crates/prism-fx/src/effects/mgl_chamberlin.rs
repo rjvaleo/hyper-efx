@@ -15,23 +15,23 @@
 //! only change between blocks; here they are worked out when a control moves.
 
 use super::mgl_dattorro_common::{spec, store, whole_rate};
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec};
+use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 use core::f32::consts::PI;
 
 static PARAMS: &[ParamSpec] = &[
-    spec("lowOn", "Low on", 0.0, 1.0, 1.0),
+    spec("lowOn", "Low on", 0.0, 1.0, 1.0).kind(ParamKind::Toggle),
     spec("lowFreq", "Low frequency", 20.0, 18_000.0, 1000.0).log().unit("Hz"),
     spec("lowQ", "Low Q", 0.2, 10.0, 0.7),
     spec("lowAmp", "Low amplitude", 0.0, 1.0, 1.0),
-    spec("bandOn", "Band on", 0.0, 1.0, 0.0),
+    spec("bandOn", "Band on", 0.0, 1.0, 0.0).kind(ParamKind::Toggle),
     spec("bandFreq", "Band frequency", 20.0, 18_000.0, 1000.0).log().unit("Hz"),
     spec("bandQ", "Band Q", 0.2, 10.0, 1.0),
     spec("bandAmp", "Band amplitude", 0.0, 1.0, 0.0),
-    spec("highOn", "High on", 0.0, 1.0, 0.0),
+    spec("highOn", "High on", 0.0, 1.0, 0.0).kind(ParamKind::Toggle),
     spec("highFreq", "High frequency", 20.0, 18_000.0, 1000.0).log().unit("Hz"),
     spec("highQ", "High Q", 0.2, 10.0, 0.7),
     spec("highAmp", "High amplitude", 0.0, 1.0, 0.0),
-    spec("notchOn", "Notch on", 0.0, 1.0, 0.0),
+    spec("notchOn", "Notch on", 0.0, 1.0, 0.0).kind(ParamKind::Toggle),
     spec("notchFreq", "Notch frequency", 20.0, 18_000.0, 1000.0).log().unit("Hz"),
     spec("notchQ", "Notch Q", 0.2, 10.0, 1.0),
     spec("notchAmp", "Notch amplitude", 0.0, 1.0, 0.0),
