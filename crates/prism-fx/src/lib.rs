@@ -114,6 +114,11 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::mgl_doubler::DESCRIPTOR, make: boxed::<effects::MglDoubler> },
     Entry { descriptor: &effects::mgl_doppler::DESCRIPTOR, make: boxed::<effects::MglDoppler> },
     Entry { descriptor: &effects::mgl_dattorro_filter_bank::DESCRIPTOR, make: boxed::<effects::MglDattorroFilterBank> },
+    Entry { descriptor: &effects::schroeder_reverb::DESCRIPTOR, make: boxed::<effects::SchroederReverb> },
+    Entry { descriptor: &effects::moorer_reverb::DESCRIPTOR, make: boxed::<effects::MoorerReverb> },
+    Entry { descriptor: &effects::phaser::DESCRIPTOR, make: boxed::<effects::Phaser> },
+    Entry { descriptor: &effects::eq::DESCRIPTOR, make: boxed::<effects::Eq> },
+    Entry { descriptor: &effects::compressor::DESCRIPTOR, make: boxed::<effects::Compressor> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {

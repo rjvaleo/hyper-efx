@@ -176,3 +176,17 @@ pub use mgl_detune::MglDetune;
 pub use mgl_doubler::MglDoubler;
 pub use mgl_doppler::MglDoppler;
 pub use mgl_dattorro_filter_bank::MglDattorroFilterBank;
+
+// MultiGrainLive's own effects: its comb reverbs, Smith phaser, and the rack's
+// EQ and compressor.
+mod comb_lines;
+pub mod compressor;
+pub mod eq;
+pub mod moorer_reverb;
+pub mod phaser;
+pub mod schroeder_reverb;
+pub use compressor::Compressor;
+pub use eq::Eq;
+pub use moorer_reverb::MoorerReverb;
+pub use phaser::Phaser;
+pub use schroeder_reverb::SchroederReverb;

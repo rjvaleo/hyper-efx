@@ -313,6 +313,65 @@ fn a_control_that_acts_only_while_another_moves_is_not_deaf() {
     assert_eq!(contract::every_control_reaches_the_output(&make), Ok(()));
 }
 
+/// A band of an EQ: its tilt acts only while the band is on and its gain is
+/// off zero. At rest the gain is zero; every setting of the rest at once that
+/// turns the band off or leaves the gain at zero hides the tilt, so it is
+/// found only with the switch on and the gain moved together.
+static BAND_PARAMS: &[ParamSpec] = &[
+    ParamSpec::new("gainDb", "Gain", -12.0, 12.0, 0.0).unit("dB"),
+    ParamSpec::new("tilt", "Tilt", 0.0, 1.0, 0.5),
+    ParamSpec::new("on", "On", 0.0, 1.0, 1.0).kind(ParamKind::Toggle),
+];
+
+static BAND: Descriptor = Descriptor {
+    id: "test-band",
+    code: 9004,
+    version: 1,
+    label: "Test band",
+    category: Category::Filter,
+    params: BAND_PARAMS,
+    panel: Panel { groups: &[], primary: &["gainDb"], displays: &[], pad: None },
+    source: "planted by the contract tests",
+    sound: None,
+};
+
+struct Band {
+    values: [f32; 3],
+}
+
+impl Kernel for Band {
+    fn new(_: f32) -> Self {
+        Band { values: [0.0, 0.5, 1.0] }
+    }
+    fn descriptor() -> &'static Descriptor {
+        &BAND
+    }
+    fn set_param(&mut self, i: usize, v: f32) {
+        if let Some(spec) = BAND_PARAMS.get(i) {
+            self.values[i] = spec.clamp(v);
+        }
+    }
+    fn param(&self, i: usize) -> f32 {
+        self.values.get(i).copied().unwrap_or(0.0)
+    }
+    fn reset(&mut self) {}
+    fn tick(&mut self, f: &mut [f32; 2]) {
+        let [gain, tilt, on] = self.values;
+        if on > 0.5 && gain != 0.0 {
+            let g = 1.0 + (10f32.powf(gain / 20.0) - 1.0) * tilt;
+            f[0] *= g;
+            f[1] *= g;
+        }
+    }
+}
+
+#[test]
+fn a_control_that_acts_only_in_combination_with_two_others_is_not_deaf() {
+    let make = || -> Boxed { Box::new(Band::new(contract::SAMPLE_RATE)) };
+    assert_eq!(contract::check_descriptor(&BAND), Vec::<String>::new());
+    assert_eq!(contract::every_control_reaches_the_output(&make), Ok(()));
+}
+
 /// Blows up at the top of its gain range.
 struct Unstable(Gain);
 impl Kernel for Unstable {

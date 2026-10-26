@@ -217,10 +217,13 @@ pub fn block_size_does_not_matter(make: Make) -> Result<(), String> {
 /// waits for keys other than the root to be held.
 /// A glide time acts only on a move, so it is
 /// tried while the control it glides moves half a second in; a control that
-/// applies only in one setting of another is tried in that setting. A
-/// control is deaf only if it changes nothing from any of these. A control
-/// marked inert is held to the opposite: it must change nothing from all of
-/// them.
+/// applies only in one setting of another is tried in that setting. Last,
+/// only for a control none of those reached: every switch on and one other
+/// control at a time at its far end, because some controls act only in
+/// combination — an EQ band's frequency only while its band is on and its
+/// gain is off zero, which no single setting of the rest gives. A control is
+/// deaf only if it changes nothing from any of these. A control marked inert
+/// is held to the opposite: it must change nothing from all of them.
 ///
 /// The move is only ever the glided control's, never a general one: a kernel
 /// that stores a value and applies it only when some other control next moves
@@ -276,14 +279,25 @@ pub fn every_control_reaches_the_output(make: Make) -> Result<(), String> {
         if let Some((j, v)) = spec.when.and_then(|(key, v)| Some((params.iter().position(|p| p.key == key)?, v))) {
             states.push((vec![(j, v)], Vec::new()));
         }
-        let moved = states.iter().any(|(start, halfway)| {
+        let differs = |start: &Vec<(usize, f32)>, halfway: &[(usize, f32)]| {
             let reference = render_with(start, halfway);
             [spec.min, spec.max].iter().any(|&end| {
                 let mut start = start.clone();
                 start.push((i, end));
                 first_difference(&reference, &render_with(&start, halfway), 1e-6).is_some()
             })
-        });
+        };
+        let moved = states.iter().any(|(start, halfway)| differs(start, halfway))
+            || params.iter().enumerate().filter(|&(j, _)| j != i).any(|(j, other)| {
+                let mut start: Vec<(usize, f32)> = params
+                    .iter()
+                    .enumerate()
+                    .filter(|&(k, s)| k != i && k != j && s.kind == ParamKind::Toggle)
+                    .map(|(k, s)| (k, s.max))
+                    .collect();
+                start.push((j, far(other)));
+                differs(&start, &[])
+            });
         if spec.inert && moved {
             audible.push(spec.key);
         } else if !spec.inert && !moved {
