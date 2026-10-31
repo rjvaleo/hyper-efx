@@ -1,5 +1,15 @@
 # prism-fx
 
+![Rust](https://img.shields.io/badge/Rust-edition_2021-000000?logo=rust&logoColor=white)
+![Effects](https://img.shields.io/badge/effects-86-8957e5)
+![Crates](https://img.shields.io/badge/crates-prism--fx_%C2%B7_prism--grain-dea584?logo=rust&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-2ea44f)
+![unsafe](https://img.shields.io/badge/unsafe-forbidden_in_prism--fx-2ea44f)
+![Tests](https://img.shields.io/badge/tests-675_%23%5Btest%5D-2ea44f)
+![wasm32](https://img.shields.io/badge/builds_for-wasm32--unknown--unknown-654FF0?logo=webassembly&logoColor=white)
+![Hosts](https://img.shields.io/badge/hosts-MultiGrainLive_%C2%B7_idMLab-6aa84f)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
 Audio effects and a sound engine written once, for two programs:
 **MultiGrainLive** (native Rust) and **idMLab** in M Clone (Rust compiled to
 wasm32 in an AudioWorklet). Both depend on this repository by path.
@@ -20,6 +30,20 @@ its `docs/HYPERPRISM.md` and `docs/EFFECT-INTAKE.md`.
 - **`prism-grain`** — MultiGrainLive's sound engine, moved here unchanged:
   grains, WSOLA, phase vocoder, PVSOLA and hybrid streamers, the `Stretcher`
   and the `BlockRenderer`. idMLab runs it as its Grain Engine.
+
+## In the hosts
+
+Each host draws an effect's panel from its `Descriptor`: the same controls,
+groups and pad in both.
+
+![Hyperprism Chorus in idMLab, as a module with its X/Y pad](docs/screenshots/idmlab-hyperprism-chorus.png)
+
+*idMLab: Hyperprism Chorus as a module.*
+
+![Hyperprism Chorus in MultiGrainLive's rack, beside its EQ and compressor](docs/screenshots/multigrainlive-rack.png)
+
+*MultiGrainLive: the same effect in the rack, after its EQ and compressor —
+both of which are prism-fx effects too.*
 
 ## The effect contract
 
