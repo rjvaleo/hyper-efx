@@ -369,11 +369,33 @@ impl TimeMap {
     pub fn anchor_count(&self) -> usize {
         self.anchors.len()
     }
+
+    /// The (input, output) pairs, so a map built on one thread can be handed
+    /// to another — idMLab builds it in a worker and plays it in the worklet.
+    pub fn anchors(&self) -> &[(f64, f64)] {
+        &self.anchors
+    }
+
+    /// A map from the pairs `anchors` gave out, unchanged.
+    pub fn from_anchors(anchors: Vec<(f64, f64)>) -> Self {
+        TimeMap { anchors }
+    }
 }
 
 #[cfg(test)]
 mod map_tests {
     use super::*;
+
+    #[test]
+    fn a_map_taken_apart_and_put_back_is_the_same_map() {
+        // A map built on one thread and played on another crosses as its anchors.
+        let m = TimeMap::linear(1000, 2.0);
+        let back = TimeMap::from_anchors(m.anchors().to_vec());
+        assert_eq!(back.anchors(), m.anchors());
+        for out in [0.0, 333.0, 1999.0] {
+            assert_eq!(back.input_at(out), m.input_at(out));
+        }
+    }
 
     #[test]
     fn a_plain_stretch_is_a_straight_line() {
