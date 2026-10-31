@@ -118,4 +118,19 @@ impl Kernel for Utility {
             self.fit.tick(frame);
         }
     }
+
+    /// The original swapped and widened only with two channels or more; one
+    /// channel took the gain and the amplitude fit alone.
+    fn has_mono(&self) -> bool {
+        true
+    }
+
+    fn tick_mono(&mut self, sample: &mut f32) {
+        *sample *= self.gain;
+        if self.values[AMP_FIT] >= 0.5 {
+            let mut frame = [*sample, *sample];
+            self.fit.tick(&mut frame);
+            *sample = frame[0];
+        }
+    }
 }
