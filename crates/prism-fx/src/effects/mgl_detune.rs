@@ -78,4 +78,17 @@ impl Kernel for MglDetune {
     fn tail_seconds(&self) -> f32 {
         self.p[1] / 1000.0
     }
+
+    /// The original, given one channel, put both voices in it, averaged.
+    fn has_mono(&self) -> bool {
+        true
+    }
+
+    fn tick_mono(&mut self, sample: &mut f32) {
+        let input = [*sample, *sample];
+        let (mut u, mut d) = ([0.0; 2], [0.0; 2]);
+        self.up.frame(&input, &mut u, self.ratio, self.p[1]);
+        self.down.frame(&input, &mut d, 1.0 / self.ratio, self.p[1]);
+        *sample = *sample * self.p[3] + (u[0] + d[0]) * 0.5 * self.p[2];
+    }
 }

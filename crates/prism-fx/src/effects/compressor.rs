@@ -158,4 +158,10 @@ impl Kernel for Compressor {
         frame[0] *= g;
         frame[1] *= g;
     }
+
+    /// The gain reduction now, as positive dB: what the original showed on
+    /// its meter.
+    fn telemetry(&self) -> f32 {
+        -self.envelope_db
+    }
 }

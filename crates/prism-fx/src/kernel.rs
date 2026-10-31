@@ -57,6 +57,30 @@ pub trait Kernel: Send {
     fn tail_seconds(&self) -> f32 {
         0.0
     }
+
+    /// Whether the effect does something of its own with one channel.
+    ///
+    /// A host with a mono source feeds it to both sides and keeps the left,
+    /// which for nearly every effect is exactly what its original did with
+    /// one channel. An effect whose original treated mono differently (the
+    /// Dattorro detune, which averaged its two voices into the one channel)
+    /// says so here, and the host calls `tick_mono` instead.
+    fn has_mono(&self) -> bool {
+        false
+    }
+
+    /// One mono sample, in place, when `has_mono` says so.
+    fn tick_mono(&mut self, sample: &mut f32) {
+        let mut frame = [*sample, *sample];
+        self.tick(&mut frame);
+        *sample = frame[0];
+    }
+
+    /// One number the effect reports about itself for a meter: a compressor's
+    /// gain reduction, as positive dB. Zero for an effect with nothing to say.
+    fn telemetry(&self) -> f32 {
+        0.0
+    }
 }
 
 /// `Kernel` as a host holds it: `Box<dyn DynKernel>`. Every kernel is one.
@@ -70,6 +94,9 @@ pub trait DynKernel: Send {
     fn set_sound(&mut self, samples: &[f32], channels: usize, sample_rate: f32);
     fn latency_frames(&self) -> u32;
     fn tail_seconds(&self) -> f32;
+    fn has_mono(&self) -> bool;
+    fn tick_mono(&mut self, sample: &mut f32);
+    fn telemetry(&self) -> f32;
 }
 
 impl<K: Kernel> DynKernel for K {
@@ -99,5 +126,14 @@ impl<K: Kernel> DynKernel for K {
     }
     fn tail_seconds(&self) -> f32 {
         Kernel::tail_seconds(self)
+    }
+    fn has_mono(&self) -> bool {
+        Kernel::has_mono(self)
+    }
+    fn tick_mono(&mut self, sample: &mut f32) {
+        Kernel::tick_mono(self, sample)
+    }
+    fn telemetry(&self) -> f32 {
+        Kernel::telemetry(self)
     }
 }
