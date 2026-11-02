@@ -21,6 +21,11 @@
 //! Changed from the original: settings made before the first frame land at
 //! once, as the original's initialisation copies the target times into the
 //! glides.
+//!
+//! Added (not in the original): Feedback, 0–100 %, default 0. The line takes
+//! `in + feedback·sum / (g1 + g2 + g3)`, the taps' sum over their total gain,
+//! so the loop never gains more than `feedback` and the attenuations shape
+//! the regeneration as they shape the taps. At 0 it is the original exactly.
 
 use super::hp_delay_law::{samples, speed, Line};
 use super::hp_echo::fraction;
@@ -30,6 +35,10 @@ const DELAY1: usize = 0;
 const ATT1: usize = 2;
 const MIX: usize = 5;
 const SPEED: usize = 6;
+const FEEDBACK: usize = 7;
+
+/// The line's ceiling under feedback.
+const LOOP_LIMIT: f32 = 4.0;
 
 const LONGEST_MS: f32 = 1000.0;
 
@@ -45,6 +54,7 @@ static PARAMS: &[ParamSpec] = &[
         .kind(ParamKind::Int)
         .smooth(0.0)
         .glides("delay1Ms"),
+    ParamSpec::new("feedback", "Feedback", 0.0, 100.0, 0.0).unit("%").smooth(0.0),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -58,7 +68,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Pad", keys: &["delay1Ms", "delay2Ms"] },
             Group { label: "Taps", keys: &["att1Db", "att2Db", "att3Db"] },
-            Group { label: "Additional settings", keys: &["speed", "mix"] },
+            Group { label: "Additional settings", keys: &["feedback", "speed", "mix"] },
         ],
         primary: &["delay1Ms", "delay2Ms", "mix"],
         displays: &[Display::Meter],
@@ -70,7 +80,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
 
 pub struct HpMultiDelay {
     sample_rate: f32,
-    values: [f32; 7],
+    values: [f32; 8],
     line: Line,
     /// The two gliding times, in samples (the original's doubles at +0x78, +0x80).
     times: [f64; 2],
@@ -81,6 +91,8 @@ pub struct HpMultiDelay {
     b: f64,
     mix: f32,
     dry: f32,
+    /// Feedback over the taps' total gain.
+    regen: f32,
     started: bool,
 }
 
@@ -95,6 +107,7 @@ impl HpMultiDelay {
         (self.a, self.b) = speed(self.values[SPEED], self.sample_rate);
         self.mix = fraction(self.values[MIX]);
         self.dry = (1.0 - self.mix as f64) as f32;
+        self.regen = fraction(self.values[FEEDBACK]) / self.gains.iter().sum::<f32>();
         if !self.started {
             self.times = [self.targets[0] as f64, self.targets[1] as f64];
         }
@@ -104,7 +117,7 @@ impl HpMultiDelay {
 impl Kernel for HpMultiDelay {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 7];
+        let mut values = [0.0; 8];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -120,6 +133,7 @@ impl Kernel for HpMultiDelay {
             b: 0.0,
             mix: 0.0,
             dry: 0.0,
+            regen: 0.0,
             started: false,
         };
         k.reset();
@@ -162,17 +176,30 @@ impl Kernel for HpMultiDelay {
         let two = self.line.at(taps[1]);
         let three = self.line.at((taps[0] + taps[1]).min(self.line.longest()));
         let [g1, g2, g3] = self.gains;
-        // No feedback: the line takes the input.
-        self.line.push(*frame);
+        let mut written = *frame;
         for (ch, s) in frame.iter_mut().enumerate() {
             let sum = three[ch].mul_add(g3, one[ch].mul_add(g1, two[ch] * g2));
+            if self.regen > 0.0 {
+                written[ch] = sum.mul_add(self.regen, *s).clamp(-LOOP_LIMIT, LOOP_LIMIT);
+            }
             *s = s.mul_add(self.dry, self.mix * sum);
         }
+        // At zero feedback the line takes the input, as the original's does.
+        self.line.push(written);
     }
 
     fn tail_seconds(&self) -> f32 {
         let [a, b] = self.times;
         let [c, d] = self.targets;
-        ((a + b) as f32).max(c + d) / self.sample_rate
+        let longest = ((a + b) as f32).max(c + d) / self.sample_rate;
+        // Each pass round the loop loses at least the feedback's share.
+        let gain = fraction(self.values[FEEDBACK]);
+        if gain >= 1.0 {
+            return 60.0;
+        }
+        if gain <= 0.0 {
+            return longest;
+        }
+        (longest * (0.001f32.ln() / gain.ln()).ceil()).min(60.0)
     }
 }
