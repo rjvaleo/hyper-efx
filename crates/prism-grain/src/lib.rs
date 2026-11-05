@@ -12,6 +12,7 @@
 //! is plain DSP with no dependencies, and builds for wasm32.
 
 pub mod decompose;
+pub mod feedback;
 pub mod fft;
 pub mod grain;
 pub mod hstream;

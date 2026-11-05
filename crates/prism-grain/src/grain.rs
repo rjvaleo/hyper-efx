@@ -146,6 +146,20 @@ pub struct Grain {
     pub drift_step: bool,
     /// Spreads grains across the stereo field, each to its own place.
     pub pan_spread: f32,
+    /// Grain feedback (`feedback.rs`): how much of each pass of the cloud comes
+    /// round again, 0..0.95. Zero is the cloud as it was.
+    pub fb_amount: f32,
+    /// How far back the loop reaches, in milliseconds, 20..2000.
+    pub fb_time_ms: f32,
+    /// Diffusion inside the loop, 0..1: clear returns at zero, a smear at one.
+    pub fb_smear: f32,
+    /// A high cut inside the loop, 0..1, so each pass is darker than the last.
+    pub fb_damp: f32,
+    /// Pitch each pass is moved by, in semitones, -12..12.
+    pub fb_shift: f32,
+    /// Hold the loop: nothing new goes in and what is in it goes round at full
+    /// level.
+    pub fb_hold: bool,
 }
 
 impl Default for Grain {
@@ -175,6 +189,12 @@ impl Default for Grain {
             link_jitter: false,
             drift_step: false,
             pan_spread: 0.0,
+            fb_amount: 0.0,
+            fb_time_ms: 250.0,
+            fb_smear: 0.3,
+            fb_damp: 0.4,
+            fb_shift: 0.0,
+            fb_hold: false,
         }
     }
 }
@@ -204,6 +224,7 @@ impl Grain {
             && !self.link_jitter
             && !self.drift_step
             && self.pan_spread.abs() < 1e-4
+            && !crate::feedback::Feedback::active(self)
     }
 
     /// Uniform random in 0..1 for grain `index`. `salt` separates the streams,

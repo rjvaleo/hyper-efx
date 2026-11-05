@@ -534,7 +534,7 @@ impl Stretch {
                 input, channels, sample_rate, ratio, self.semitones, self.window_ms,
                 &self.grain, prog,
             );
-            return fit(out, want, channels);
+            return self.with_feedback(fit(out, want, channels), channels, sample_rate);
         }
 
         // Stretch far enough that resampling for pitch lands on `want`.
@@ -618,7 +618,14 @@ impl Stretch {
 
         // Hold the promised length exactly, so timeline arithmetic stays honest.
         let out = fit(out, want, channels);
-        self.with_cloud(out, input, channels, sample_rate, ratio, want, prog)
+        let out = self.with_cloud(out, input, channels, sample_rate, ratio, want, prog);
+        self.with_feedback(out, channels, sample_rate)
+    }
+
+    /// Feedback over the whole render, last, as the `Stretcher` runs it live.
+    fn with_feedback(&self, mut out: Vec<f32>, channels: usize, sample_rate: u32) -> Vec<f32> {
+        crate::feedback::Feedback::new().process(&mut out, channels, &self.grain, sample_rate);
+        out
     }
 
     /// Mix the grain cloud in over an engine's output.

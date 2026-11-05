@@ -186,6 +186,33 @@ impl BlockRenderer {
         }
     }
 
+    /// Move the playhead to `out_frame` **without** dropping the grains that are
+    /// sounding (RJ, 4 Nov 2026: a stretch change should carry them). A seek
+    /// silences them and starts fresh; this shifts each one by the same amount
+    /// the playhead moved, so it plays on from where it was, and puts each
+    /// layer's schedule at the first grain from the new place — nothing that
+    /// would start before it is spawned again.
+    pub fn rescale(&mut self, out_frame: u64, sp: &StreamParams) {
+        let delta = out_frame as i64 - self.position as i64;
+        for v in &mut self.voices[..self.live] {
+            v.event.out_frame = (v.event.out_frame as i64 + delta).max(0) as u64;
+        }
+        self.position = out_frame;
+        let layers = layer_count(sp);
+        for l in 0..layers {
+            let lp = layer_params(sp, l);
+            let off = layer_offset(sp, l, layers);
+            let mut s = self.streams[l as usize];
+            s.seek(out_frame.saturating_sub(off), &lp);
+            // Skip what would already have started: the voices carried over are
+            // what is sounding there.
+            while s.out_frame() + off < out_frame {
+                s.next(&lp);
+            }
+            self.streams[l as usize] = s;
+        }
+    }
+
     /// Take a grain, stealing the oldest voice if the pool is full.
     ///
     /// It used to drop the *incoming* grain. For a stretcher that is

@@ -126,6 +126,12 @@ pub struct Stretcher {
     /// And somewhere to render the grain cloud when it is layered over an
     /// engine rather than being the engine.
     cloud_buf: Vec<f32>,
+    /// Frames left of the short fade-in after a rescale on an engine with no
+    /// grains to carry: its seek starts mid-wave, which is a click otherwise.
+    declick: u32,
+    /// Feedback over whatever is playing, the same stage the offline render
+    /// ends with (`feedback.rs`).
+    feedback: crate::feedback::Feedback,
     /// And somewhere to render each extra layer before it is added in.
     layer_buf: Vec<f32>,
     /// The extra layers, if any have been handed over yet.
@@ -144,6 +150,8 @@ pub struct Stretcher {
 /// which would otherwise be a click is spread below hearing, short enough that
 /// the change still feels immediate under the finger.
 const FADE_FRAMES: usize = 1024;
+/// The fade-in after a rescale, about five milliseconds at 48 kHz.
+const DECLICK_FRAMES: u32 = 240;
 
 /// Which engines run here at all.
 ///
@@ -219,6 +227,8 @@ impl Stretcher {
             scratch: vec![0.0; max_block.max(1) * channels.max(1)],
             layer_buf: vec![0.0; max_block.max(1) * channels.max(1)],
             cloud_buf: vec![0.0; max_block.max(1) * channels.max(1)],
+            declick: 0,
+            feedback: crate::feedback::Feedback::new(),
             bank: None,
             layer_at: vec![u64::MAX; crate::render::MAX_LAYERS],
             position: 0,
@@ -284,11 +294,34 @@ impl Stretcher {
 
     pub fn seek(&mut self, out_frame: u64, sp: &StreamParams) {
         self.position = out_frame;
+        // A seek starts the loop empty, as a render from the top does. A
+        // rescale keeps it: the stretch moved, not the playhead.
+        self.feedback.reset();
         self.current = resolve(sp.algorithm);
         // A seek is a jump anyway; there is nothing to fade from.
         self.fading = None;
         self.layer_at.iter_mut().for_each(|v| *v = u64::MAX);
         self.seek_current(out_frame, sp);
+    }
+
+    /// Move to `out_frame` because the stretch changed, keeping the grain
+    /// cloud's sounding grains (see `BlockRenderer::rescale`). The splice and
+    /// spectral engines have no grains to keep, so they seek as before; the
+    /// cloud layered over one of them is carried like the cloud on its own.
+    pub fn rescale(&mut self, out_frame: u64, sp: &StreamParams) {
+        self.position = out_frame;
+        self.current = resolve(sp.algorithm);
+        self.fading = None;
+        self.layer_at.iter_mut().for_each(|v| *v = u64::MAX);
+        if self.current == Algorithm::Granular {
+            self.grain.rescale(out_frame, sp);
+        } else {
+            self.seek_one(self.current, out_frame, sp);
+            self.declick = DECLICK_FRAMES;
+            if sp.cloud {
+                self.grain.rescale(out_frame, sp);
+            }
+        }
     }
 
     fn seek_current(&mut self, out_frame: u64, sp: &StreamParams) {
@@ -350,6 +383,20 @@ impl Stretcher {
 
         let frames = out.len() / channels.max(1);
         let mut reported = self.render_one(self.current, out, channels, src, sp, events);
+        // A rescaled splice or spectral engine fades in over a few
+        // milliseconds rather than starting mid-wave.
+        if self.declick > 0 {
+            for f in 0..frames {
+                if self.declick == 0 {
+                    break;
+                }
+                let g = 1.0 - self.declick as f32 / DECLICK_FRAMES as f32;
+                for ch in 0..channels {
+                    out[f * channels + ch] *= g;
+                }
+                self.declick -= 1;
+            }
+        }
         self.add_layers(out, channels, src, sp);
         reported = reported.max(self.add_cloud(out, channels, src, sp, events));
 
@@ -385,6 +432,10 @@ impl Stretcher {
                 Some(rest) => Some((from, rest)),
             };
         }
+
+        // Feedback last, over the engine, its layers and the cloud together,
+        // as the offline render ends.
+        self.feedback.process(&mut out[..frames * channels], channels, &sp.grain, sp.sample_rate);
 
         self.position += frames as u64;
         reported
