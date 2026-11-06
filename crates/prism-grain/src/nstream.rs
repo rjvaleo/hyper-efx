@@ -48,6 +48,8 @@ pub struct NoiseStream {
     gain_from: f32,
     gain_to: f32,
     gain_at: u64,
+    /// Keeps the read continuous when the ratio moves. See `anchor.rs`.
+    anchor: crate::anchor::Anchor,
 }
 
 impl NoiseStream {
@@ -73,6 +75,7 @@ impl NoiseStream {
             gain_from: 1.0,
             gain_to: 1.0,
             gain_at: 0,
+            anchor: crate::anchor::Anchor::default(),
         }
     }
 
@@ -89,7 +92,7 @@ impl NoiseStream {
         self.gain_from = 1.0;
         self.gain_to = 1.0;
         self.gain_at = self.write;
-        let _ = p;
+        self.anchor.reset(p.ratio.clamp(0.01, 100.0));
     }
 
     pub fn position(&self) -> u64 {
@@ -169,6 +172,7 @@ impl NoiseStream {
         let n = (m.fft_size.max(64).next_power_of_two()).min(MAX_FFT);
         let hop = (n / 4).max(1);
         let ratio = p.ratio.clamp(0.01, 100.0);
+        self.anchor.retune(self.write, ratio);
         let span = m.smooth_bins.max(1) | 1;
         let bins = n / 2 + 1;
         self.ensure_window(n);
@@ -176,7 +180,7 @@ impl NoiseStream {
         let need = self.emitted + frames as u64;
         while self.write < need {
             // Where in the source this output frame is looking.
-            let src = (self.write as f64 / ratio as f64) as f32;
+            let src = self.anchor.source(self.write as f64, ratio).max(0.0) as f32;
             let a_start = (src as usize).min(in_frames.saturating_sub(n));
             let b_start = (a_start + hop).min(in_frames.saturating_sub(n));
             let t = (src - a_start as f32).clamp(0.0, 1.0);
@@ -269,7 +273,7 @@ impl NoiseStream {
         d: f32,
     ) -> f32 {
         let in_frames = input.len() / channels;
-        let src = (frame as f64 / ratio as f64) as usize;
+        let src = self.anchor.source(frame as f64, ratio).max(0.0) as usize;
         if src >= in_frames || d <= 1e-6 {
             return 1.0;
         }

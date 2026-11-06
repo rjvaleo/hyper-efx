@@ -198,18 +198,11 @@ impl BlockRenderer {
             v.event.out_frame = (v.event.out_frame as i64 + delta).max(0) as u64;
         }
         self.position = out_frame;
+        // Each layer's schedule moves with the playhead and carries on, as the
+        // voices do: see `GrainStream::shift`.
         let layers = layer_count(sp);
         for l in 0..layers {
-            let lp = layer_params(sp, l);
-            let off = layer_offset(sp, l, layers);
-            let mut s = self.streams[l as usize];
-            s.seek(out_frame.saturating_sub(off), &lp);
-            // Skip what would already have started: the voices carried over are
-            // what is sounding there.
-            while s.out_frame() + off < out_frame {
-                s.next(&lp);
-            }
-            self.streams[l as usize] = s;
+            self.streams[l as usize].shift(delta);
         }
     }
 

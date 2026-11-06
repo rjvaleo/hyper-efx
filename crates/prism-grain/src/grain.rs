@@ -806,6 +806,17 @@ impl GrainStream {
         self.write = self.index * hop;
     }
 
+    /// Move the schedule by `delta` output frames without re-deriving it: the
+    /// playhead was relabelled because the stretch changed (`BlockRenderer::
+    /// rescale`), and a grain reads `write / ratio`, so the next grain, moved
+    /// with it, reads on from where it was. A seek here instead re-derived the
+    /// schedule from the new place and skipped forward to it, which under a
+    /// stretch moving every block could leave it a quarter of a second ahead
+    /// of the playhead, with no grains at all until the playhead caught up.
+    pub fn shift(&mut self, delta: i64) {
+        self.write = (self.write as i64 + delta).max(0) as u64;
+    }
+
     /// The next grain, then advance by the hop the *current* parameters imply.
     pub fn next(&mut self, sp: &StreamParams) -> GrainEvent {
         let p = sp.plan();
@@ -1406,5 +1417,32 @@ mod layer_ceiling_tests {
         let mut sp = StreamParams::new(48_000, 48_000);
         sp.grain.layers = 16;
         assert_eq!(layer_count(&sp), 16, "sixteen layers is no longer honoured");
+    }
+}
+
+#[cfg(test)]
+mod rescale {
+    use super::*;
+
+    /// A stretch change relabels the playhead; the schedule moved with it reads
+    /// on from where it was, at the new rate, and skips nothing.
+    #[test]
+    fn a_shifted_schedule_reads_on_from_where_it_was() {
+        let mut sp = StreamParams::new(480_000, 48_000);
+        sp.ratio = 1.0;
+        let mut s = GrainStream::new();
+        s.seek(96_000, &sp);
+        let a = s.next(&sp);
+        // ×1 to ×1.25 at frame `here`: the playhead becomes here × 1.25.
+        let here = s.out_frame();
+        let there = here * 5 / 4;
+        sp.ratio = 1.25;
+        s.shift(there as i64 - here as i64);
+        let b = s.next(&sp);
+        assert_eq!(b.index, a.index + 1, "nothing skipped");
+        assert_eq!(b.out_frame, there, "moved with the playhead");
+        let hop = sp.plan().hop as f32;
+        let gap = b.src_frame - a.src_frame;
+        assert!(gap > 0.0 && gap <= hop * 1.01, "the next grain reads on: {gap} source frames on");
     }
 }

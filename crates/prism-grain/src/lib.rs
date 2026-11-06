@@ -11,6 +11,7 @@
 //! device, the threads and the locks stayed in MultiGrainLive: everything here
 //! is plain DSP with no dependencies, and builds for wasm32.
 
+pub mod anchor;
 pub mod decompose;
 pub mod feedback;
 pub mod fft;

@@ -306,18 +306,36 @@ impl Stretcher {
 
     /// Move to `out_frame` because the stretch changed, keeping the grain
     /// cloud's sounding grains (see `BlockRenderer::rescale`). The splice and
-    /// spectral engines have no grains to keep, so they seek as before; the
-    /// cloud layered over one of them is carried like the cloud on its own.
+    /// spectral engines, and their extra layers, read on from where they are
+    /// (see below); the cloud layered over one of them is carried like the
+    /// cloud on its own.
     pub fn rescale(&mut self, out_frame: u64, sp: &StreamParams) {
+        let delta = out_frame as i64 - self.position as i64;
         self.position = out_frame;
         self.current = resolve(sp.algorithm);
         self.fading = None;
-        self.layer_at.iter_mut().for_each(|v| *v = u64::MAX);
+        let mapped = self.current == Algorithm::Wsola && sp.wsola.preserve_transients;
+        // The extra layers move with the playhead rather than losing their
+        // place: forgetting where they were makes each one seek, and a stretch
+        // moving every block was a seek of every layer every block.
+        for v in self.layer_at.iter_mut() {
+            *v = if mapped || *v == u64::MAX { u64::MAX } else { (*v as i64 + delta).max(0) as u64 };
+        }
         if self.current == Algorithm::Granular {
             self.grain.rescale(out_frame, sp);
         } else {
-            self.seek_one(self.current, out_frame, sp);
-            self.declick = DECLICK_FRAMES;
+            // The splice and spectral engines read on from where they are: the
+            // vocoder and PVSOLA advance their read themselves, and WSOLA and
+            // the noise stream hold it with an anchor (`anchor.rs`). So a new
+            // ratio relabels the playhead and nothing else: no seek, nothing to
+            // fade in. A seek and a fade here, every block of a moving stretch,
+            // was heard as chopping. A WSOLA reading through a transient map is
+            // the one that still seeks, because the map, not the anchor, says
+            // where it reads.
+            if mapped {
+                self.seek_one(self.current, out_frame, sp);
+                self.declick = DECLICK_FRAMES;
+            }
             if sp.cloud {
                 self.grain.rescale(out_frame, sp);
             }

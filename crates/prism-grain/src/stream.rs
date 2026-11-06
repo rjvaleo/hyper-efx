@@ -109,6 +109,8 @@ pub struct WsolaStream {
     /// Built off the audio thread when it is needed at all, because deriving it
     /// runs an onset detector over the whole file and allocates.
     map: Option<crate::transient::TimeMap>,
+    /// Keeps the read continuous when the ratio moves. See `anchor.rs`.
+    anchor: crate::anchor::Anchor,
     /// Dropped because the ring could not hold the window. Surfaced rather than
     /// silently degrading, exactly as the voice pool's overflow is.
     pub overflows: u64,
@@ -140,6 +142,7 @@ impl WsolaStream {
             index: 0,
             first: true,
             map: None,
+            anchor: crate::anchor::Anchor::default(),
             overflows: 0,
         }
     }
@@ -162,7 +165,7 @@ impl WsolaStream {
     fn nominal(&self, out_frame: f64, ratio: f32, in_frames: usize) -> f32 {
         match &self.map {
             Some(m) => m.input_at(out_frame) as f32,
-            None => (out_frame / ratio.max(1e-6) as f64).clamp(0.0, in_frames as f64) as f32,
+            None => self.anchor.source(out_frame, ratio).clamp(0.0, in_frames as f64) as f32,
         }
     }
 
@@ -226,6 +229,7 @@ impl Streamer for WsolaStream {
         // windows have been laid, so seeking to a moment gives the same splices
         // as playing to it. The grain cloud does the same, for the same reason.
         self.index = out_frame / hop as u64;
+        self.anchor.reset(p.ratio.clamp(0.01, 100.0));
         let nominal = self.nominal(out_frame as f64, p.ratio, input_frames);
         let scan = p.grain.scan.clamp(-4.0, 4.0);
         let swept = if scan < 0.0 {
@@ -250,6 +254,9 @@ impl Streamer for WsolaStream {
 
         let sr = p.sample_rate.max(1) as f32;
         let ratio = p.ratio.clamp(0.01, 100.0);
+        // A new ratio reads on from where the next window was going to read,
+        // rather than from wherever `frame / ratio` now lands.
+        self.anchor.retune(self.write, ratio);
         let win = (((p.window_ms.clamp(5.0, MAX_WINDOW_MS) / 1000.0) * sr) as usize).max(64) & !1;
         let hop_out = crate::stretch::hop_frames(&p.grain, win, sr).max(1);
         // How far a splice may be moved to find a better join.
