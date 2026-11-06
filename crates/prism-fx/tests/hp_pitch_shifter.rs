@@ -141,3 +141,34 @@ fn the_ranges_are_the_originals() {
     assert_eq!(d.label, "Hyperprism Pitch Shifter");
     assert_eq!(d.source, "Hyperprism-PPC 1.2.1: Pitch Shifter");
 }
+
+#[test]
+fn the_pitch_scale_takes_the_ratio_past_200_percent() {
+    // The Pitch Time Changer's ratio is pitch/speed with no limit: Pitch
+    // 100 % at Speed 25 % is 4 ×. Pitch scale multiplies the ratio, so the
+    // shifter reaches it with Pitch at 100 %.
+    let n = 88_200;
+    let x: Vec<f32> = (0..n).map(|i| (std::f32::consts::TAU * 200.0 * i as f32 / SR).sin()).collect();
+    for (pitch, scale) in [(100.0f32, 4.0f32), (200.0, 3.0), (50.0, 10.0)] {
+        let mut k = shifter(&[("pitch", pitch), ("pitchScale", scale), ("mix", 100.0)]);
+        let (y, _) = run(&mut k, &x);
+        let rising = y[44_100..].windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count() as f32;
+        let want = 200.0 * scale * pitch / 100.0;
+        assert!((rising - want).abs() / want < 0.03, "{pitch} % × {scale}: {rising} Hz, want {want}");
+    }
+    // And a ramp's slope is the whole ratio between the grain jumps, once the
+    // reads are past the line's first 32 768 frames.
+    let mut k = shifter(&[("pitch", 100.0), ("pitchScale", 4.0), ("mix", 100.0), ("xfade", 0.0)]);
+    let (y, _) = run(&mut k, &ramp(60_000));
+    let on_slope = y[34_000..].windows(2).filter(|w| (w[1] - w[0] - 4.0).abs() < 0.02).count();
+    assert!(on_slope > 25_900, "{on_slope} of 26 000 samples at the slope of 4");
+}
+
+#[test]
+fn the_pitch_scale_is_added_after_the_originals_controls() {
+    let d = prism_fx::find("hp-pitch-shifter").unwrap().descriptor;
+    let s = d.spec("pitchScale").expect("pitchScale");
+    assert_eq!((s.min, s.max, s.default), (0.0, 200.0, 1.0));
+    let keys: Vec<&str> = d.params.iter().map(|p| p.key).collect();
+    assert_eq!(keys.last(), Some(&"pitchScale"));
+}

@@ -50,6 +50,13 @@
 //! step starts its count afresh, stepping on the next sample. Default 513 is
 //! the original exactly.
 //!
+//! Added (not in the original): Pitch scale, 0–200 ×, default 1: multiplies
+//! the ratio, so the shifter runs at `r = scale · pitch/100 − 1`. The
+//! original's Pitch Time Changer drove this routine at `pitch/speed` with no
+//! limit — Pitch 200 % at Speed 1 % is a ratio of 200 — which the Pitch
+//! control's 0–200 % cannot reach; the host sets Pitch to 100 % and the ratio
+//! here. Default 1 is the original exactly.
+//!
 //! Changed from the original: the Pitch Time Changer took its mix before
 //! setting it to 100 % and never smoothed it after, so it ran half dry. The
 //! mix here is the control, smoothed, and 100 % is all wet.
@@ -65,6 +72,7 @@ const GRAIN: usize = 3;
 const XFADE: usize = 4;
 const SMOOTHING: usize = 5;
 const STEP: usize = 6;
+const PITCH_SCALE: usize = 7;
 
 const TABLE: usize = 1024;
 /// P7: the crossfade tables' scale.
@@ -82,6 +90,7 @@ static PARAMS: &[ParamSpec] = &[
         .kind(ParamKind::Int)
         .smooth(0.0)
         .glides("pitch"),
+    ParamSpec::new("pitchScale", "Pitch scale", 0.0, 200.0, 1.0).unit("×").smooth(1200.0),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -95,6 +104,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Pad", keys: &["pitch", "mix"] },
             Group { label: "Additional settings", keys: &["feedback", "grain", "xfade", "smoothing", "smoothingStep"] },
+            Group { label: "Added (not in the original)", keys: &["pitchScale"] },
         ],
         primary: &["pitch", "mix"],
         displays: &[Display::Meter],
@@ -120,7 +130,7 @@ enum Change {
 
 pub struct HpPitchShifter {
     sample_rate: f32,
-    values: [f32; 7],
+    values: [f32; 8],
     frames: Vec<[f32; 2]>,
     write: usize,
     sin: [f32; TABLE],
@@ -146,7 +156,7 @@ pub struct HpPitchShifter {
 
 impl HpPitchShifter {
     fn targets(&self) -> (f32, f32) {
-        let ratio = self.values[PITCH] * 0.01;
+        let ratio = self.values[PITCH] * 0.01 * self.values[PITCH_SCALE];
         (ratio - 1.0, self.values[MIX] * 0.01)
     }
 
@@ -257,7 +267,7 @@ impl HpPitchShifter {
 impl Kernel for HpPitchShifter {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 7];
+        let mut values = [0.0; 8];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
