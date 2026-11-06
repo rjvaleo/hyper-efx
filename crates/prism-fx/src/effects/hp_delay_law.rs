@@ -96,6 +96,78 @@ impl Line {
     }
 }
 
+/// What the Hyperprism ports' bit-exact tests share: a fixed stereo input and
+/// a hash of every output bit, so a render at the defaults can be held to the
+/// one the unchanged code gave.
+#[cfg(test)]
+pub(crate) mod golden {
+    use crate::Kernel;
+
+    /// `seconds` of two sines (220 Hz left, 331 Hz right) under fixed-seed
+    /// noise, with a quiet stretch in the middle for dynamics to act on.
+    pub(crate) fn input(seconds: f32, sample_rate: f32) -> Vec<[f32; 2]> {
+        let n = (seconds * sample_rate) as usize;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                let level = if i > n / 3 && i < n / 2 { 0.05 } else { 0.6 };
+                let l = level * (core::f32::consts::TAU * 220.0 * t).sin() + 0.1 * noise();
+                let r = level * (core::f32::consts::TAU * 331.0 * t).sin() + 0.1 * noise();
+                [l, r]
+            })
+            .collect()
+    }
+
+    /// The input through `k`, frame by frame, with `at(k, i)` called before
+    /// frame `i` for moves mid-way.
+    pub(crate) fn render<K: Kernel>(k: &mut K, input: &[[f32; 2]], mut at: impl FnMut(&mut K, usize)) -> Vec<[f32; 2]> {
+        input
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                at(k, i);
+                let mut frame = *x;
+                k.tick(&mut frame);
+                frame
+            })
+            .collect()
+    }
+
+    /// FNV-1a over every output bit.
+    pub(crate) fn hash(out: &[[f32; 2]]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in out.iter().flat_map(|f| f.iter()).flat_map(|s| s.to_bits().to_le_bytes()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// A kernel made at `sample_rate` with `settings` (index, value), rendered
+    /// with `moves` (frame, index, value) applied mid-way, hashed.
+    pub(crate) fn hash_of<K: Kernel>(sample_rate: f32, seconds: f32, settings: &[(usize, f32)], moves: &[(usize, usize, f32)]) -> u64 {
+        let mut k = K::new(sample_rate);
+        for &(i, v) in settings {
+            k.set_param(i, v);
+        }
+        let out = render(&mut k, &input(seconds, sample_rate), |k, n| {
+            for &(at, i, v) in moves {
+                if at == n {
+                    k.set_param(i, v);
+                }
+            }
+        });
+        hash(&out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

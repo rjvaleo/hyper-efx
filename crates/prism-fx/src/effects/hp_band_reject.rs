@@ -32,18 +32,25 @@
 //! - **Rate.** The 45-sample step is scaled with the rate (49 at 48 kHz), so
 //!   a glide takes the same time anywhere. Frequencies are in hertz at the
 //!   host's rate, as the code's are at its own.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often F and q glide a step. The default is the
+//!   original exactly.
 
-use super::hp_fr::{Countdown, Glide, SMOOTHING};
+use super::hp_fr::{Countdown, Glide, SMOOTHING, SMOOTHING_STEP};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec};
 
 const FREQ: usize = 0;
 const Q: usize = 1;
 const SMOOTH: usize = 2;
+const STEP: usize = 3;
 
 static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("freqHz", "Frequency", 0.0, 2_000.0, 1_000.0).unit("Hz").smooth(9.7),
     ParamSpec::new("q", "Q", 1.0, 10.0, 1.0).smooth(9.7),
     SMOOTHING.glides("freqHz"),
+    SMOOTHING_STEP.glides("freqHz"),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -57,6 +64,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Filter", keys: &["freqHz", "q"] },
             Group { label: "Settings", keys: &["smoothing"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["freqHz", "q"],
         displays: &[Display::Curve, Display::Meter],
@@ -74,7 +82,7 @@ struct Svf {
 
 pub struct HpBandReject {
     sample_rate: f32,
-    values: [f32; 3],
+    values: [f32; 4],
     /// F and q: their targets and their glides.
     target: (f32, f32),
     smoothed: (f32, f32),
@@ -98,7 +106,7 @@ impl HpBandReject {
 impl Kernel for HpBandReject {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 4];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -109,7 +117,7 @@ impl Kernel for HpBandReject {
             smoothed: (0.0, 0.0),
             sides: [Svf::default(); 2],
             glide: Glide::new(values[SMOOTH]),
-            countdown: Countdown::new(sample_rate),
+            countdown: Countdown::every(values[STEP], sample_rate),
         };
         k.retarget();
         k.reset();
@@ -125,6 +133,8 @@ impl Kernel for HpBandReject {
         self.values[index] = spec.clamp(value);
         if index == SMOOTH {
             self.glide = Glide::new(self.values[SMOOTH]);
+        } else if index == STEP {
+            self.countdown.set_every(self.values[STEP], self.sample_rate);
         } else {
             self.retarget();
         }
@@ -155,5 +165,37 @@ impl Kernel for HpBandReject {
             s.low = low;
             *x = (f64::from(low) + f64::from(high)) as f32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpBandReject>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpBandReject>(44_100.0, 3.0, &[("freqHz", 500.0), ("q", 4.0)], &[("freqHz", 1_500.0)]),
+            checksum::<HpBandReject>(
+                48_000.0,
+                3.0,
+                &[("freqHz", 200.0), ("q", 8.0), ("smoothing", 60.0)],
+                &[("q", 2.0)],
+            ),
+        ];
+        assert_eq!(got, [10350161641232645261, 9081015865674694557, 14509206055873080460]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpBandReject>(
+            &[("freqHz", 500.0), ("q", 4.0)],
+            &[("freqHz", 1_500.0)],
+        );
     }
 }

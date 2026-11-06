@@ -17,7 +17,13 @@
 //! effect starts silent; mid 100 % and side 0 % is the mono sum. Smoothing
 //! starts at the effect's own default, 25 % (a = 0.1), since no settings
 //! dialog ever loads.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often both gains glide a step. The default is
+//!   the original exactly.
 
+use super::hp_fr::SMOOTHING_STEP;
 use super::hp_stereo_shared::Stepper;
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 
@@ -26,6 +32,7 @@ const MID: usize = 1;
 const INPUT: usize = 2;
 const SMOOTHING: usize = 3;
 const MONO: usize = 4;
+const STEP: usize = 5;
 
 static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("sideGain", "Side", -90.0, 90.0, 0.0).unit("%").smooth(0.0),
@@ -33,6 +40,7 @@ static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("input", "Input", 0.0, 1.0, 0.0).kind(ParamKind::Choice(&["L/R", "M/S"])).smooth(0.0),
     ParamSpec::new("smoothing", "Smoothing", 0.0, 100.0, 25.0).unit("%").kind(ParamKind::Int).smooth(0.0),
     ParamSpec::new("mono", "Mono input", 0.0, 1.0, 0.0).kind(ParamKind::Toggle).smooth(0.0),
+    SMOOTHING_STEP,
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -48,6 +56,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Gains", keys: &["sideGain", "midGain"] },
             Group { label: "Settings", keys: &["input", "smoothing", "mono"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["sideGain", "midGain", "input"],
         displays: &[Display::Meter],
@@ -58,7 +67,8 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
 };
 
 pub struct HpHyperStereo {
-    values: [f32; 5],
+    sample_rate: f32,
+    values: [f32; 6],
     /// Targets: mid gain, side gain.
     target: [f32; 2],
     smoothed: [f32; 2],
@@ -75,12 +85,12 @@ impl HpHyperStereo {
 impl Kernel for HpHyperStereo {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 5];
+        let mut values = [0.0; 6];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
-        let step = Stepper::new(sample_rate, values[SMOOTHING]);
-        let mut k = HpHyperStereo { values, target: [0.0; 2], smoothed: [0.0; 2], step };
+        let step = Stepper::every(values[STEP], sample_rate, values[SMOOTHING]);
+        let mut k = HpHyperStereo { sample_rate, values, target: [0.0; 2], smoothed: [0.0; 2], step };
         k.targets();
         k.reset();
         k
@@ -96,6 +106,7 @@ impl Kernel for HpHyperStereo {
         match index {
             SIDE | MID => self.targets(),
             SMOOTHING => self.step.set_smoothing(self.values[SMOOTHING]),
+            STEP => self.step.set_every(self.values[STEP], self.sample_rate),
             _ => {}
         }
     }
@@ -130,5 +141,37 @@ impl Kernel for HpHyperStereo {
         let side = gs * s;
         frame[0] = (gm as f64 * m as f64 + side as f64) as f32;
         frame[1] = (gm as f64 * m as f64 - side as f64) as f32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpHyperStereo>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpHyperStereo>(44_100.0, 3.0, &[("sideGain", 60.0), ("midGain", 120.0)], &[("sideGain", -40.0)]),
+            checksum::<HpHyperStereo>(
+                48_000.0,
+                3.0,
+                &[("input", 1.0), ("midGain", -200.0), ("smoothing", 50.0)],
+                &[("midGain", 300.0)],
+            ),
+        ];
+        assert_eq!(got, [2307696701297496229, 2703270182231127609, 8891148128338008449]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpHyperStereo>(
+            &[("sideGain", 60.0), ("midGain", 100.0)],
+            &[("sideGain", -60.0)],
+        );
     }
 }

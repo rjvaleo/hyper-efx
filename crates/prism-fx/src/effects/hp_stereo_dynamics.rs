@@ -13,18 +13,26 @@
 //! 101 ms). A mono input came out as the same two gains on the one channel,
 //! which equal sides give here. The original would take typed gains up to
 //! 32767 %; the range here is the window's.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often the gains glide a step. The default is
+//!   the original exactly.
 
+use super::hp_fr::SMOOTHING_STEP;
 use super::hp_stereo_shared::Stepper;
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 
 const RIGHT: usize = 0;
 const LEFT: usize = 1;
 const SMOOTHING: usize = 2;
+const STEP: usize = 3;
 
 static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("rightGain", "Right gain", 0.0, 100.0, 50.0).unit("%").smooth(0.0),
     ParamSpec::new("leftGain", "Left gain", 0.0, 100.0, 50.0).unit("%").smooth(0.0),
     ParamSpec::new("smoothing", "Smoothing", 0.0, 100.0, 50.0).unit("%").kind(ParamKind::Int).smooth(0.0),
+    SMOOTHING_STEP,
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -40,6 +48,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Gains", keys: &["rightGain", "leftGain"] },
             Group { label: "Settings", keys: &["smoothing"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["rightGain", "leftGain"],
         displays: &[Display::Meter],
@@ -50,7 +59,8 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
 };
 
 pub struct HpStereoDynamics {
-    values: [f32; 3],
+    sample_rate: f32,
+    values: [f32; 4],
     /// Targets: left gain, right gain, and the overall gain, which this
     /// process leaves at 1 but still glides like the others.
     target: [f32; 3],
@@ -68,12 +78,12 @@ impl HpStereoDynamics {
 impl Kernel for HpStereoDynamics {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 4];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
-        let step = Stepper::new(sample_rate, values[SMOOTHING]);
-        let mut k = HpStereoDynamics { values, target: [0.0; 3], smoothed: [0.0; 3], step };
+        let step = Stepper::every(values[STEP], sample_rate, values[SMOOTHING]);
+        let mut k = HpStereoDynamics { sample_rate, values, target: [0.0; 3], smoothed: [0.0; 3], step };
         k.targets();
         k.reset();
         k
@@ -88,6 +98,7 @@ impl Kernel for HpStereoDynamics {
         self.values[index] = spec.clamp(value);
         match index {
             SMOOTHING => self.step.set_smoothing(self.values[SMOOTHING]),
+            STEP => self.step.set_every(self.values[STEP], self.sample_rate),
             _ => self.targets(),
         }
     }
@@ -110,5 +121,42 @@ impl Kernel for HpStereoDynamics {
         let [gl, gr, g] = self.smoothed;
         frame[0] = g * (frame[0] * gl);
         frame[1] = g * (frame[1] * gr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpStereoDynamics>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpStereoDynamics>(
+                44_100.0,
+                3.0,
+                &[("rightGain", 90.0), ("leftGain", 10.0)],
+                &[("rightGain", 20.0)],
+            ),
+            checksum::<HpStereoDynamics>(
+                48_000.0,
+                3.0,
+                &[("smoothing", 20.0), ("leftGain", 100.0)],
+                &[("leftGain", 0.0)],
+            ),
+        ];
+        assert_eq!(got, [6084974374263663669, 8355386559955286793, 5015182231625198693]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpStereoDynamics>(
+            &[("rightGain", 90.0)],
+            &[("rightGain", 10.0)],
+        );
     }
 }

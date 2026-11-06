@@ -44,6 +44,12 @@
 //! block, so time goes as 1/speed and pitch as pitch. Here the host's engine
 //! does the speed; this kernel is the shifter, at the ratio it is given.
 //!
+//! Added (not in the original): Smoothing step, 1–2048 samples at 44.1 kHz,
+//! default 513: how often mix and ratio step, on the first sample and every
+//! 513th after in the original; scaled with the rate as that count is. A new
+//! step starts its count afresh, stepping on the next sample. Default 513 is
+//! the original exactly.
+//!
 //! Changed from the original: the Pitch Time Changer took its mix before
 //! setting it to 100 % and never smoothed it after, so it ran half dry. The
 //! mix here is the control, smoothed, and 100 % is all wet.
@@ -58,6 +64,7 @@ const FEEDBACK: usize = 2;
 const GRAIN: usize = 3;
 const XFADE: usize = 4;
 const SMOOTHING: usize = 5;
+const STEP: usize = 6;
 
 const TABLE: usize = 1024;
 /// P7: the crossfade tables' scale.
@@ -70,6 +77,11 @@ static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("grain", "Grain size", 0.0, 100.0, 15.0).unit("%").kind(ParamKind::Int).smooth(0.0),
     ParamSpec::new("xfade", "X-fade size", 0.0, 100.0, 100.0).unit("%").kind(ParamKind::Int).smooth(0.0),
     ParamSpec::new("smoothing", "Smoothing", 0.0, 100.0, 50.0).unit("%").kind(ParamKind::Int).smooth(0.0).glides("pitch"),
+    ParamSpec::new("smoothingStep", "Smoothing step", 1.0, 2048.0, 513.0)
+        .unit("samples")
+        .kind(ParamKind::Int)
+        .smooth(0.0)
+        .glides("pitch"),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -82,7 +94,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
     panel: Panel {
         groups: &[
             Group { label: "Pad", keys: &["pitch", "mix"] },
-            Group { label: "Additional settings", keys: &["feedback", "grain", "xfade", "smoothing"] },
+            Group { label: "Additional settings", keys: &["feedback", "grain", "xfade", "smoothing", "smoothingStep"] },
         ],
         primary: &["pitch", "mix"],
         displays: &[Display::Meter],
@@ -107,7 +119,8 @@ enum Change {
 }
 
 pub struct HpPitchShifter {
-    values: [f32; 6],
+    sample_rate: f32,
+    values: [f32; 7],
     frames: Vec<[f32; 2]>,
     write: usize,
     sin: [f32; TABLE],
@@ -244,7 +257,7 @@ impl HpPitchShifter {
 impl Kernel for HpPitchShifter {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 6];
+        let mut values = [0.0; 7];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -258,6 +271,7 @@ impl Kernel for HpPitchShifter {
             cos[i] = a.cos().powf(1.0) as f32;
         }
         let mut k = HpPitchShifter {
+            sample_rate,
             values,
             frames: vec![[0.0; 2]; len],
             write: 0,
@@ -290,6 +304,7 @@ impl Kernel for HpPitchShifter {
         self.values[index] = spec.clamp(value);
         match index {
             SMOOTHING => self.steps.set_percent(self.values[SMOOTHING]),
+            STEP => self.steps = Stepper::new(self.sample_rate, self.values[STEP] as f64 - 1.0, 0.0, self.values[SMOOTHING]),
             // The sliders' live path: a grain move flags growth or shrinkage
             // for the next wrap; a crossfade move always flags shrinkage.
             GRAIN if self.change == Change::None => {
@@ -381,5 +396,45 @@ impl Kernel for HpPitchShifter {
     fn tail_seconds(&self) -> f32 {
         // Two grains of the longest line, more with feedback.
         1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hp_delay_law::golden::hash_of;
+    use super::*;
+
+    fn hashes() -> [u64; 4] {
+        let h = hash_of::<HpPitchShifter>;
+        [
+            h(44_100.0, 3.0, &[], &[(66_150, PITCH, 150.0)]),
+            h(44_100.0, 3.0, &[(PITCH, 70.0), (FEEDBACK, 40.0), (GRAIN, 40.0)], &[(50_000, PITCH, 130.0), (90_000, XFADE, 50.0)]),
+            h(44_100.0, 3.0, &[(SMOOTHING, 20.0), (MIX, 100.0)], &[(30_000, PITCH, 50.0), (60_000, GRAIN, 5.0)]),
+            h(48_000.0, 3.0, &[(PITCH, 120.0)], &[(72_000, PITCH, 80.0)]),
+        ]
+    }
+
+    #[test]
+    fn the_smoothing_step_sets_how_often_mix_and_ratio_move() {
+        // Mix 50 → 100 % at 50 % smoothing, a = 0.01 per step, stepping on the
+        // first sample and every `step`th after.
+        let mix_after = |step: f32, samples: usize| {
+            let mut k = HpPitchShifter::new(44_100.0);
+            k.set_param(STEP, step);
+            k.set_param(MIX, 100.0);
+            for _ in 0..samples {
+                k.tick(&mut [0.0, 0.0]);
+            }
+            k.mix
+        };
+        let expect = |steps: i32| 1.0 - 0.5 * 0.99f32.powi(steps);
+        assert!((mix_after(513.0, 51_300) - expect(100)).abs() < 1e-3, "{}", mix_after(513.0, 51_300));
+        assert!((mix_after(1.0, 300) - expect(300)).abs() < 1e-3, "{}", mix_after(1.0, 300));
+        assert!((mix_after(2_048.0, 51_300) - expect(26)).abs() < 1e-3, "{}", mix_after(2_048.0, 51_300));
+    }
+
+    #[test]
+    fn defaults_render_as_the_original() {
+        assert_eq!(hashes(), [13794128734943140359, 13542462230472589813, 14070832131601433436, 18186235280647770109]);
     }
 }

@@ -45,11 +45,25 @@ pub(crate) struct Stepper {
 impl Stepper {
     /// `reload` and `start` are the original's counts at 44.1 kHz.
     pub fn new(sample_rate: f32, reload: f64, start: f64, percent: f32) -> Self {
-        let scale = |n: f64| samples(n, sample_rate).round().clamp(0.0, i32::MAX as f64) as i32;
+        let scale = |n: f64| Self::scaled(n, sample_rate);
         let mut s = Stepper { a: 1.0, b: 0.0, reload: scale(reload), start: scale(start), count: 0 };
         s.set_percent(percent);
         s.reset();
         s
+    }
+
+    fn scaled(n: f64, sample_rate: f32) -> i32 {
+        samples(n, sample_rate).round().clamp(0.0, i32::MAX as f64) as i32
+    }
+
+    /// Steps every `every` samples at 44.1 kHz: the reload and the start are
+    /// both `every − 1`, the original's 44 for its 45. A countdown already
+    /// past the new reload is brought back to it.
+    pub fn set_every(&mut self, sample_rate: f32, every: f32) {
+        let n = Self::scaled(every.max(1.0) as f64 - 1.0, sample_rate);
+        self.reload = n;
+        self.start = n;
+        self.count = self.count.min(n);
     }
 
     pub fn set_percent(&mut self, percent: f32) {
@@ -106,6 +120,55 @@ pub(crate) fn one_m_cos_table() -> [f32; LFO] {
         *v = (0.5 * (1.0 - (i as f64 * step).cos())) as f32;
     }
     t
+}
+
+// ---- added LFO shapes and stereo offsets (not in the original) -------------------
+
+/// One cycle of a triangle in the sine's phase: 0, up to 1 at a quarter, down
+/// to −1 at three quarters, back to 0.
+pub(crate) fn triangle_table() -> [f32; LFO] {
+    core::array::from_fn(|i| {
+        let x = i as f32 / LFO as f32;
+        if x < 0.25 {
+            4.0 * x
+        } else if x < 0.75 {
+            2.0 - 4.0 * x
+        } else {
+            4.0 * x - 4.0
+        }
+    })
+}
+
+/// One cycle of a square in the sine's phase: 1 for the first half, −1 for
+/// the second.
+pub(crate) fn square_table() -> [f32; LFO] {
+    core::array::from_fn(|i| if i < LFO / 2 { 1.0 } else { -1.0 })
+}
+
+/// A sine-phased table made unipolar the way `OneMCosBuffer` is the sine's:
+/// `0.5·(1 + t(i − n/4))`, from 0 at the start up to 1 halfway.
+fn raised(t: [f32; LFO]) -> [f32; LFO] {
+    core::array::from_fn(|i| 0.5 * (1.0 + t[(i + LFO - LFO / 4) % LFO]))
+}
+
+/// The LFO shape control's table: 0 the original's own (`OneMCosBuffer` when
+/// `unipolar`, else `SinBuffer`), 1 a triangle, 2 a square, each in the
+/// original's phase and range.
+pub(crate) fn shape_table(shape: f32, unipolar: bool) -> [f32; LFO] {
+    match (shape.round() as i32, unipolar) {
+        (1, true) => raised(triangle_table()),
+        (1, false) => triangle_table(),
+        (2, true) => raised(square_table()),
+        (2, false) => square_table(),
+        (_, true) => one_m_cos_table(),
+        (_, false) => sin_table(),
+    }
+}
+
+/// A phase in degrees as table steps, 360° to the whole table.
+#[inline]
+pub(crate) fn degrees(deg: f32) -> f32 {
+    deg / 360.0 * LFO as f32
 }
 
 /// A table read at a phase in table units, linearly between neighbours, the
@@ -201,7 +264,9 @@ impl Line {
 
 /// The Modulation routine: a delay swept from `centre` to `centre + depth`
 /// frames on a raised cosine, the line fed back from the previous sample's
-/// wet sound, and `wet·P2 + dry·P3` out. Both sides run the same LFO.
+/// wet sound, and `wet·P2 + dry·P3` out. Both sides run the same LFO; the
+/// added `offset` (table steps, 0 in the original) puts the right side's
+/// ahead of the left's.
 pub(crate) struct Modulation {
     pub line: Line,
     table: [f32; LFO],
@@ -211,7 +276,9 @@ pub(crate) struct Modulation {
     /// The smoothed rate (table steps per sample) and depth (frames).
     pub rate: f32,
     pub depth: f32,
-    phase: [f32; 2],
+    /// The right LFO's lead over the left, in table steps.
+    pub offset: f32,
+    phase: f32,
     last_wet: [f32; 2],
 }
 
@@ -225,14 +292,19 @@ impl Modulation {
             feedback,
             rate: 0.0,
             depth: 0.0,
-            phase: [0.0; 2],
+            offset: 0.0,
+            phase: 0.0,
             last_wet: [0.0; 2],
         }
     }
 
+    pub fn set_table(&mut self, table: [f32; LFO]) {
+        self.table = table;
+    }
+
     pub fn clear(&mut self) {
         self.line.clear();
-        self.phase = [0.0; 2];
+        self.phase = 0.0;
         self.last_wet = [0.0; 2];
     }
 
@@ -242,14 +314,16 @@ impl Modulation {
         for (c, &x) in x.iter().enumerate() {
             self.line.write(c, x + self.feedback * self.last_wet[c]);
         }
+        // At no offset the right phase is the left's to the bit.
+        let phases = [self.phase, advance(self.phase, self.offset)];
         for (c, &x) in x.iter().enumerate() {
-            let lfo = lookup(&self.table, self.phase[c]);
+            let lfo = lookup(&self.table, phases[c]);
             let d = lfo as f64 * self.depth as f64;
             let wet = self.line.read(c, d);
             frame[c] = wet * self.wet + x * self.dry;
             self.last_wet[c] = wet;
-            self.phase[c] = advance(self.phase[c], self.rate);
         }
+        self.phase = advance(self.phase, self.rate);
         self.line.step();
     }
 }
@@ -257,16 +331,23 @@ impl Modulation {
 // ---- the RingMod routine (Ring Modulator, Tremolo) -------------------------------
 
 /// The RingMod routine: `y = x·(1 − d) + lfo·(x·d)` on both sides, one phase.
+/// The added `offset` (table steps, 0 in the original) reads the right side's
+/// LFO that far ahead.
 pub(crate) struct RingMod {
     table: [f32; LFO],
     pub rate: f32,
     pub depth: f32,
+    pub offset: f32,
     phase: f32,
 }
 
 impl RingMod {
     pub fn new(table: [f32; LFO]) -> Self {
-        RingMod { table, rate: 0.0, depth: 0.0, phase: 0.0 }
+        RingMod { table, rate: 0.0, depth: 0.0, offset: 0.0, phase: 0.0 }
+    }
+
+    pub fn set_table(&mut self, table: [f32; LFO]) {
+        self.table = table;
     }
 
     pub fn clear(&mut self) {
@@ -276,11 +357,98 @@ impl RingMod {
     #[inline]
     pub fn tick(&mut self, frame: &mut [f32; 2]) {
         let lfo = lookup(&self.table, self.phase);
+        let right = if self.offset == 0.0 { lfo } else { lookup(&self.table, advance(self.phase, self.offset)) };
+        let lfos = [lfo, right];
         let (d, dry) = (self.depth, 1.0 - self.depth);
-        for x in frame.iter_mut() {
+        for (x, lfo) in frame.iter_mut().zip(lfos) {
             *x = *x * dry + lfo * (*x * d);
         }
         self.phase = advance(self.phase, self.rate);
+    }
+}
+
+/// What the effects' own tests share: a fixed stereo input, a render through
+/// a kernel, and a checksum of every output bit.
+#[cfg(test)]
+pub(crate) mod check {
+    use crate::Kernel;
+
+    /// `seconds` of a 220 Hz sine on the left, 331 Hz on the right, each with
+    /// noise from a fixed seed, at `sample_rate`.
+    pub fn input(seconds: f32, sample_rate: f32) -> (Vec<f32>, Vec<f32>) {
+        let n = (seconds * sample_rate) as usize;
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        let mut left = Vec::with_capacity(n);
+        let mut right = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sample_rate as f64;
+            left.push(0.5 * (std::f64::consts::TAU * 220.0 * t).sin() as f32 + 0.2 * noise());
+            right.push(0.5 * (std::f64::consts::TAU * 331.0 * t).sin() as f32 + 0.2 * noise());
+        }
+        (left, right)
+    }
+
+    /// The input through `k`, with `later` set (by index) halfway through.
+    pub fn render<K: Kernel>(
+        k: &mut K,
+        input: &(Vec<f32>, Vec<f32>),
+        later: &[(usize, f32)],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (mut left, mut right) = input.clone();
+        let half = left.len() / 2;
+        for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+            if i == half {
+                for &(index, value) in later {
+                    k.set_param(index, value);
+                }
+            }
+            let mut frame = [*l, *r];
+            k.tick(&mut frame);
+            (*l, *r) = (frame[0], frame[1]);
+        }
+        (left, right)
+    }
+
+    /// FNV-1a over the bits of every sample, left then right.
+    pub fn checksum(out: &(Vec<f32>, Vec<f32>)) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for v in out.0.iter().chain(out.1.iter()) {
+            for b in v.to_bits().to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// The checksums of three renders of `seconds` at `sample_rate`: at the
+    /// defaults; with `pad` set and the kernel reset; and with `moved` set
+    /// halfway through a render at the defaults.
+    pub fn checksums<K: Kernel>(
+        sample_rate: f32,
+        seconds: f32,
+        pad: &[(usize, f32)],
+        moved: &[(usize, f32)],
+    ) -> [u64; 3] {
+        let x = input(seconds, sample_rate);
+        let defaults = checksum(&render(&mut K::new(sample_rate), &x, &[]));
+        let mut k = K::new(sample_rate);
+        for &(i, v) in pad {
+            k.set_param(i, v);
+        }
+        k.reset();
+        let set = checksum(&render(&mut k, &x, &[]));
+        let moving = checksum(&render(&mut K::new(sample_rate), &x, moved));
+        [defaults, set, moving]
+    }
+
+    /// Mean square of a run of samples.
+    pub fn power(x: &[f32]) -> f64 {
+        x.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / x.len().max(1) as f64
     }
 }
 
@@ -301,6 +469,31 @@ mod tests {
         let mut s = Stepper::new(44_100.0, 44.0, 44.0, 50.0);
         let fired: Vec<usize> = (0..200).filter(|_| s.due()).collect();
         assert_eq!(fired, vec![44, 89, 134, 179]);
+    }
+
+    #[test]
+    fn the_added_shapes_keep_the_originals_phase_and_range() {
+        assert_eq!(shape_table(0.0, true), one_m_cos_table());
+        assert_eq!(shape_table(0.0, false), sin_table());
+        for unipolar in [true, false] {
+            let original = shape_table(0.0, unipolar);
+            for shape in [1.0, 2.0] {
+                let t = shape_table(shape, unipolar);
+                let (lo, hi) = t.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                assert_eq!((lo, hi), if unipolar { (0.0, 1.0) } else { (-1.0, 1.0) });
+                // Each peaks where the original does; all but the bipolar
+                // square start where it starts.
+                let peak = if unipolar { LFO / 2 } else { LFO / 4 };
+                assert_eq!(t[peak], 1.0);
+                if unipolar || shape == 1.0 {
+                    assert_eq!(t[0], original[0]);
+                }
+            }
+        }
+        let mut s = Stepper::new(44_100.0, 44.0, 44.0, 50.0);
+        s.set_every(44_100.0, 10.0);
+        let fired: Vec<usize> = (0..40).filter(|_| s.due()).collect();
+        assert_eq!(fired, vec![9, 19, 29, 39]);
     }
 
     #[test]

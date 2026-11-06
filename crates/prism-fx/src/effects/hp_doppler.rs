@@ -34,6 +34,15 @@
 //! delay at the source's distance; the original's initialisation seeded the
 //! read from the x position instead and left the delay to sweep there.
 //! Settings made before the first frame land at once.
+//!
+//! Added (not in the original): **Smoothing step**, 1–2048 samples, default
+//! 2: how often the position takes its smoothing step and the delay its new
+//! rate. Like the original's 2 it is a count of samples at any rate. Each
+//! update the delay still covers the share of the way the original's two
+//! samples at 1/44 cover, kept in time — `1 − (1 − 2/44)^(n/2)` over n
+//! samples — so it trails the position by the same 44 samples and stays
+//! stable at any step; longer steps move the position in coarser ramps and
+//! slow the smoothing in proportion. The default is the original exactly.
 
 use super::hp_delay_law::{smoothing, ORIGINAL_RATE};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
@@ -41,6 +50,10 @@ use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamK
 const X: usize = 0;
 const Y: usize = 1;
 const SMOOTHING: usize = 2;
+const STEP: usize = 3;
+
+/// The original's update: every second sample.
+const EVERY: f32 = 2.0;
 
 const RANGE_M: f32 = 100.0;
 /// The original's constant for 1/340, a double written to ten places.
@@ -58,6 +71,11 @@ static PARAMS: &[ParamSpec] = &[
         .kind(ParamKind::Int)
         .smooth(0.0)
         .glides("xM"),
+    ParamSpec::new("smoothingStep", "Smoothing step", 1.0, 2048.0, EVERY)
+        .unit("samples")
+        .kind(ParamKind::Int)
+        .smooth(0.0)
+        .glides("xM"),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -71,6 +89,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Pad", keys: &["xM", "yM"] },
             Group { label: "Additional settings", keys: &["smoothing"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["xM", "yM"],
         displays: &[Display::Meter],
@@ -82,7 +101,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
 
 pub struct HpDoppler {
     sample_rate: f32,
-    values: [f32; 3],
+    values: [f32; 4],
     line: Vec<f32>,
     write: usize,
     /// The smoothed position (the original's +0x68, +0x70).
@@ -100,12 +119,25 @@ pub struct HpDoppler {
     a: f32,
     b: f32,
     follow: f32,
+    /// The rate's share of the way per sample for the step, and the
+    /// countdown's reload: `follow` and 1 at the original's step of 2.
+    share: f32,
+    reload: i32,
     started: bool,
 }
 
 impl HpDoppler {
     fn apply(&mut self) {
         (self.a, self.b) = smoothing(self.values[SMOOTHING], self.sample_rate);
+        let n = self.values[STEP];
+        self.reload = n as i32 - 1;
+        self.countdown = self.countdown.min(self.reload);
+        self.share = if n == EVERY {
+            self.follow
+        } else {
+            let per_two = 2.0 * self.follow as f64;
+            ((1.0 - (1.0 - per_two).powf(f64::from(n) / 2.0)) / f64::from(n)) as f32
+        };
         if !self.started {
             self.land();
         }
@@ -143,7 +175,7 @@ impl HpDoppler {
 impl Kernel for HpDoppler {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 4];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -172,6 +204,8 @@ impl Kernel for HpDoppler {
             a: 1.0,
             b: 0.0,
             follow,
+            share: follow,
+            reload: 1,
             started: false,
         };
         k.reset();
@@ -195,7 +229,7 @@ impl Kernel for HpDoppler {
     fn reset(&mut self) {
         self.line.fill(0.0);
         self.write = 0;
-        self.countdown = 1;
+        self.countdown = self.values[STEP] as i32 - 1;
         self.started = false;
         self.apply();
     }
@@ -208,8 +242,8 @@ impl Kernel for HpDoppler {
             self.y = self.a.mul_add(self.values[Y], self.b * self.y);
             self.x = self.a.mul_add(self.values[X], self.b * self.x);
             let target = self.aim();
-            self.rate = self.follow * (target - self.delay);
-            self.countdown = 1;
+            self.rate = self.share * (target - self.delay);
+            self.countdown = self.reload;
         }
         let len = self.line.len();
         let at = |age: usize| self.line[(self.write + len - age % len) % len];
@@ -227,5 +261,72 @@ impl Kernel for HpDoppler {
     fn tail_seconds(&self) -> f32 {
         let far = (2.0f64.sqrt() * RANGE_M as f64 * PER_METRE) as f32;
         (self.delay / self.sample_rate).max(far)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpDoppler>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpDoppler>(44_100.0, 3.0, &[("xM", 30.0), ("yM", 5.0)], &[("xM", -40.0), ("yM", -20.0)]),
+            checksum::<HpDoppler>(48_000.0, 3.0, &[("smoothing", 30.0), ("yM", 80.0)], &[("yM", 2.0)]),
+        ];
+        assert_eq!(got, [86303782164117845, 4967918048877032271, 5957184625838451813]);
+    }
+
+    fn doppler(step: f32) -> HpDoppler {
+        let mut k = HpDoppler::new(44_100.0);
+        k.set_param(STEP, step);
+        k.reset();
+        k
+    }
+
+    /// Samples until the position is within 1 % of a move 50 m right.
+    fn settles_in(step: f32) -> usize {
+        let mut k = doppler(step);
+        k.tick(&mut [0.0, 0.0]);
+        k.set_param(X, 50.0);
+        (1..60 * 44_100)
+            .find(|_| {
+                k.tick(&mut [0.0, 0.0]);
+                (k.x - 50.0).abs() < 0.5
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        // At 50 % (a = 0.01) the position takes 459 updates to come within 1 %.
+        let at = |n: usize| settles_in(n as f32).abs_diff(459 * n);
+        assert!(at(2) <= 2 && at(1) <= 1 && at(64) <= 64, "{} {} {}", at(1), at(2), at(64));
+    }
+
+    #[test]
+    fn the_delay_trails_the_position_alike_and_stays_put_at_any_step() {
+        // Each update covers the original's share of the way in its time,
+        // so the delay lands on the distance's delay at long steps too.
+        for n in [1.0, 2.0, 100.0, 2_048.0] {
+            let mut k = doppler(n);
+            k.set_param(SMOOTHING, 0.0);
+            k.tick(&mut [0.0, 0.0]);
+            k.set_param(Y, 50.0);
+            let mut worst = 0f32;
+            for _ in 0..10 * 44_100 {
+                let mut frame = [0.5, 0.5];
+                k.tick(&mut frame);
+                worst = worst.max(frame[0].abs()).max(frame[1].abs());
+            }
+            let want = (44_100.0 * (PER_METRE * 50.0)) as f32;
+            assert!((k.delay - want).abs() < 0.5, "step {n}: delay {} for {want}", k.delay);
+            assert!(worst <= 0.5, "step {n}: {worst}");
+        }
     }
 }

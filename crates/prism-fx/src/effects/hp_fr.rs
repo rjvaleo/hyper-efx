@@ -3,6 +3,10 @@
 //! biquad section, and EReverb's single-memory engine. The effects themselves
 //! are `hp_low_pass` … `hp_hall`; this module holds no descriptor.
 //!
+//! It also holds the controls added to them (not in the original), each
+//! with the original's fixed value as its default: the Smoothing step, the
+//! filters' Output gain, and the reverbs' Size.
+//!
 //! Arithmetic follows the decompile's precision: coefficients and state are
 //! `f32`, the products and sums the code does in double are done in `f64` and
 //! rounded to `f32` where the code rounds.
@@ -16,6 +20,18 @@ pub(crate) const HP_RATE: f64 = 44_100.0;
 /// effect is made.
 pub(crate) const SMOOTHING: ParamSpec =
     ParamSpec::new("smoothing", "Smoothing", 0.0, 100.0, 25.0).unit("%").kind(crate::ParamKind::Int).smooth(0.0);
+
+/// The glide's step, in samples at 44.1 kHz.
+pub(crate) const STEP: f32 = 45.0;
+
+/// Added (not in the original): the glide's step as a control, in samples
+/// at 44.1 kHz, scaled with the rate as the fixed 45 is. Its default is the
+/// original's 45. Like Smoothing it acts only on a move, so an effect marks
+/// it `.glides` the same control its Smoothing does.
+pub(crate) const SMOOTHING_STEP: ParamSpec = ParamSpec::new("smoothingStep", "Smoothing step", 1.0, 2048.0, STEP)
+    .unit("samples")
+    .kind(crate::ParamKind::Int)
+    .smooth(0.0);
 
 /// `a` for a Smoothing setting: `0.0001·int(10^(0.04·(100 − s)))`, so 25 %
 /// is 0.1, 0 % is 1 (no glide) and 100 % is 0.0001.
@@ -56,9 +72,21 @@ pub(crate) struct Countdown {
 }
 
 impl Countdown {
-    pub(crate) fn new(sample_rate: f32) -> Self {
-        let every = (45.0 * f64::from(sample_rate) / HP_RATE).round().max(1.0) as i32;
+    /// A step every `samples` at 44.1 kHz, scaled with the rate.
+    pub(crate) fn every(samples: f32, sample_rate: f32) -> Self {
+        let every = Countdown::period(samples, sample_rate);
         Countdown { reload: every - 1, count: every - 1 }
+    }
+
+    fn period(samples: f32, sample_rate: f32) -> i32 {
+        (f64::from(samples) * f64::from(sample_rate) / HP_RATE).round().max(1.0) as i32
+    }
+
+    /// A new step length, taking effect without a restart: a count already
+    /// past the new length is cut to it.
+    pub(crate) fn set_every(&mut self, samples: f32, sample_rate: f32) {
+        self.reload = Countdown::period(samples, sample_rate) - 1;
+        self.count = self.count.min(self.reload);
     }
 
     pub(crate) fn reset(&mut self) {
@@ -219,12 +247,28 @@ pub(crate) const FREQ: usize = 0;
 pub(crate) const Q: usize = 1;
 pub(crate) const SMOOTH: usize = 2;
 
-/// Low Pass, High Pass and Band Pass: X frequency, Y Q, and Smoothing.
+/// Added (not in the original): the section's output gain, in dB. Its
+/// default is the built-in gain of 2, `20·log₁₀ 2` dB, and at the default
+/// the section is the original exactly. Off the default the recursion keeps
+/// its gain of 2 and only the output is scaled by `10^((dB − default)/20)`:
+/// the gain inside the loop is part of the filter's shape, and moving it
+/// would move the poles.
+pub(crate) const OUTPUT_GAIN: ParamSpec =
+    ParamSpec::new("outputDb", "Output gain", -24.0, 12.0, 6.0206).unit("dB").smooth(9.7);
+
+/// Low Pass, High Pass and Band Pass: X frequency, Y Q, and Smoothing, and
+/// the added step and output gain where an effect's controls have them.
 pub(crate) struct EFilterCore {
     process: EFilterProcess,
     params: &'static [ParamSpec],
     sample_rate: f32,
-    values: [f32; 3],
+    values: [f32; 5],
+    /// Where the added controls are in `params`, if they are.
+    step_at: Option<usize>,
+    gain_at: Option<usize>,
+    /// The output scale and its glide.
+    gain: f32,
+    gain_s: f32,
     target: Abg,
     smoothed: Abg,
     first: Coefs,
@@ -238,26 +282,41 @@ pub(crate) struct EFilterCore {
 impl EFilterCore {
     pub(crate) fn new(process: EFilterProcess, params: &'static [ParamSpec], sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 5];
         for (v, spec) in values.iter_mut().zip(params) {
             *v = spec.default;
         }
+        let at = |key: &str| params.iter().position(|p| p.key == key);
+        let step_at = at(SMOOTHING_STEP.key);
         let mut k = EFilterCore {
             process,
             params,
             sample_rate,
             values,
+            step_at,
+            gain_at: at(OUTPUT_GAIN.key),
+            gain: 1.0,
+            gain_s: 1.0,
             target: Abg::default(),
             smoothed: Abg::default(),
             first: Coefs::default(),
             second: Coefs::default(),
             sides: [[Section::default(); 2]; 2],
             glide: Glide::new(values[SMOOTH]),
-            countdown: Countdown::new(sample_rate),
+            countdown: Countdown::every(step_at.map_or(STEP, |i| values[i]), sample_rate),
         };
         k.retarget();
+        k.regain();
         k.reset();
         k
+    }
+
+    /// The output scale for the output gain: exactly 1 at its default.
+    fn regain(&mut self) {
+        if let Some(i) = self.gain_at {
+            let spec = &self.params[i];
+            self.gain = 10f64.powf(f64::from(self.values[i] - spec.default) / 20.0) as f32;
+        }
     }
 
     fn retarget(&mut self) {
@@ -285,6 +344,10 @@ impl EFilterCore {
         self.values[index] = spec.clamp(value);
         if index == SMOOTH {
             self.glide = Glide::new(self.values[SMOOTH]);
+        } else if Some(index) == self.step_at {
+            self.countdown.set_every(self.values[index], self.sample_rate);
+        } else if Some(index) == self.gain_at {
+            self.regain();
         } else {
             self.retarget();
         }
@@ -297,6 +360,7 @@ impl EFilterCore {
     /// The process's (re)initialisation: glides on their targets, state zero.
     pub(crate) fn reset(&mut self) {
         self.smoothed = self.target;
+        self.gain_s = self.gain;
         self.load();
         self.sides = [[Section::default(); 2]; 2];
         self.countdown.reset();
@@ -307,6 +371,12 @@ impl EFilterCore {
         if self.countdown.fires() {
             self.smoothed = self.smoothed.glided(&self.glide, &self.target);
             self.load();
+            // The output scale glides with the coefficients, and lands
+            // exactly, so the default's 1 stays exactly 1.
+            if self.gain_s != self.gain {
+                let g = self.glide.step(self.gain, self.gain_s);
+                self.gain_s = if (g - self.gain).abs() <= 1e-6 * self.gain { self.gain } else { g };
+            }
         }
         for (x, side) in frame.iter_mut().zip(self.sides.iter_mut()) {
             *x = match self.process {
@@ -317,6 +387,9 @@ impl EFilterCore {
                     ((f64::from(s1) + f64::from(s2)) as f32) * 0.5
                 }
             };
+            if self.gain_at.is_some() {
+                *x *= self.gain_s;
+            }
         }
     }
 }
@@ -365,6 +438,11 @@ pub(crate) const FEEDBACK: usize = 1;
 pub(crate) const DIFFUSION: usize = 2;
 pub(crate) const BRIGHTNESS: usize = 3;
 pub(crate) const REVERB_SMOOTH: usize = 4;
+pub(crate) const REVERB_STEP: usize = 5;
+pub(crate) const SIZE: usize = 6;
+
+/// The Size control's top, as a share: the memory is made for it.
+const SIZE_MAX: f32 = 200.0;
 
 /// Mix and Feedback on the pad, then the window's settings.
 pub(crate) static REVERB_PARAMS: &[ParamSpec] = &[
@@ -373,13 +451,15 @@ pub(crate) static REVERB_PARAMS: &[ParamSpec] = &[
     ParamSpec::new("diffusion", "Diffusion", 0.0, 150.0, 85.0).unit("%").kind(crate::ParamKind::Int).smooth(0.0),
     ParamSpec::new("brightness", "Brightness", 0.0, 100.0, 50.0).unit("%").kind(crate::ParamKind::Int).smooth(0.0),
     SMOOTHING.glides("mix"),
+    SMOOTHING_STEP.glides("mix"),
+    ParamSpec::new("size", "Size", 25.0, SIZE_MAX, 100.0).unit("%").smooth(0.0),
 ];
 
-/// Sample ages at another rate: each scaled and rounded, except that ages
-/// one or two apart in the original — the joins between stages — stay that
-/// far apart. At 44.1 kHz every age is the original's.
-fn scale_ages(ages: &[u32; 25], sample_rate: f32) -> [usize; 25] {
-    let ratio = f64::from(sample_rate) / HP_RATE;
+/// Sample ages at another rate and Size: each scaled and rounded, except
+/// that ages one or two apart in the original — the joins between stages —
+/// stay that far apart. At 44.1 kHz and 100 % every age is the original's.
+fn scale_ages(ages: &[u32; 25], sample_rate: f32, size: f32) -> [usize; 25] {
+    let ratio = f64::from(sample_rate) / HP_RATE * (f64::from(size) / 100.0);
     let mut sorted = *ages;
     sorted.sort_unstable();
     let mut scaled_sorted = [0usize; 25];
@@ -409,7 +489,7 @@ fn scale_ages(ages: &[u32; 25], sample_rate: f32) -> [usize; 25] {
 pub(crate) struct ReverbCore {
     room: Room,
     sample_rate: f32,
-    values: [f32; 5],
+    values: [f32; 7],
     taps: [usize; 25],
     buf: Vec<f32>,
     mask: usize,
@@ -433,9 +513,12 @@ pub(crate) struct ReverbCore {
 impl ReverbCore {
     pub(crate) fn new(room: Room, sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let taps = scale_ages(if room == Room::Hall { &HALL_TAPS } else { &MEDIUM_TAPS }, sample_rate);
-        let size = (taps.iter().max().copied().unwrap_or(0) + 2).next_power_of_two();
-        let mut values = [0.0; 5];
+        let ages = if room == Room::Hall { &HALL_TAPS } else { &MEDIUM_TAPS };
+        let taps = scale_ages(ages, sample_rate, REVERB_PARAMS[SIZE].default);
+        // Made for the largest Size, so a change of Size never allocates.
+        let longest = scale_ages(ages, sample_rate, SIZE_MAX);
+        let size = (longest.iter().max().copied().unwrap_or(0) + 2).next_power_of_two();
+        let mut values = [0.0; 7];
         for (v, spec) in values.iter_mut().zip(REVERB_PARAMS) {
             *v = spec.default;
         }
@@ -457,7 +540,7 @@ impl ReverbCore {
             lpi: 0.0,
             lpf: 0.0,
             glide: Glide::new(values[REVERB_SMOOTH]),
-            countdown: Countdown::new(sample_rate),
+            countdown: Countdown::every(values[REVERB_STEP], sample_rate),
         };
         for i in 0..REVERB_PARAMS.len() {
             k.apply(i);
@@ -470,6 +553,11 @@ impl ReverbCore {
     fn apply(&mut self, index: usize) {
         let v = f64::from(self.values[index]);
         match index {
+            REVERB_STEP => self.countdown.set_every(self.values[REVERB_STEP], self.sample_rate),
+            SIZE => {
+                let ages = if self.room == Room::Hall { &HALL_TAPS } else { &MEDIUM_TAPS };
+                self.taps = scale_ages(ages, self.sample_rate, self.values[SIZE]);
+            }
             MIX => self.mix = (0.01 * v) as f32,
             FEEDBACK => self.feedback = (0.01 * v) as f32,
             DIFFUSION => self.diffusion = (0.01 * v) as f32,
@@ -598,12 +686,14 @@ impl ReverbCore {
     }
 
     /// The loop's 60 dB decay, after the last tap: the Hall's loop gain is
-    /// Feedback, the Medium Room's Feedback squared.
+    /// Feedback, the Medium Room's Feedback squared. Size scales both spans.
     pub(crate) fn tail_seconds(&self) -> f32 {
         let (loop_len, longest) = match self.room {
             Room::Hall => (12_419.0, 12_421.0),
             Room::Medium => (13_104.0, 13_106.0),
         };
+        let scale = f64::from(self.values[SIZE]) / 100.0;
+        let (loop_len, longest) = (loop_len * scale, longest * scale);
         let fb = f64::from(self.feedback);
         let gain = if self.room == Room::Hall { fb } else { fb * fb };
         let tail = if gain <= 1e-3 {
@@ -614,5 +704,134 @@ impl ReverbCore {
             loop_len * (0.001f64.ln() / gain.ln())
         };
         ((longest + tail) / HP_RATE).min(60.0) as f32
+    }
+}
+
+/// What the Hyperprism ports' own tests share: a fixed stereo input, a render
+/// with settings from the start and settings moved partway, and a hash of
+/// the output's bits.
+#[cfg(test)]
+pub(crate) mod render {
+    use crate::Kernel;
+
+    /// Seconds of a 220 Hz sine on the left, 331 Hz on the right, each with
+    /// noise from a fixed seed, at −6 dB.
+    pub(crate) fn input(seconds: f32, sample_rate: f32) -> Vec<[f32; 2]> {
+        let n = (seconds * sample_rate) as usize;
+        let mut seed: u32 = 0x1234_5678;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        };
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / f64::from(sample_rate);
+                let l = (core::f64::consts::TAU * 220.0 * t).sin() as f32;
+                let r = (core::f64::consts::TAU * 331.0 * t).sin() as f32;
+                [0.35 * l + 0.15 * noise(), 0.35 * r + 0.15 * noise()]
+            })
+            .collect()
+    }
+
+    fn set<K: Kernel>(k: &mut K, settings: &[(&str, f32)]) {
+        for &(key, v) in settings {
+            let i = K::descriptor().index_of(key).unwrap_or_else(|| panic!("no control '{key}'"));
+            k.set_param(i, v);
+        }
+    }
+
+    /// The output for `start` set after `new`, and `moved` set a third of the
+    /// way in.
+    pub(crate) fn output<K: Kernel>(
+        sample_rate: f32,
+        seconds: f32,
+        start: &[(&str, f32)],
+        moved: &[(&str, f32)],
+    ) -> Vec<[f32; 2]> {
+        let mut k = K::new(sample_rate);
+        set(&mut k, start);
+        let mut frames = input(seconds, sample_rate);
+        let third = frames.len() / 3;
+        for (i, f) in frames.iter_mut().enumerate() {
+            if i == third {
+                set(&mut k, moved);
+            }
+            k.tick(f);
+        }
+        frames
+    }
+
+    /// FNV-1a over the output's bits.
+    pub(crate) fn hash(frames: &[[f32; 2]]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for f in frames {
+            for s in f {
+                for b in s.to_bits().to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+
+    /// `hash(output(…))`.
+    pub(crate) fn checksum<K: Kernel>(
+        sample_rate: f32,
+        seconds: f32,
+        start: &[(&str, f32)],
+        moved: &[(&str, f32)],
+    ) -> u64 {
+        hash(&output::<K>(sample_rate, seconds, start, moved))
+    }
+
+    /// The output with `settings` in place from the first frame: set, then
+    /// a reset, which lands every glide on its target.
+    pub(crate) fn settled<K: Kernel>(sample_rate: f32, seconds: f32, settings: &[(&str, f32)]) -> Vec<[f32; 2]> {
+        let mut k = K::new(sample_rate);
+        set(&mut k, settings);
+        k.reset();
+        let mut frames = input(seconds, sample_rate);
+        frames.iter_mut().for_each(|f| k.tick(f));
+        frames
+    }
+
+    /// How far a move a third of the way in is from having landed, summed
+    /// over the half second after it, with the Smoothing step at `step`: the
+    /// render from `start` moved by `moved`, against the render with both in
+    /// place from the start.
+    pub(crate) fn settle_error<K: Kernel>(
+        sample_rate: f32,
+        start: &[(&str, f32)],
+        moved: &[(&str, f32)],
+        step: f32,
+    ) -> f64 {
+        let mut start = start.to_vec();
+        start.push(("smoothingStep", step));
+        let got = output::<K>(sample_rate, 1.5, &start, moved);
+        let mut both = start.clone();
+        both.extend_from_slice(moved);
+        let landed = settled::<K>(sample_rate, 1.5, &both);
+        let third = got.len() / 3;
+        let window = third..third + (sample_rate / 2.0) as usize;
+        got[window.clone()]
+            .iter()
+            .zip(&landed[window])
+            .map(|(a, b)| f64::from((a[0] - b[0]).abs()) + f64::from((a[1] - b[1]).abs()))
+            .sum()
+    }
+
+    /// The smoothing step's errors at 1, the default and a long step are in
+    /// that order, each well apart.
+    pub(crate) fn assert_step_paces_the_glide<K: Kernel>(start: &[(&str, f32)], moved: &[(&str, f32)]) {
+        let default = K::descriptor().spec("smoothingStep").expect("a Smoothing step").default;
+        let [fast, normal, slow] = [1.0, default, 400.0].map(|n| settle_error::<K>(44_100.0, start, moved, n));
+        assert!(fast < 0.8 * normal && normal < 0.8 * slow, "step 1: {fast}, {default}: {normal}, 400: {slow}");
+    }
+
+    /// RMS of one side over a range of frames.
+    pub(crate) fn rms(frames: &[[f32; 2]], side: usize, range: core::ops::Range<usize>) -> f64 {
+        let n = range.len().max(1) as f64;
+        (frames[range].iter().map(|f| f64::from(f[side]) * f64::from(f[side])).sum::<f64>() / n).sqrt()
     }
 }

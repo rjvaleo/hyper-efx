@@ -24,14 +24,20 @@
 //!   a glide takes the same time anywhere. Frequencies are in hertz at the
 //!   host's rate, as the code's are at its own; below 44.1 kHz the frequency
 //!   is also held under 20 kHz × sr/44100, the pad window's share of the rate.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often the glide steps. The default is the
+//!   original exactly.
 
-use super::hp_fr::{EFilterCore, EFilterProcess, SMOOTHING};
+use super::hp_fr::{EFilterCore, EFilterProcess, SMOOTHING, SMOOTHING_STEP};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec};
 
 static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("freqHz", "Frequency", 0.0, 2_000.0, 1_000.0).unit("Hz").smooth(9.7),
     ParamSpec::new("q", "Q", 1.0, 10.0, 1.0).smooth(9.7),
     SMOOTHING.glides("freqHz"),
+    SMOOTHING_STEP.glides("freqHz"),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -45,6 +51,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Filter", keys: &["freqHz", "q"] },
             Group { label: "Settings", keys: &["smoothing"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["freqHz", "q"],
         displays: &[Display::Curve, Display::Meter],
@@ -79,5 +86,32 @@ impl Kernel for HpBandPass {
 
     fn tick(&mut self, frame: &mut [f32; 2]) {
         self.0.tick(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpBandPass>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpBandPass>(44_100.0, 3.0, &[("freqHz", 500.0), ("q", 4.0)], &[("freqHz", 1_500.0)]),
+            checksum::<HpBandPass>(48_000.0, 3.0, &[("freqHz", 200.0), ("q", 8.0), ("smoothing", 60.0)], &[("q", 2.0)]),
+        ];
+        assert_eq!(got, [10584316696350347020, 183338442048746097, 517227411517004566]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpBandPass>(
+            &[("freqHz", 500.0), ("q", 4.0)],
+            &[("freqHz", 1_500.0)],
+        );
     }
 }

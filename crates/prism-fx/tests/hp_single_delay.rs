@@ -82,7 +82,8 @@ fn controls_are_the_originals() {
     assert_eq!((d.code, d.label, d.source), (40, "Hyperprism Single Delay", "Hyperprism-PPC 1.2.1: Single Delay"));
     assert_eq!(d.category, prism_fx::Category::Delay);
     let keys: Vec<&str> = d.params.iter().map(|p| p.key).collect();
-    assert_eq!(keys, ["delayMs", "mix", "speed"]);
+    // The original's three, then the one added after it (see the module).
+    assert_eq!(keys, ["delayMs", "mix", "speed", "crossfade"]);
     let p = |key: &str| d.spec(key).unwrap();
     assert_eq!((p("delayMs").min, p("delayMs").max, p("delayMs").default), (0.0, 2000.0, 1000.0));
     assert_eq!((p("mix").min, p("mix").max, p("mix").default), (0.0, 100.0, 50.0));

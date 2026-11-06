@@ -45,9 +45,21 @@ pub(crate) struct Stepper {
 
 impl Stepper {
     pub(crate) fn new(sample_rate: f32, percent: f32) -> Self {
-        let period = scaled(SMOOTHING_PERIOD, sample_rate) as u32;
+        Stepper::every(SMOOTHING_PERIOD, sample_rate, percent)
+    }
+
+    /// A firing every `samples` at 44.1 kHz, scaled with the rate as the 45 is.
+    pub(crate) fn every(samples: f32, sample_rate: f32, percent: f32) -> Self {
+        let period = scaled(samples, sample_rate) as u32;
         let (a, b) = smoothing_coefficients(percent);
         Stepper { period, count: period - 1, a, b }
+    }
+
+    /// A new period, taking effect without a restart: a count already past
+    /// the new period is cut to it.
+    pub(crate) fn set_every(&mut self, samples: f32, sample_rate: f32) {
+        self.period = scaled(samples, sample_rate) as u32;
+        self.count = self.count.min(self.period - 1);
     }
 
     pub(crate) fn set_smoothing(&mut self, percent: f32) {
@@ -130,6 +142,18 @@ mod tests {
         let mut s = Stepper::new(44_100.0, 50.0);
         assert!((0..44).all(|_| !s.fires()) && s.fires());
         assert_eq!(scaled(45.0, 88_200.0), 90);
+    }
+
+    #[test]
+    fn a_stepper_of_another_period_fires_on_it() {
+        let mut s = Stepper::every(10.0, 44_100.0, 50.0);
+        let fired: Vec<usize> = (0..40).filter(|_| s.fires()).collect();
+        assert_eq!(fired, [9, 19, 29, 39]);
+        let mut s = Stepper::new(44_100.0, 50.0);
+        (0..5).for_each(|_| assert!(!s.fires()));
+        s.set_every(3.0, 44_100.0);
+        let fired: Vec<usize> = (0..9).filter(|_| s.fires()).collect();
+        assert_eq!(fired, [2, 5, 8]);
     }
 
     #[test]

@@ -18,13 +18,20 @@
 //! gain up, −96 to 0 dB. The original would also take typed balances past
 //! ±100 %, which turn θ past 0…π/2 and invert a channel; the range here is
 //! the window's.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often the three gains glide a step. The default is
+//!   the original exactly.
 
+use super::hp_fr::SMOOTHING_STEP;
 use super::hp_stereo_shared::Stepper;
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 
 const BALANCE: usize = 0;
 const GAIN_DB: usize = 1;
 const SMOOTHING: usize = 2;
+const STEP: usize = 3;
 
 /// The original's π/4: a double a little short of the true value.
 const QUARTER_PI: f64 = 0.785_398_141_75;
@@ -33,6 +40,7 @@ static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("balance", "LR Balance", -100.0, 100.0, 0.0).unit("%").smooth(0.0),
     ParamSpec::new("gainDb", "Gain", -96.0, 0.0, 0.0).unit("dB").smooth(0.0),
     ParamSpec::new("smoothing", "Smoothing", 0.0, 100.0, 50.0).unit("%").kind(ParamKind::Int).smooth(0.0),
+    SMOOTHING_STEP,
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -48,6 +56,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Pan", keys: &["balance", "gainDb"] },
             Group { label: "Settings", keys: &["smoothing"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["balance", "gainDb"],
         displays: &[Display::Meter],
@@ -58,7 +67,8 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
 };
 
 pub struct HpPan {
-    values: [f32; 3],
+    sample_rate: f32,
+    values: [f32; 4],
     /// Targets: left gain, right gain, overall gain.
     target: [f32; 3],
     smoothed: [f32; 3],
@@ -77,11 +87,12 @@ impl HpPan {
 impl Kernel for HpPan {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 4];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
-        let mut k = HpPan { values, target: [0.0; 3], smoothed: [0.0; 3], step: Stepper::new(sample_rate, values[SMOOTHING]) };
+        let step = Stepper::every(values[STEP], sample_rate, values[SMOOTHING]);
+        let mut k = HpPan { sample_rate, values, target: [0.0; 3], smoothed: [0.0; 3], step };
         k.targets();
         k.reset();
         k
@@ -96,6 +107,7 @@ impl Kernel for HpPan {
         self.values[index] = spec.clamp(value);
         match index {
             SMOOTHING => self.step.set_smoothing(self.values[SMOOTHING]),
+            STEP => self.step.set_every(self.values[STEP], self.sample_rate),
             _ => self.targets(),
         }
     }
@@ -118,5 +130,32 @@ impl Kernel for HpPan {
         let [gl, gr, g] = self.smoothed;
         frame[0] = g * (frame[0] * gl);
         frame[1] = g * (frame[1] * gr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpPan>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpPan>(44_100.0, 3.0, &[("balance", 60.0), ("gainDb", -12.0)], &[("balance", -80.0)]),
+            checksum::<HpPan>(48_000.0, 3.0, &[("smoothing", 30.0), ("gainDb", -30.0)], &[("gainDb", 0.0)]),
+        ];
+        assert_eq!(got, [16564445293895768245, 16637100687211378122, 14744019853957590286]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpPan>(
+            &[("balance", 60.0)],
+            &[("balance", -80.0)],
+        );
     }
 }

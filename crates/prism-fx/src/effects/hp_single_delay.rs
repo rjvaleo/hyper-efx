@@ -19,13 +19,19 @@
 //! listed for Echo: 0 ms is reached, a tap is never crossfaded with itself, a
 //! walk cannot stall, and a jump at speed 100 leaves no stale tap. Settings
 //! made before the first frame land at once.
+//!
+//! Added (not in the original): Crossfade, 64–32 768 samples at 44.1 kHz,
+//! default 4096: the shortest step of a walk, the 4096 in
+//! `max(4096, |distance|)`, scaled with the rate. Default 4096 is the
+//! original exactly.
 
-use super::hp_echo::{fraction, Delay2, LONGEST_MS};
+use super::hp_echo::{fraction, Delay2, CROSSFADE_SPEC, LONGEST_MS};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 
 const DELAY: usize = 0;
 const MIX: usize = 1;
 const SPEED: usize = 2;
+const CROSSFADE: usize = 3;
 
 static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("delayMs", "Delay", 0.0, LONGEST_MS, 1000.0).unit("ms").smooth(0.0),
@@ -35,6 +41,7 @@ static PARAMS: &[ParamSpec] = &[
         .kind(ParamKind::Int)
         .smooth(0.0)
         .glides("delayMs"),
+    CROSSFADE_SPEC,
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -47,7 +54,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
     panel: Panel {
         groups: &[
             Group { label: "Pad", keys: &["delayMs", "mix"] },
-            Group { label: "Additional settings", keys: &["speed"] },
+            Group { label: "Additional settings", keys: &["speed", "crossfade"] },
         ],
         primary: &["delayMs", "mix"],
         displays: &[Display::Meter],
@@ -58,7 +65,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
 };
 
 pub struct HpSingleDelay {
-    values: [f32; 3],
+    values: [f32; 4],
     delay: Delay2,
     mix: f32,
     dry: f32,
@@ -70,13 +77,14 @@ impl HpSingleDelay {
         self.mix = fraction(self.values[MIX]);
         self.dry = (1.0 - self.mix as f64) as f32;
         self.step = fraction(self.values[SPEED]);
+        self.delay.set_crossfade(self.values[CROSSFADE]);
     }
 }
 
 impl Kernel for HpSingleDelay {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 4];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -113,5 +121,48 @@ impl Kernel for HpSingleDelay {
 
     fn tail_seconds(&self) -> f32 {
         self.delay.seconds()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hp_delay_law::golden::hash_of;
+    use super::*;
+
+    fn hashes() -> [u64; 4] {
+        let h = hash_of::<HpSingleDelay>;
+        [
+            h(44_100.0, 4.0, &[], &[(88_200, DELAY, 400.0)]),
+            h(44_100.0, 4.0, &[(MIX, 100.0), (DELAY, 300.0)], &[(40_000, DELAY, 1_700.0), (120_000, DELAY, 10.0)]),
+            h(44_100.0, 4.0, &[(SPEED, 20.0), (MIX, 70.0)], &[(30_000, DELAY, 250.0)]),
+            h(48_000.0, 4.0, &[], &[(96_000, DELAY, 600.0)]),
+        ]
+    }
+
+    #[test]
+    fn the_crossfade_reaches_the_walk() {
+        // 1000 ms to 500 ms at 99 %: a 22 050-sample step, and then one of
+        // 220.5 samples, which lasts the crossfade.
+        let render = |crossfade: f32| {
+            let mut k = HpSingleDelay::new(44_100.0);
+            k.set_param(SPEED, 99.0);
+            k.set_param(MIX, 100.0);
+            k.set_param(CROSSFADE, crossfade);
+            let input = super::super::hp_delay_law::golden::input(3.0, 44_100.0);
+            super::super::hp_delay_law::golden::render(&mut k, &input, |k, i| {
+                if i == 1 {
+                    k.set_param(DELAY, 500.0);
+                }
+            })
+        };
+        let (a, b) = (render(4_096.0), render(256.0));
+        let first = a.iter().zip(&b).position(|(x, y)| x != y).unwrap();
+        // The two agree through the first, long step.
+        assert!(first > 22_050, "{first}");
+    }
+
+    #[test]
+    fn defaults_render_as_the_original() {
+        assert_eq!(hashes(), [12387532202999560235, 7173241853870491397, 18270784688647093312, 6411789358579832841]);
     }
 }

@@ -27,7 +27,18 @@
 //!
 //! Not reproduced: the original's depth slot starts at 100 (×100) until the
 //! window sends its start value; here the depth is always the control's.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often α, β, γ and the depth glide a step.
+//!   The default is the original exactly.
+//! - **Low-cut Q**, 0.3–5, default 1/√2: the high-pass's Q, fixed at the
+//!   Butterworth's in the original. β takes `sin w/(2Q)` where the code has
+//!   `sin w/√2`; at the default it is the code's √2 itself, so the default is
+//!   the original exactly. Below 1/√2 the corner softens; above it a peak
+//!   rises at the low cut, in the comb's injected part only.
 
+use super::hp_fr::SMOOTHING_STEP;
 use super::hp_stereo_shared::{scaled, Stepper};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 
@@ -36,6 +47,11 @@ const LOW_CUT: usize = 1;
 const DELAY: usize = 2;
 const SMOOTHING: usize = 3;
 const MONO: usize = 4;
+const STEP: usize = 5;
+const LOW_CUT_Q: usize = 6;
+
+/// The high-pass's Q in the original: the Butterworth's.
+const BUTTERWORTH_Q: f32 = core::f32::consts::FRAC_1_SQRT_2;
 
 /// The ring at 44.1 kHz.
 const RING: f32 = 1_920.0;
@@ -47,6 +63,8 @@ static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("delayMs", "Delay Time", 0.0, LONGEST_MS, 25.0).unit("ms").kind(ParamKind::Int).smooth(0.0),
     ParamSpec::new("smoothing", "Smoothing", 0.0, 100.0, 50.0).unit("%").kind(ParamKind::Int).smooth(0.0),
     ParamSpec::new("mono", "Mono input", 0.0, 1.0, 0.0).kind(ParamKind::Toggle).smooth(0.0),
+    SMOOTHING_STEP,
+    ParamSpec::new("lowCutQ", "Low-cut Q", 0.3, 5.0, BUTTERWORTH_Q).smooth(0.0),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -62,6 +80,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Width", keys: &["depth", "lowCutHz"] },
             Group { label: "Settings", keys: &["delayMs", "smoothing", "mono"] },
+            Group { label: "Added (not in the original)", keys: &["lowCutQ", "smoothingStep"] },
         ],
         primary: &["depth", "lowCutHz"],
         displays: &[Display::Meter],
@@ -79,7 +98,7 @@ fn madd(p: f32, q: f32, t: f32) -> f32 {
 
 pub struct HpQuasiStereo {
     sample_rate: f32,
-    values: [f32; 5],
+    values: [f32; 7],
     ring: Box<[f32]>,
     write: usize,
     read: usize,
@@ -110,8 +129,10 @@ impl HpQuasiStereo {
         let w = ((std::f64::consts::TAU * f) / sr) as f32 as f64;
         let s = w.sin() as f32 as f64;
         let c = w.cos() as f32 as f64;
-        let root2 = 2f64.sqrt();
-        let beta = (0.5 * ((1.0 - s / root2) / (1.0 + s / root2))) as f32;
+        // 2Q: at the Butterworth's Q, the code's √2.
+        let q = self.values[LOW_CUT_Q];
+        let two_q = if q == BUTTERWORTH_Q { 2f64.sqrt() } else { 2.0 * q as f64 };
+        let beta = (0.5 * ((1.0 - s / two_q) / (1.0 + s / two_q))) as f32;
         let half_beta = 0.5 + beta as f64;
         let gamma = (half_beta * c) as f32;
         let alpha = (0.25 * (half_beta + gamma as f64)) as f32;
@@ -139,7 +160,7 @@ impl HpQuasiStereo {
 impl Kernel for HpQuasiStereo {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 5];
+        let mut values = [0.0; 7];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -158,7 +179,7 @@ impl Kernel for HpQuasiStereo {
             x2: 0.0,
             y1: 0.0,
             y2: 0.0,
-            step: Stepper::new(sample_rate, values[SMOOTHING]),
+            step: Stepper::every(values[STEP], sample_rate, values[SMOOTHING]),
         };
         k.high_pass();
         k.depth();
@@ -177,9 +198,10 @@ impl Kernel for HpQuasiStereo {
         self.values[index] = v;
         match index {
             DEPTH => self.depth(),
-            LOW_CUT => self.high_pass(),
+            LOW_CUT | LOW_CUT_Q => self.high_pass(),
             DELAY if changed => self.taps(),
             SMOOTHING => self.step.set_smoothing(v),
+            STEP => self.step.set_every(v, self.sample_rate),
             _ => {}
         }
     }
@@ -236,5 +258,78 @@ impl Kernel for HpQuasiStereo {
 
     fn tail_seconds(&self) -> f32 {
         self.delay() as f32 / self.sample_rate + 0.1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpQuasiStereo>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpQuasiStereo>(
+                44_100.0,
+                3.0,
+                &[("depth", 80.0), ("lowCutHz", 500.0), ("delayMs", 10.0)],
+                &[("lowCutHz", 2_000.0)],
+            ),
+            checksum::<HpQuasiStereo>(
+                48_000.0,
+                3.0,
+                &[("depth", 30.0), ("lowCutHz", 100.0), ("smoothing", 20.0), ("mono", 1.0)],
+                &[("depth", 90.0)],
+            ),
+        ];
+        assert_eq!(got, [7952222075962207534, 11057299279536035753, 14101189837107582786]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpQuasiStereo>(
+            &[("depth", 80.0)],
+            &[("depth", 10.0)],
+        );
+    }
+
+    /// The injected high-pass's gain at `hz`, from L − R = 2·depth·HP(mid),
+    /// in dB, with the low cut at 500 Hz and the depth at 100 %.
+    fn injected_db(q: f32, hz: f64) -> f64 {
+        let mut k = HpQuasiStereo::new(44_100.0);
+        let d = HpQuasiStereo::descriptor();
+        for (key, v) in [("depth", 100.0), ("lowCutHz", 500.0), ("lowCutQ", q)] {
+            k.set_param(d.index_of(key).unwrap(), v);
+        }
+        k.reset();
+        let mut peak = 0f64;
+        for i in 0..44_100 {
+            let x = 0.25 * (core::f64::consts::TAU * hz * i as f64 / 44_100.0).sin() as f32;
+            let mut frame = [x, x];
+            k.tick(&mut frame);
+            if i > 22_050 {
+                peak = peak.max(f64::from(frame[0] - frame[1]).abs() / 2.0);
+            }
+        }
+        20.0 * (peak / 0.25).log10()
+    }
+
+    #[test]
+    fn the_low_cut_q_sets_the_response_at_the_corner() {
+        // At the corner a high-pass of this form has a gain of Q: −3 dB at
+        // the Butterworth's 1/√2.
+        for q in [0.3, BUTTERWORTH_Q, 2.0, 5.0] {
+            let got = injected_db(q, 500.0);
+            let want = 20.0 * f64::from(q).log10();
+            assert!((got - want).abs() < 0.1, "Q {q}: {got:.2} dB at the corner, want {want:.2}");
+        }
+        // Well above the corner the passband stays unity whatever the Q.
+        for q in [0.3, 2.0] {
+            assert!(injected_db(q, 8_000.0).abs() < 0.3, "Q {q}");
+        }
     }
 }

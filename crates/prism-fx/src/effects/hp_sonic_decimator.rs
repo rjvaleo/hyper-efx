@@ -23,18 +23,26 @@
 //! wrapping. The original cast to a 16-bit short, so a float of +1 (32768)
 //! came out as −32768, and anything past full scale folded over; from 16-bit
 //! files it never saw such values, from a float host it does.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often rate and bits glide a step. The default is
+//!   the original exactly.
 
+use super::hp_fr::SMOOTHING_STEP;
 use super::hp_stereo_shared::{Stepper, FULL_SCALE};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
 
 const RATE: usize = 0;
 const BITS: usize = 1;
 const SMOOTHING: usize = 2;
+const STEP: usize = 3;
 
 static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("rate", "Sample Rate", 1.0, 100.0, 50.0).unit("%").smooth(0.0),
     ParamSpec::new("bits", "Bit Depth", 1.0, 16.0, 8.0).unit("bits").smooth(0.0),
     ParamSpec::new("smoothing", "Smoothing", 0.0, 100.0, 30.0).unit("%").kind(ParamKind::Int).smooth(0.0),
+    SMOOTHING_STEP,
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -50,6 +58,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Decimate", keys: &["rate", "bits"] },
             Group { label: "Settings", keys: &["smoothing"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["rate", "bits"],
         displays: &[Display::Meter],
@@ -72,7 +81,8 @@ fn floor_to(v: i32, shift: i32) -> i32 {
 }
 
 pub struct HpSonicDecimator {
-    values: [f32; 3],
+    sample_rate: f32,
+    values: [f32; 4],
     /// Targets: rate as a fraction, bits.
     rate: f32,
     bits: f32,
@@ -101,11 +111,12 @@ impl HpSonicDecimator {
 impl Kernel for HpSonicDecimator {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 4];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
         let mut k = HpSonicDecimator {
+            sample_rate,
             values,
             rate: 0.0,
             bits: 0.0,
@@ -115,7 +126,7 @@ impl Kernel for HpSonicDecimator {
             whole: 16,
             held: [0.0; 2],
             count: 0.0,
-            step: Stepper::new(sample_rate, values[SMOOTHING]),
+            step: Stepper::every(values[STEP], sample_rate, values[SMOOTHING]),
         };
         k.targets();
         k.reset();
@@ -131,6 +142,7 @@ impl Kernel for HpSonicDecimator {
         self.values[index] = spec.clamp(value);
         match index {
             SMOOTHING => self.step.set_smoothing(self.values[SMOOTHING]),
+            STEP => self.step.set_every(self.values[STEP], self.sample_rate),
             _ => self.targets(),
         }
     }
@@ -168,5 +180,37 @@ impl Kernel for HpSonicDecimator {
             let q2 = floor_to(v, fine);
             *out = ((q2 - q1) as f32 * fraction + q1 as f32) / FULL_SCALE;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpSonicDecimator>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpSonicDecimator>(44_100.0, 3.0, &[("rate", 30.0), ("bits", 5.5)], &[("bits", 12.0)]),
+            checksum::<HpSonicDecimator>(
+                48_000.0,
+                3.0,
+                &[("rate", 80.0), ("bits", 3.0), ("smoothing", 60.0)],
+                &[("rate", 10.0)],
+            ),
+        ];
+        assert_eq!(got, [5877925302365260789, 3714870018392712440, 3641172298338581280]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpSonicDecimator>(
+            &[("bits", 12.0)],
+            &[("bits", 3.0)],
+        );
     }
 }

@@ -120,7 +120,8 @@ fn controls_are_the_originals() {
     assert_eq!((d.code, d.label, d.source), (44, "Hyperprism Comb Filter", "Hyperprism-PPC 1.2.1: Comb Filter"));
     assert_eq!(d.category, prism_fx::Category::Filter);
     let keys: Vec<&str> = d.params.iter().map(|p| p.key).collect();
-    assert_eq!(keys, ["delayMs", "depth", "smoothing"]);
+    // The original's three, then the ones added after it (see the module).
+    assert_eq!(keys, ["delayMs", "depth", "smoothing", "feedback", "smoothingStep"]);
     let p = |key: &str| d.spec(key).unwrap();
     assert_eq!((p("delayMs").min, p("delayMs").max, p("delayMs").default), (0.0, 100.0, 50.0));
     assert_eq!((p("depth").min, p("depth").max, p("depth").default), (0.0, 100.0, 0.0));

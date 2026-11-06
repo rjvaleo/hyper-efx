@@ -37,18 +37,25 @@
 //! - **Rate.** The 45-sample step is scaled with the rate (49 at 48 kHz), so
 //!   a glide takes the same time anywhere. Frequencies are in hertz at the
 //!   host's rate, as the code's are at its own.
+//!
+//! Added (not in the original):
+//! - **Smoothing step**, 1–2048 samples at 44.1 kHz (scaled with the rate as
+//!   the 45 is), default 45: how often α, β, γ and g glide a step. The default is the
+//!   original exactly.
 
-use super::hp_fr::{Abg, Coefs, Countdown, Glide, Section, SMOOTHING};
+use super::hp_fr::{Abg, Coefs, Countdown, Glide, Section, SMOOTHING, SMOOTHING_STEP};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec};
 
 const LEVEL: usize = 0;
 const LOW_CUT: usize = 1;
 const SMOOTH: usize = 2;
+const STEP: usize = 3;
 
 static PARAMS: &[ParamSpec] = &[
     ParamSpec::new("level", "Stereo Level", 0.0, 300.0, 150.0).unit("%").smooth(9.7),
     ParamSpec::new("lowCutHz", "Low Cut", 0.0, 6_000.0, 0.0).unit("Hz").smooth(9.7),
     SMOOTHING.glides("level"),
+    SMOOTHING_STEP.glides("level"),
 ];
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
@@ -62,6 +69,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         groups: &[
             Group { label: "Stereo", keys: &["level", "lowCutHz"] },
             Group { label: "Settings", keys: &["smoothing"] },
+            Group { label: "Added (not in the original)", keys: &["smoothingStep"] },
         ],
         primary: &["level", "lowCutHz"],
         displays: &[Display::Scope, Display::Meter],
@@ -97,7 +105,7 @@ fn butterworth(f: f32, sample_rate: f32) -> Abg {
 
 pub struct HpMoreStereo {
     sample_rate: f32,
-    values: [f32; 3],
+    values: [f32; 4],
     target: Abg,
     smoothed: Abg,
     /// g, as SetParameter stores it, and its glide.
@@ -112,7 +120,7 @@ pub struct HpMoreStereo {
 impl Kernel for HpMoreStereo {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 3];
+        let mut values = [0.0; 4];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -126,7 +134,7 @@ impl Kernel for HpMoreStereo {
             coefs: Coefs::default(),
             side: Section::default(),
             glide: Glide::new(values[SMOOTH]),
-            countdown: Countdown::new(sample_rate),
+            countdown: Countdown::every(values[STEP], sample_rate),
         };
         k.set_param(LEVEL, values[LEVEL]);
         k.set_param(LOW_CUT, values[LOW_CUT]);
@@ -145,7 +153,8 @@ impl Kernel for HpMoreStereo {
         match index {
             LEVEL => self.gain = ((f64::from(v) - 100.0) / 200.0) as f32,
             LOW_CUT => self.target = butterworth(v, self.sample_rate),
-            _ => self.glide = Glide::new(v),
+            SMOOTH => self.glide = Glide::new(v),
+            _ => self.countdown.set_every(v, self.sample_rate),
         }
     }
 
@@ -172,5 +181,37 @@ impl Kernel for HpMoreStereo {
         let g = f64::from(self.gain_s);
         frame[0] = (h * g + f64::from(l)) as f32;
         frame[1] = -((h * g - f64::from(r)) as f32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::hp_fr::render::checksum;
+
+    /// The renders before any control was added, at the defaults and at two
+    /// other settings, one at 48 kHz: the added controls at their defaults
+    /// leave every bit as it was.
+    #[test]
+    fn defaults_render_as_the_original() {
+        let got = [
+            checksum::<HpMoreStereo>(44_100.0, 3.0, &[], &[]),
+            checksum::<HpMoreStereo>(44_100.0, 3.0, &[("level", 250.0), ("lowCutHz", 300.0)], &[("level", 50.0)]),
+            checksum::<HpMoreStereo>(
+                48_000.0,
+                3.0,
+                &[("level", 0.0), ("lowCutHz", 1_000.0), ("smoothing", 60.0)],
+                &[("lowCutHz", 100.0)],
+            ),
+        ];
+        assert_eq!(got, [13459003854452520756, 17161291872567083114, 7275150955604991193]);
+    }
+
+    #[test]
+    fn the_smoothing_step_paces_the_glide() {
+        crate::effects::hp_fr::render::assert_step_paces_the_glide::<HpMoreStereo>(
+            &[("level", 250.0), ("lowCutHz", 300.0)],
+            &[("level", 50.0)],
+        );
     }
 }

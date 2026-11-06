@@ -47,6 +47,13 @@
 //!   times and full feedback.
 //! - Settings made before the first frame land at once, as the original's
 //!   initialisation copies the target time into its taps.
+//!
+//! Added (not in the original): Crossfade, 64–32 768 samples at 44.1 kHz,
+//! default 4096: the shortest step of a walk, the 4096 in
+//! `max(4096, |distance|)`, scaled with the rate as that count is. Shorter
+//! makes a time change quicker and its crossfades more audible; longer, a
+//! slower, smoother walk. A step under way keeps its length. Default 4096 is
+//! the original exactly.
 
 use super::hp_delay_law::{count, samples, Line};
 use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
@@ -56,6 +63,7 @@ const DELAY: usize = 0;
 const FEEDBACK: usize = 1;
 const MIX: usize = 2;
 const SPEED: usize = 3;
+const CROSSFADE: usize = 4;
 
 /// The longest time, in ms.
 pub(crate) const LONGEST_MS: f32 = 2000.0;
@@ -71,7 +79,15 @@ static PARAMS: &[ParamSpec] = &[
         .kind(ParamKind::Int)
         .smooth(0.0)
         .glides("delayMs"),
+    CROSSFADE_SPEC,
 ];
+
+/// The walk's shortest step, shared with Single Delay.
+pub(crate) const CROSSFADE_SPEC: ParamSpec = ParamSpec::new("crossfade", "Crossfade", 64.0, 32_768.0, 4_096.0)
+    .unit("samples")
+    .kind(ParamKind::Int)
+    .smooth(0.0)
+    .glides("delayMs");
 
 pub static DESCRIPTOR: Descriptor = Descriptor {
     id: "hp-echo",
@@ -85,7 +101,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
         // additional-settings sliders.
         groups: &[
             Group { label: "Pad", keys: &["delayMs", "feedback"] },
-            Group { label: "Additional settings", keys: &["speed", "mix"] },
+            Group { label: "Additional settings", keys: &["speed", "mix", "crossfade"] },
         ],
         primary: &["delayMs", "feedback", "mix"],
         displays: &[Display::Meter],
@@ -156,6 +172,11 @@ impl Delay2 {
         self.next = d;
         self.target = 0.0;
         self.moving = false;
+    }
+
+    /// The walk's shortest step, in samples at 44.1 kHz.
+    pub(crate) fn set_crossfade(&mut self, samples: f32) {
+        self.shortest = count(samples as i32, self.sample_rate);
     }
 
     /// A new time: a target to walk to, or at speed 100 a jump.
@@ -243,7 +264,7 @@ pub(crate) fn fraction(v: f32) -> f32 {
 }
 
 pub struct HpEcho {
-    values: [f32; 4],
+    values: [f32; 5],
     delay: Delay2,
     feedback: f32,
     mix: f32,
@@ -257,13 +278,14 @@ impl HpEcho {
         self.mix = fraction(self.values[MIX]);
         self.dry = (1.0 - self.mix as f64) as f32;
         self.step = fraction(self.values[SPEED]);
+        self.delay.set_crossfade(self.values[CROSSFADE]);
     }
 }
 
 impl Kernel for HpEcho {
     fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);
-        let mut values = [0.0; 4];
+        let mut values = [0.0; 5];
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
@@ -309,5 +331,66 @@ impl Kernel for HpEcho {
             return longest;
         }
         (longest * (0.001f32.ln() / gain.ln()).ceil()).min(60.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hp_delay_law::golden::hash_of;
+    use super::*;
+
+    fn hashes() -> [u64; 4] {
+        let h = hash_of::<HpEcho>;
+        [
+            h(44_100.0, 4.0, &[], &[(88_200, DELAY, 400.0)]),
+            h(44_100.0, 4.0, &[(FEEDBACK, 60.0), (DELAY, 300.0)], &[(40_000, DELAY, 1_700.0), (120_000, DELAY, 10.0)]),
+            h(44_100.0, 4.0, &[(SPEED, 20.0), (MIX, 80.0), (FEEDBACK, 30.0)], &[(30_000, DELAY, 250.0)]),
+            h(48_000.0, 4.0, &[(FEEDBACK, 40.0)], &[(96_000, DELAY, 600.0)]),
+        ]
+    }
+
+    /// From 1000 ms to 990 ms (441 samples) at 99 %: the first step's
+    /// length, and frames until the walk is done.
+    fn walk(crossfade: f32, sample_rate: f32) -> (i32, usize) {
+        let mut k = HpEcho::new(sample_rate);
+        k.set_param(SPEED, 99.0);
+        k.set_param(CROSSFADE, crossfade);
+        let mut f = [0.0; 2];
+        k.tick(&mut f);
+        k.set_param(DELAY, 990.0);
+        let mut first = None;
+        for n in 1..1_000_000 {
+            k.tick(&mut f);
+            if first.is_none() && k.delay.length != k.delay.first && k.delay.length != k.delay.idle {
+                first = Some(k.delay.length);
+            }
+            if !k.delay.moving {
+                return (first.unwrap(), n);
+            }
+        }
+        panic!("the walk never ended");
+    }
+
+    #[test]
+    fn the_crossfade_sets_how_long_a_time_change_takes() {
+        // Steps of 441, 4.41 and 0.0441 samples, then the target: each step
+        // lasts max(crossfade, distance).
+        let (first, default) = walk(4_096.0, 44_100.0);
+        assert_eq!(first, 4_096);
+        let (first, short) = walk(64.0, 44_100.0);
+        assert_eq!(first, 441);
+        let (first, long) = walk(32_768.0, 44_100.0);
+        assert_eq!(first, 32_768);
+        // Each walk waits up to 2049 samples to begin, then runs its steps.
+        assert!((4_096 * 3..4_096 * 3 + 2_049 + 4_096).contains(&default), "{default}");
+        assert!(short < 441 + 64 * 3 + 2_049 + 64, "{short}");
+        assert!(long > 32_768 * 3, "{long}");
+        // Scaled with the rate.
+        assert_eq!(walk(4_096.0, 48_000.0).0, 4_458);
+    }
+
+    #[test]
+    fn defaults_render_as_the_original() {
+        assert_eq!(hashes(), [12387532202999560235, 12855732709087454009, 99845474641824827, 3676454022240175079]);
     }
 }

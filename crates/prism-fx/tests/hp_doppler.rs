@@ -122,7 +122,7 @@ fn controls() {
     assert_eq!((d.code, d.label, d.source), (45, "Hyperprism Doppler", "Hyperprism-PPC 1.2.1: Doppler"));
     assert_eq!(d.category, prism_fx::Category::Stereo);
     let keys: Vec<&str> = d.params.iter().map(|p| p.key).collect();
-    assert_eq!(keys, ["xM", "yM", "smoothing"]);
+    assert_eq!(keys, ["xM", "yM", "smoothing", "smoothingStep"]);
     let p = |key: &str| d.spec(key).unwrap();
     assert_eq!((p("smoothing").min, p("smoothing").max, p("smoothing").default), (0.0, 100.0, 50.0));
     assert!(d.params.iter().all(|s| !s.log));
