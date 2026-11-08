@@ -67,6 +67,8 @@ pub struct VocoderStream {
 
     scratch: Vec<f32>,
     peak_idx: Vec<usize>,
+    /// How far along its wander the pitch drift has got.
+    drift: crate::grain::DriftClock,
 
     /// The analysis and synthesis window, rebuilt only when its shape changes.
     win: Vec<f32>,
@@ -138,6 +140,7 @@ impl VocoderStream {
             write: 0,
             emitted: 0,
             index: 0,
+            drift: crate::grain::DriftClock::default(),
             first: true,
             ended: false,
             acc: vec![0.0; ring * channels],
@@ -219,6 +222,7 @@ impl VocoderStream {
         self.first = true;
         self.ended = false;
         self.prev_start = -1;
+        self.drift.reset();
 
         let n = crate::stretch::fft_size_for(p.vocoder.window_ms, p.sample_rate);
         let hs = crate::stretch::hop_frames(&p.grain, n, p.sample_rate.max(1) as f32).max(1);
@@ -342,7 +346,8 @@ impl VocoderStream {
                 (start as isize - self.prev_start) as f32
             };
             let ha = if ha.abs() < 1e-6 { hs as f32 } else { ha };
-            let rate = crate::stretch::grain_rate(&g, self.index, self.write as f32 / sr);
+            let x = self.drift.place(self.write, sr, g.drift_rate_hz);
+            let rate = crate::stretch::grain_rate(&g, self.index, x);
 
             if s.stereo_link && channels > 1 {
                 self.link(n, bins, channels, ha, hs, rate, s);
@@ -590,6 +595,27 @@ mod tests {
             at += n;
         }
         out
+    }
+
+
+    /// A new Drift rate changes the speed and not the place: see `DriftClock`.
+    #[test]
+    fn a_change_of_rate_leaves_the_drift_where_it_was() {
+        let input = vec![0.1f32; RATE as usize * 2];
+        let mut sp = spec(1.0);
+        sp.grain.pitch_drift_semis = 8.0;
+        sp.grain.drift_rate_hz = 0.5;
+        let mut p = params(&sp);
+        let mut s = VocoderStream::new(512, 1);
+        s.seek(RATE as u64 * 100, RATE as usize * 2, &p);
+        let mut buf = vec![0f32; 512];
+        s.render(&mut buf, 1, &input, &p);
+        let sr = RATE as f32;
+        let before = s.drift.place(s.write, sr, 0.5);
+        p.grain.drift_rate_hz = 0.51;
+        s.render(&mut buf, 1, &input, &p);
+        let after = s.drift.place(s.write, sr, 0.51);
+        assert!((after - before).abs() < 0.05, "the drift moved {} nodes in a block", (after - before).abs());
     }
 
     fn spec(ratio: f32) -> Stretch {

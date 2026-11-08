@@ -98,6 +98,8 @@ pub struct WsolaStream {
     emitted: u64,
     /// Grain index, which is what all the randomness is addressed by.
     index: u64,
+    /// How far along its wander the pitch drift has got.
+    drift: crate::grain::DriftClock,
     first: bool,
 
     /// Where each output instant comes from, when transients are being held at
@@ -140,6 +142,7 @@ impl WsolaStream {
             write: 0,
             emitted: 0,
             index: 0,
+            drift: crate::grain::DriftClock::default(),
             first: true,
             map: None,
             anchor: crate::anchor::Anchor::default(),
@@ -222,6 +225,7 @@ impl Streamer for WsolaStream {
         self.emitted = out_frame;
         self.write = out_frame;
         self.first = true;
+        self.drift.reset();
         let sr = p.sample_rate.max(1) as f32;
         let win = (((p.window_ms.clamp(5.0, MAX_WINDOW_MS) / 1000.0) * sr) as usize).max(64) & !1;
         let hop = crate::stretch::hop_frames(&p.grain, win, sr).max(1);
@@ -321,7 +325,8 @@ impl Streamer for WsolaStream {
             } else {
                 pos
             };
-            let rate = crate::stretch::grain_rate(g, self.index, self.write as f32 / sr);
+            let x = self.drift.place(self.write, sr, g.drift_rate_hz);
+            let rate = crate::stretch::grain_rate(g, self.index, x);
             let (gl, gr) = crate::grain::pan_gains(g, self.index, channels);
             let span = (len as f32) * rate;
 
@@ -866,6 +871,27 @@ mod tests {
             at += n;
         }
         out
+    }
+
+
+    /// A new Drift rate changes the speed and not the place: see `DriftClock`.
+    #[test]
+    fn a_change_of_rate_leaves_the_drift_where_it_was() {
+        let input = vec![0.1f32; RATE as usize * 2];
+        let mut sp = spec(1.0);
+        sp.grain.pitch_drift_semis = 8.0;
+        sp.grain.drift_rate_hz = 0.5;
+        let mut p = params(&sp);
+        let mut s = WsolaStream::new(512, 1, RATE);
+        s.seek(RATE as u64 * 100, RATE as usize * 2, &p);
+        let mut buf = vec![0f32; 512];
+        s.render(&mut buf, 1, &input, &p);
+        let sr = RATE as f32;
+        let before = s.drift.place(s.write, sr, 0.5);
+        p.grain.drift_rate_hz = 0.51;
+        s.render(&mut buf, 1, &input, &p);
+        let after = s.drift.place(s.write, sr, 0.51);
+        assert!((after - before).abs() < 0.05, "the drift moved {} nodes in a block", (after - before).abs());
     }
 
     fn spec(ratio: f32) -> Stretch {

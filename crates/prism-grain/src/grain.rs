@@ -251,10 +251,13 @@ impl Grain {
     /// Value noise rather than white noise: drift is meant to be heard as
     /// slowly going out of tune, which needs neighbouring moments to agree.
     pub fn drift_at(&self, t: f32) -> f32 {
-        let rate = self.drift_rate_hz.max(0.01);
-        let x = t * rate;
+        self.drift_at_place((t * self.drift_rate_hz.max(0.01)) as f64)
+    }
+
+    /// The same wander, at `x` nodes along it rather than at a time.
+    pub(crate) fn drift_at_place(&self, x: f64) -> f32 {
         let i = x.floor().max(0.0) as u64;
-        let f = x - x.floor();
+        let f = (x - x.floor()) as f32;
         let a = self.rand_bipolar(i, 77);
         if self.drift_step {
             // Hold each value until the next node. Same nodes, no glide — the
@@ -283,6 +286,65 @@ impl Grain {
     pub fn pitch_offset(&self, index: u64, t: f32) -> f32 {
         self.pitch_jitter_semis * self.rand_bipolar(index, self.salt(11))
             + self.pitch_drift_semis * self.drift_at(t)
+    }
+
+    /// The same offset, with the drift `x` nodes along its wander.
+    pub(crate) fn pitch_offset_at_place(&self, index: u64, x: f64) -> f32 {
+        self.pitch_jitter_semis * self.rand_bipolar(index, self.salt(11))
+            + self.pitch_drift_semis * self.drift_at_place(x)
+    }
+}
+
+/// How far along its wander a playing stream's drift has got.
+///
+/// Worked out as time × rate, the smallest change of rate a long way into a
+/// sound moved the place by whole nodes: 14 semitones in one hop, at a hundred
+/// seconds, for 0.01 Hz. So a stream carries its place, and a new rate changes
+/// the speed from here on and nothing else.
+///
+/// Until the rate moves, this is exactly `drift_at`'s arithmetic, because the
+/// offline render has no history to carry and has to come out the same. A seek
+/// goes back to it, so scrubbing to a moment still gives that moment's grains.
+///
+/// Bit patterns rather than floats, because `GrainStream` is `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DriftClock {
+    /// The rate it is running at. Zero until the first grain.
+    rate: u32,
+    /// The output frame the place below was taken at.
+    at: i64,
+    /// Nodes along, at that frame.
+    x: u64,
+}
+
+impl DriftClock {
+    /// Back to the arithmetic an offline render uses.
+    pub(crate) fn reset(&mut self) {
+        *self = DriftClock::default();
+    }
+
+    /// The playhead was relabelled (`GrainStream::shift`): no time has passed.
+    pub(crate) fn shift(&mut self, delta: i64) {
+        self.at += delta;
+    }
+
+    fn place_at(&self, write: u64, sr: f32, rate: f32) -> f64 {
+        let dt = (write as i64 - self.at).max(0) as f32 / sr;
+        f64::from_bits(self.x) + (dt * rate) as f64
+    }
+
+    /// The place at output frame `write`, for a stream now running at `rate`.
+    pub(crate) fn place(&mut self, write: u64, sr: f32, rate: f32) -> f64 {
+        let rate = rate.max(0.01);
+        let bits = rate.to_bits();
+        if self.rate != bits {
+            if self.rate != 0 {
+                self.x = self.place_at(write, sr, f32::from_bits(self.rate)).to_bits();
+                self.at = write as i64;
+            }
+            self.rate = bits;
+        }
+        self.place_at(write, sr, rate)
     }
 }
 
@@ -467,7 +529,7 @@ pub fn layer_gain(layers: u32) -> f32 {
 /// single implementation is not tidiness: two copies would let the picture, the
 /// playback and the exported file drift apart, which is the whole thing this
 /// module exists to prevent.
-fn event_at(index: u64, write: usize, p: &GrainPlan, sp: &StreamParams) -> GrainEvent {
+fn event_at(index: u64, write: usize, p: &GrainPlan, sp: &StreamParams, drift: Option<f64>) -> GrainEvent {
     let sr = sp.sample_rate.max(1) as f32;
     let ratio = sp.ratio.clamp(0.01, 100.0);
     let g = &sp.grain;
@@ -487,7 +549,10 @@ fn event_at(index: u64, write: usize, p: &GrainPlan, sp: &StreamParams) -> Grain
     }
     .max(16);
 
-    let semis = g.pitch_offset(index, t);
+    let semis = match drift {
+        Some(x) => g.pitch_offset_at_place(index, x),
+        None => g.pitch_offset(index, t),
+    };
     // Four octaves of base shift, plus whatever the jitter and drift add on
     // top, so the clamp has to be wider than the control range.
     let rate = (base_rate * 2f32.powf(semis / 12.0)).clamp(0.002, 256.0);
@@ -751,7 +816,7 @@ pub fn grains_sampled(
             if write >= p.out_frames {
                 break;
             }
-            let mut e = event_at(i as u64, write, &p, &lp);
+            let mut e = event_at(i as u64, write, &p, &lp, None);
             e.out_frame += off;
             out.push(e);
             i += step;
@@ -777,11 +842,12 @@ pub fn grains_sampled(
 pub struct GrainStream {
     index: u64,
     write: u64,
+    drift: DriftClock,
 }
 
 impl GrainStream {
     pub fn new() -> Self {
-        GrainStream { index: 0, write: 0 }
+        GrainStream { index: 0, write: 0, drift: DriftClock::default() }
     }
 
     /// The output frame the next grain will land on.
@@ -804,6 +870,7 @@ impl GrainStream {
         let hop = sp.plan().hop.max(1) as u64;
         self.index = out_frame / hop;
         self.write = self.index * hop;
+        self.drift.reset();
     }
 
     /// Move the schedule by `delta` output frames without re-deriving it: the
@@ -815,12 +882,15 @@ impl GrainStream {
     /// of the playhead, with no grains at all until the playhead caught up.
     pub fn shift(&mut self, delta: i64) {
         self.write = (self.write as i64 + delta).max(0) as u64;
+        self.drift.shift(delta);
     }
 
     /// The next grain, then advance by the hop the *current* parameters imply.
     pub fn next(&mut self, sp: &StreamParams) -> GrainEvent {
         let p = sp.plan();
-        let e = event_at(self.index, self.write as usize, &p, sp);
+        let sr = sp.sample_rate.max(1) as f32;
+        let x = self.drift.place(self.write, sr, sp.grain.drift_rate_hz);
+        let e = event_at(self.index, self.write as usize, &p, sp, Some(x));
         self.index += 1;
         self.write += p.hop.max(1) as u64;
         e
@@ -1444,5 +1514,91 @@ mod rescale {
         let hop = sp.plan().hop as f32;
         let gap = b.src_frame - a.src_frame;
         assert!(gap > 0.0 && gap <= hop * 1.01, "the next grain reads on: {gap} source frames on");
+    }
+}
+
+#[cfg(test)]
+mod drift_clock {
+    use super::*;
+
+    const RATE: u32 = 48_000;
+
+    fn params() -> StreamParams {
+        let mut sp = StreamParams::new(RATE as usize * 200, RATE);
+        sp.grain.pitch_drift_semis = 8.0;
+        sp.grain.drift_rate_hz = 0.5;
+        sp.grain.seed = 3;
+        sp
+    }
+
+    /// The most the pitch can move in one hop at `rate`: the noise's nodes are at
+    /// most 2 apart, smoothstep's steepest slope is 1.5, with a margin on top.
+    fn most_in_a_hop(sp: &StreamParams, rate: f32) -> f32 {
+        let hop = sp.plan().hop as f32 / RATE as f32;
+        sp.grain.pitch_drift_semis * 2.0 * 1.5 * rate * hop * 1.2
+    }
+
+    /// RJ, 8 Nov 2026, on the mock-up's Drift rate: "when you speed it up, the
+    /// whole thing redraws." At a hundred seconds in, 0.50 to 0.51 Hz moved the
+    /// noise by a whole node when the place was worked out as time × rate.
+    #[test]
+    fn a_change_of_rate_moves_the_speed_and_not_the_place() {
+        let mut sp = params();
+        let mut s = GrainStream::new();
+        s.seek(RATE as u64 * 100, &sp);
+        let mut last = s.next(&sp).pitch_semis;
+        let mut worst = 0f32;
+        for i in 0..400 {
+            sp.grain.drift_rate_hz = 0.5 + 0.01 * (i % 20) as f32;
+            let now = s.next(&sp).pitch_semis;
+            worst = worst.max((now - last).abs());
+            last = now;
+        }
+        let bound = most_in_a_hop(&sp, 0.7);
+        assert!(worst <= bound, "the pitch jumped {worst} semitones in one hop; at most {bound} is drift");
+    }
+
+    /// Until the rate moves, the stream is exactly the offline render: the
+    /// picture, the playback and the exported file are the same grains.
+    #[test]
+    fn at_a_steady_rate_the_stream_is_the_offline_render() {
+        let sp = params();
+        let p = sp.plan();
+        let mut s = GrainStream::new();
+        s.seek(RATE as u64 * 100, &sp);
+        for _ in 0..200 {
+            let (i, w) = (s.index(), s.out_frame() as usize);
+            assert_eq!(s.next(&sp), event_at(i, w, &p, &sp, None));
+        }
+    }
+
+    /// Seeking gives the same grains as playing to that moment, whatever the
+    /// rate was doing on the way.
+    #[test]
+    fn a_seek_goes_back_to_the_offline_place() {
+        let mut sp = params();
+        let mut s = GrainStream::new();
+        s.seek(RATE as u64 * 100, &sp);
+        s.next(&sp);
+        sp.grain.drift_rate_hz = 0.9;
+        s.next(&sp);
+        s.seek(RATE as u64 * 50, &sp);
+        let p = sp.plan();
+        let (i, w) = (s.index(), s.out_frame() as usize);
+        assert_eq!(s.next(&sp), event_at(i, w, &p, &sp, None));
+    }
+
+    /// A stretch change relabels the playhead (`shift`); the sound's time has not
+    /// moved, so neither may the drift.
+    #[test]
+    fn relabelling_the_playhead_leaves_the_drift_alone() {
+        let sp = params();
+        let mut s = GrainStream::new();
+        s.seek(RATE as u64 * 100, &sp);
+        let a = s.next(&sp).pitch_semis;
+        s.shift(RATE as i64 * 37);
+        let b = s.next(&sp).pitch_semis;
+        let bound = most_in_a_hop(&sp, 0.5);
+        assert!((b - a).abs() <= bound, "a relabel moved the drift by {}; at most {bound} is drift", (b - a).abs());
     }
 }

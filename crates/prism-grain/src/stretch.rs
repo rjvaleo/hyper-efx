@@ -750,11 +750,13 @@ pub(crate) fn grain_size(g: &crate::Grain, index: u64, base: usize) -> usize {
 }
 
 /// The rate one window reads at, from the pitch jitter and the drift.
-pub(crate) fn grain_rate(g: &crate::Grain, index: u64, t: f32) -> f32 {
+///
+/// `x` is how far along its wander the drift is (`DriftClock`).
+pub(crate) fn grain_rate(g: &crate::Grain, index: u64, x: f64) -> f32 {
     if g.pitch_jitter_semis.abs() < 1e-6 && g.pitch_drift_semis.abs() < 1e-6 {
         return 1.0;
     }
-    2f32.powf(g.pitch_offset(index, t) / 12.0).clamp(0.05, 20.0)
+    2f32.powf(g.pitch_offset_at_place(index, x) / 12.0).clamp(0.05, 20.0)
 }
 
 /// Where a read position lands once it has been moved off its nominal.
