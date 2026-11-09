@@ -408,7 +408,7 @@ impl PitchedHybrid {
         semitones: f32,
     ) {
         let pitch = PitchRing::factor(semitones);
-        if (pitch - 1.0).abs() < 1e-6 {
+        if self.ring.bypassed(pitch) {
             let frames = out.len() / channels.max(1);
             self.inner.render(out, channels, parts, p, h);
             self.ring.advance_unpitched(frames);

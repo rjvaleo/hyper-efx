@@ -129,6 +129,9 @@ pub struct Stretcher {
     /// Frames left of the short fade-in after a rescale on an engine with no
     /// grains to carry: its seek starts mid-wave, which is a click otherwise.
     declick: u32,
+    /// The grain renderer is playing for a Hybrid still waiting on its
+    /// separation, so the separation has a place to come in at.
+    stand_in: bool,
     /// Feedback over whatever is playing, the same stage the offline render
     /// ends with (`feedback.rs`).
     feedback: crate::feedback::Feedback,
@@ -228,6 +231,7 @@ impl Stretcher {
             layer_buf: vec![0.0; max_block.max(1) * channels.max(1)],
             cloud_buf: vec![0.0; max_block.max(1) * channels.max(1)],
             declick: 0,
+            stand_in: false,
             feedback: crate::feedback::Feedback::new(),
             bank: None,
             layer_at: vec![u64::MAX; crate::render::MAX_LAYERS],
@@ -288,6 +292,12 @@ impl Stretcher {
         self.parts = parts;
     }
 
+    /// The Hybrid is the engine and there is nothing separated for it yet, so
+    /// the grain renderer is playing in its place.
+    fn standing_in(&self) -> bool {
+        self.current == Algorithm::Hybrid && self.parts.is_empty()
+    }
+
     pub fn overflows(&self) -> u64 {
         self.grain.overflows + self.wsola.inner().overflows
     }
@@ -300,6 +310,7 @@ impl Stretcher {
         self.current = resolve(sp.algorithm);
         // A seek is a jump anyway; there is nothing to fade from.
         self.fading = None;
+        self.stand_in = false;
         self.layer_at.iter_mut().for_each(|v| *v = u64::MAX);
         self.seek_current(out_frame, sp);
     }
@@ -336,7 +347,7 @@ impl Stretcher {
                 self.seek_one(self.current, out_frame, sp);
                 self.declick = DECLICK_FRAMES;
             }
-            if sp.cloud {
+            if sp.cloud || self.standing_in() {
                 self.grain.rescale(out_frame, sp);
             }
         }
@@ -394,9 +405,36 @@ impl Stretcher {
             //
             // The old one is deliberately left alone and kept running, so there
             // is something to fade out of.
-            self.fading = Some((self.current, FADE_FRAMES));
+            let from = self.current;
             self.current = want;
+            // Unless they are one renderer: a Hybrid with nothing separated yet
+            // is the grain cloud carrying on, and fading it into itself would
+            // ask it for every frame twice.
+            self.fading = if from == Algorithm::Granular && self.standing_in() {
+                None
+            } else {
+                Some((from, FADE_FRAMES))
+            };
             self.seek_one(want, self.position, sp);
+            self.stand_in = false;
+        }
+        // The separation has arrived under a transport that was already playing
+        // (it takes a few hundred milliseconds, and a file starts at once). The
+        // engine it is for was last told where to be before there was anything
+        // to read, at the top of the file: left alone it starts there, which is
+        // the sound going back to the beginning and staying that far behind the
+        // playhead. Put it where the transport is, and cross into it from the
+        // cloud that has been covering. With the cloud on, the cloud simply
+        // carries on, and the engine fades in under it.
+        if self.stand_in && !self.parts.is_empty() {
+            self.stand_in = false;
+            self.seek_one(Algorithm::Hybrid, self.position, sp);
+            self.layer_at.iter_mut().for_each(|v| *v = u64::MAX);
+            if sp.cloud {
+                self.declick = DECLICK_FRAMES;
+            } else {
+                self.fading = Some((Algorithm::Granular, FADE_FRAMES));
+            }
         }
 
         let frames = out.len() / channels.max(1);
@@ -481,6 +519,18 @@ impl Stretcher {
         events: &mut [GrainEvent],
     ) -> usize {
         if !sp.cloud || self.current == Algorithm::Granular {
+            return 0;
+        }
+        // Waiting on a separation the engine *is* the cloud, one renderer that
+        // has already made these frames. Asked for them again it lost its
+        // place, sought, and dropped every sounding grain, once a block. All
+        // there is to do is hold it at the level the cloud will have when the
+        // separation comes in beneath it.
+        if self.standing_in() {
+            let (_, wet) = crate::stretch::cloud_gains(sp.cloud_mix);
+            for s in out.iter_mut() {
+                *s *= wet;
+            }
             return 0;
         }
         let frames = out.len() / channels.max(1);
@@ -722,6 +772,14 @@ impl Stretcher {
                 // Nothing separated yet — the pass is still running on another
                 // thread. The grain cloud covers the gap rather than silence.
                 if self.parts.is_empty() {
+                    // It has been left wherever it last played: a seek moves
+                    // the engine it is standing in for, not it.
+                    if alg == self.current {
+                        if self.grain.position() != self.position {
+                            self.grain.seek(self.position, sp);
+                        }
+                        self.stand_in = true;
+                    }
                     return self.grain.render(out, channels, src, sp, events);
                 }
                 let parts = std::sync::Arc::clone(&self.parts);

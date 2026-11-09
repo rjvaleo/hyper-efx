@@ -691,7 +691,7 @@ impl PitchedPvsola {
         semitones: f32,
     ) {
         let pitch = PitchRing::factor(semitones);
-        if (pitch - 1.0).abs() < 1e-6 {
+        if self.ring.bypassed(pitch) {
             // Already at the right rate; do not pay for a trip through the ring.
             let frames = out.len() / channels.max(1);
             self.inner.render(out, channels, input, p, pv);

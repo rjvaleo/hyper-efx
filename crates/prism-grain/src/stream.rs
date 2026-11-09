@@ -471,6 +471,8 @@ pub struct PitchRing {
     glide: f32,
     /// Output frames handed out.
     emitted: u64,
+    /// Whether anything has been read out of the ring since the last seek.
+    engaged: bool,
     /// The earliest stretched frame this run holds.
     ///
     /// The interpolator reaches one frame back, and after a seek there is
@@ -512,6 +514,7 @@ impl PitchRing {
             last_pitch: 1.0,
             glide: 1.0,
             emitted: 0,
+            engaged: false,
             origin: 0,
             chunk,
         }
@@ -529,6 +532,16 @@ impl PitchRing {
             self.since = 0;
             self.last_pitch = pitch;
         }
+    }
+
+    /// Whether this pitch can skip the ring and take the engine's own frames.
+    ///
+    /// Only until something has been read through it. After that the engine is
+    /// a few frames ahead of the read, so coming home to nought and bypassing
+    /// the ring there skips those frames, and is heard. The ring carries on at
+    /// a rate of one until the next seek.
+    pub fn bypassed(&self, pitch: f32) -> bool {
+        !self.engaged && (pitch - 1.0).abs() < 1e-6
     }
 
     /// Whether the rate is still on its way somewhere.
@@ -604,6 +617,7 @@ impl PitchRing {
     /// Read `out.len() / channels` frames back at `pitch`.
     pub fn read(&mut self, out: &mut [f32], channels: usize, pitch: f32) {
         self.retune(pitch);
+        self.engaged = true;
         let channels = channels.max(1).min(self.channels);
         let frames = out.len() / channels.max(1);
         let base = self.base;
@@ -612,6 +626,7 @@ impl PitchRing {
         // below a portamento and well above a click.
         let k = 1.0 - (-1.0f32 / GLIDE_FRAMES).exp();
         let mut walking = self.base;
+        let mut glided = false;
         for f in 0..frames {
             let at = if self.gliding() {
                 // Travelling: the position has to be accumulated, because the
@@ -620,8 +635,19 @@ impl PitchRing {
                 if (self.glide - self.last_pitch).abs() < 1e-4 {
                     self.glide = self.last_pitch;
                 }
+                glided = true;
                 let here = walking;
                 walking += self.glide as f64;
+                here
+            } else if glided {
+                // Arrived part way through this block. The closed form below
+                // counts from the top of the block, where the read no longer
+                // is, so it reads on from where the glide got to. Going back to
+                // the closed form here was a jump of the frames travelled so
+                // far, and a second, backwards, when the next block began from
+                // the frame the glide had stopped on.
+                let here = walking;
+                walking += pitch as f64;
                 here
             } else {
                 base + (since + f as u64) as f64 * pitch as f64
@@ -643,7 +669,7 @@ impl PitchRing {
         }
         // A glide leaves the read somewhere the closed form does not describe,
         // so hand the accumulated position back as the new base.
-        if walking != self.base {
+        if glided {
             self.base = walking;
             self.since = 0;
         } else {
@@ -684,6 +710,7 @@ impl PitchRing {
         // into its pitch would not match what the offline renderer writes for
         // the same frames, which is the one thing that must never differ.
         self.glide = pitch;
+        self.engaged = false;
         let at = self.pos();
         self.made = at as u64;
         self.origin = at as u64;
@@ -725,7 +752,7 @@ impl<S: Streamer> Pitched<S> {
         semitones: f32,
     ) {
         let pitch = PitchRing::factor(semitones);
-        if (pitch - 1.0).abs() < 1e-6 {
+        if self.ring.bypassed(pitch) {
             // Nothing to resample; the engine is already producing at the right
             // rate, so do not pay for a copy through the ring.
             let frames = out.len() / channels.max(1);
