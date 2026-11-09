@@ -331,6 +331,11 @@ impl TimeMap {
         TimeMap { anchors }
     }
 
+    /// The output frame the map runs out at.
+    pub fn out_end(&self) -> f64 {
+        self.anchors[self.anchors.len() - 1].1
+    }
+
     /// Where in the input the given output instant comes from.
     pub fn input_at(&self, out: f64) -> f64 {
         let a = &self.anchors;

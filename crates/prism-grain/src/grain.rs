@@ -365,6 +365,9 @@ pub struct GrainEvent {
     pub rate: f32,
     /// Total pitch offset in semitones, base plus jitter plus drift.
     pub pitch_semis: f32,
+    /// Which of the Grain page's voices played it, by its note's id: nought for
+    /// the transport's own stream.
+    pub voice: u32,
 }
 
 /// The grain schedule for a render. Deterministic and cheap — no audio is read.
@@ -600,6 +603,7 @@ fn event_at(index: u64, write: usize, p: &GrainPlan, sp: &StreamParams, drift: O
         size: size as u32,
         rate,
         pitch_semis: sp.semitones + semis,
+        voice: 0,
     }
 }
 

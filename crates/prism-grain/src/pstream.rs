@@ -118,21 +118,25 @@ impl PvsolaStream {
         let n = crate::stretch::fft_size_for(p.vocoder.window_ms, p.sample_rate);
         let hop = (n / 4).max(1);
         let anchors = pv.anchor_frames.clamp(1, 64) as usize;
-        let ratio = p.ratio.clamp(0.01, 100.0);
         let out_span = anchors * hop;
+        // Scan is the sweep's speed through the source, so a round covers that
+        // much more or less of it. The vocoder inside it reads Scan itself.
+        let scan = p.grain.scan.clamp(-4.0, 4.0);
+        let ratio = if scan.abs() == 1.0 { p.ratio } else { p.ratio / scan.abs().max(1e-3) }.clamp(0.01, 100.0);
         Plan {
             n,
             ratio,
             out_span,
-            in_span: ((out_span as f32) / ratio).round().max(1.0) as usize,
+            in_span: ((out_span as f32) / ratio).round().max(if scan == 0.0 { 0.0 } else { 1.0 }) as usize,
             search: ((pv.search_ms.clamp(0.0, 200.0) / 1000.0) * sr) as usize,
             blend: ((pv.blend.clamp(0.0, 1.0) * n as f32) as usize).min(out_span),
             pre_out: n,
             pre_in: ((n as f32) / ratio).ceil() as usize,
+            backward: scan < 0.0,
         }
     }
 
-    pub fn seek(&mut self, out_frame: u64, _input_frames: usize, p: &StretchParams, pv: &PvsolaParams) {
+    pub fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams, pv: &PvsolaParams) {
         let pl = Self::plan(p, pv);
         self.acc.fill(0.0);
         self.emitted = out_frame;
@@ -141,7 +145,9 @@ impl PvsolaStream {
         // thing this engine cannot do — a run is defined from its anchor.
         let round = out_frame / pl.out_span.max(1) as u64;
         self.written = round * pl.out_span as u64;
-        self.read = (round as usize).saturating_mul(pl.in_span);
+        let swept = (round as usize).saturating_mul(pl.in_span);
+        // Backward, the first round is anchored at the end of the file.
+        self.read = if pl.backward { input_frames.saturating_sub(swept) } else { swept };
         self.first = true;
         self.ended = false;
         self.piece_frames = 0;
@@ -232,15 +238,24 @@ impl PvsolaStream {
             return;
         }
         if self.prep.is_none() {
-            // Back up for the run-up, taking whatever is there.
-            let from = self.read.saturating_sub(pl.pre_in);
-            let lead = self.read - from;
+            let want = pl.piece_len().min(self.piece.len() / channels);
+            // A backward run reads down from the top of its segment, so its
+            // run-up is above the anchor rather than below it.
+            let (from, lead) = if pl.backward {
+                let top = (self.read + pl.pre_in + pl.n).min(in_frames);
+                let lead = top.saturating_sub(self.read + pl.n);
+                let used = pl.n + ((want as f32 / pl.ratio).ceil() as usize);
+                (top.saturating_sub(used), lead)
+            } else {
+                // Back up for the run-up, taking whatever is there.
+                let from = self.read.saturating_sub(pl.pre_in);
+                (from, self.read - from)
+            };
             let at = if lead == pl.pre_in {
                 pl.pre_out
             } else {
                 ((lead as f32) * pl.ratio).round() as usize
             };
-            let want = pl.piece_len().min(self.piece.len() / channels);
 
             // The segment is bounded exactly as the offline renderer bounds it.
             // Handing the vocoder the rest of the file instead would give it a
@@ -249,7 +264,13 @@ impl PvsolaStream {
             // near the end of every file, which is the one place nobody listens.
             let need_out = pl.out_span + pl.blend + pl.search;
             let need_in = ((need_out as f32) / pl.ratio).ceil() as usize + pl.n;
-            let take = (lead + need_in).min(in_frames.saturating_sub(from));
+            let take = if pl.backward {
+                // Everything from the bottom of what the run will read to the
+                // top it starts at.
+                (self.read + lead + pl.n).min(in_frames).saturating_sub(from)
+            } else {
+                (lead + need_in).min(in_frames.saturating_sub(from))
+            };
             if take < pl.n || at >= want {
                 self.ended = true;
                 return;
@@ -325,14 +346,21 @@ impl PvsolaStream {
             self.written = join + len as u64;
         }
 
-        self.read += pl.in_span;
-        // Checked here rather than on the way in, which is where the offline
-        // renderer checks it. The difference is one round's worth of output at
-        // the very end of a file — 0.4% of the frames, and every one of them
-        // wrong, which is exactly the kind of thing that never shows up until
-        // someone stretches something short.
-        if self.read + pl.n >= _in_frames {
-            self.ended = true;
+        if pl.backward {
+            if self.read == 0 {
+                self.ended = true;
+            }
+            self.read = self.read.saturating_sub(pl.in_span);
+        } else {
+            self.read += pl.in_span;
+            // Checked here rather than on the way in, which is where the offline
+            // renderer checks it. The difference is one round's worth of output at
+            // the very end of a file — 0.4% of the frames, and every one of them
+            // wrong, which is exactly the kind of thing that never shows up until
+            // someone stretches something short.
+            if self.read + pl.n >= _in_frames {
+                self.ended = true;
+            }
         }
         std::mem::swap(&mut self.a, &mut self.b);
     }
@@ -432,6 +460,8 @@ struct Plan {
     blend: usize,
     pre_out: usize,
     pre_in: usize,
+    /// Scan is negative: each round is anchored below the last.
+    backward: bool,
 }
 
 impl Plan {

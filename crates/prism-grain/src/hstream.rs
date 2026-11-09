@@ -119,6 +119,15 @@ impl HybridStream {
         self.percussive.set_map(map);
     }
 
+    /// The same, for a map somebody else holds too.
+    pub fn adopt_map(&mut self, map: Option<std::sync::Arc<crate::transient::TimeMap>>) {
+        self.percussive.adopt_map(map);
+    }
+
+    pub fn set_map_scale(&mut self, scale: f64) {
+        self.percussive.set_map_scale(scale);
+    }
+
     pub fn seek(&mut self, out_frame: u64, parts: &Parts, p: &StretchParams, h: HybridParams) {
         self.emitted = out_frame;
         let frames = parts.frames();
@@ -396,6 +405,15 @@ impl PitchedHybrid {
     /// The percussive part wants a transient map, as it does unpitched.
     pub fn set_map(&mut self, map: Option<crate::transient::TimeMap>) {
         self.inner.set_map(map);
+    }
+
+    /// The same, for a map somebody else holds too.
+    pub fn adopt_map(&mut self, map: Option<std::sync::Arc<crate::transient::TimeMap>>) {
+        self.inner.adopt_map(map);
+    }
+
+    pub fn set_map_scale(&mut self, scale: f64) {
+        self.inner.set_map_scale(scale);
     }
 
     pub fn render_pitched(

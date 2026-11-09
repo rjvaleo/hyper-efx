@@ -99,6 +99,20 @@ impl NoiseStream {
         self.emitted
     }
 
+    /// Where in the source an output frame reads, under Scan: the same sweep the
+    /// other parts of the hybrid follow, from the end of the file when it runs
+    /// backward.
+    fn source_at(&self, frame: f64, ratio: f32, scan: f32, in_frames: usize) -> f64 {
+        let along = self.anchor.source(frame, ratio);
+        if scan == 1.0 {
+            along
+        } else if scan < 0.0 {
+            in_frames as f64 + along * scan as f64
+        } else {
+            along * scan as f64
+        }
+    }
+
     fn ensure_window(&mut self, n: usize) {
         if self.win_for == Some(n) {
             return;
@@ -175,12 +189,13 @@ impl NoiseStream {
         self.anchor.retune(self.write, ratio);
         let span = m.smooth_bins.max(1) | 1;
         let bins = n / 2 + 1;
+        let scan = p.grain.scan.clamp(-4.0, 4.0);
         self.ensure_window(n);
 
         let need = self.emitted + frames as u64;
         while self.write < need {
             // Where in the source this output frame is looking.
-            let src = self.anchor.source(self.write as f64, ratio).max(0.0) as f32;
+            let src = self.source_at(self.write as f64, ratio, scan, in_frames).max(0.0) as f32;
             let a_start = (src as usize).min(in_frames.saturating_sub(n));
             let b_start = (a_start + hop).min(in_frames.saturating_sub(n));
             let t = (src - a_start as f32).clamp(0.0, 1.0);
@@ -246,7 +261,7 @@ impl NoiseStream {
             // derived, a hop at a time, ramped so nothing steps.
             if frame >= self.gain_at {
                 self.gain_from = self.gain_to;
-                self.gain_to = self.local_gain(input, channels, frame, ratio, hop, d);
+                self.gain_to = self.local_gain(input, channels, frame, ratio, hop, d, scan);
                 self.gain_at = frame + hop as u64;
             }
             let along = ((frame + hop as u64 - self.gain_at) as f32) / hop as f32;
@@ -271,9 +286,10 @@ impl NoiseStream {
         ratio: f32,
         hop: usize,
         d: f32,
+        scan: f32,
     ) -> f32 {
         let in_frames = input.len() / channels;
-        let src = self.anchor.source(frame as f64, ratio).max(0.0) as usize;
+        let src = self.source_at(frame as f64, ratio, scan, in_frames).max(0.0) as usize;
         if src >= in_frames || d <= 1e-6 {
             return 1.0;
         }

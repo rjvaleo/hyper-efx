@@ -23,6 +23,7 @@ use crate::stretch::Algorithm;
 use crate::vstream::VocoderStream;
 
 use crate::render::{BlockRenderer, Source};
+use std::sync::Arc;
 
 /// Extra engine instances, for layers past the first.
 ///
@@ -104,10 +105,12 @@ pub struct Stretcher {
     /// `StreamParams` — see `set_layer_cap`.
     layer_cap: u32,
     grain: BlockRenderer,
-    wsola: Pitched<WsolaStream>,
-    vocoder: Pitched<VocoderStream>,
-    pvsola: PitchedPvsola,
-    hybrid: PitchedHybrid,
+    /// Each engine, or nothing where a voice has no use for it: see
+    /// [`Stretcher::voice`]. The deck's own has them all.
+    wsola: Option<Pitched<WsolaStream>>,
+    vocoder: Option<Pitched<VocoderStream>>,
+    pvsola: Option<PitchedPvsola>,
+    hybrid: Option<PitchedHybrid>,
     /// The source, split three ways. Handed over from off the audio thread; an
     /// empty one simply means the hybrid has nothing to play yet.
     parts: std::sync::Arc<Parts>,
@@ -133,8 +136,9 @@ pub struct Stretcher {
     /// separation, so the separation has a place to come in at.
     stand_in: bool,
     /// Feedback over whatever is playing, the same stage the offline render
-    /// ends with (`feedback.rs`).
-    feedback: crate::feedback::Feedback,
+    /// ends with (`feedback.rs`). A voice has none: its notes go through the
+    /// deck's, after they have been summed.
+    feedback: Option<crate::feedback::Feedback>,
     /// And somewhere to render each extra layer before it is added in.
     layer_buf: Vec<f32>,
     /// The extra layers, if any have been handed over yet.
@@ -145,6 +149,8 @@ pub struct Stretcher {
     /// Output frame the whole thing is at. Kept here rather than read from
     /// whichever engine is live, because a switch must not appear to seek.
     position: u64,
+    /// The transient map WSOLA is holding, for the voices to share.
+    map: Option<Arc<crate::transient::TimeMap>>,
 }
 
 /// How long a switch between engines takes to cross over.
@@ -215,14 +221,14 @@ impl Stretcher {
     pub fn new(max_block: usize, channels: usize, sample_rate: u32) -> Self {
         Stretcher {
             grain: BlockRenderer::new(max_block),
-            wsola: Pitched::new(
+            wsola: Some(Pitched::new(
                 WsolaStream::new(max_block, channels, sample_rate),
                 max_block,
                 channels,
-            ),
-            vocoder: Pitched::new(VocoderStream::new(max_block, channels), max_block, channels),
-            pvsola: PitchedPvsola::new(max_block, channels),
-            hybrid: PitchedHybrid::new(max_block, channels, sample_rate),
+            )),
+            vocoder: Some(Pitched::new(VocoderStream::new(max_block, channels), max_block, channels)),
+            pvsola: Some(PitchedPvsola::new(max_block, channels)),
+            hybrid: Some(PitchedHybrid::new(max_block, channels, sample_rate)),
             parts: std::sync::Arc::new(Parts::default()),
             current: Algorithm::Granular,
             fading: None,
@@ -232,10 +238,53 @@ impl Stretcher {
             cloud_buf: vec![0.0; max_block.max(1) * channels.max(1)],
             declick: 0,
             stand_in: false,
-            feedback: crate::feedback::Feedback::new(),
+            feedback: Some(crate::feedback::Feedback::new()),
             bank: None,
             layer_at: vec![u64::MAX; crate::render::MAX_LAYERS],
             position: 0,
+            map: None,
+        }
+    }
+
+    /// One note's worth of engine: `algorithm` alone, its layers, and a cloud.
+    ///
+    /// The Grain page's Poly runs one of these per held key, each at its own
+    /// semitones. Only the engine in use is built, for the reason [`LayerBank`]
+    /// is built that way, and with no feedback loop of its own, because the
+    /// deck's runs over the sum. Allocates; never call this from the audio
+    /// thread.
+    pub fn voice(
+        algorithm: Algorithm,
+        layers: u32,
+        max_block: usize,
+        channels: usize,
+        sample_rate: u32,
+    ) -> Self {
+        let wide = max_block.max(1) * channels.max(1);
+        let is = |a: Algorithm| algorithm == a;
+        Stretcher {
+            grain: BlockRenderer::new(max_block),
+            wsola: is(Algorithm::Wsola).then(|| {
+                Pitched::new(WsolaStream::new(max_block, channels, sample_rate), max_block, channels)
+            }),
+            vocoder: is(Algorithm::Vocoder)
+                .then(|| Pitched::new(VocoderStream::new(max_block, channels), max_block, channels)),
+            pvsola: is(Algorithm::Pvsola).then(|| PitchedPvsola::new(max_block, channels)),
+            hybrid: is(Algorithm::Hybrid).then(|| PitchedHybrid::new(max_block, channels, sample_rate)),
+            parts: Arc::new(Parts::default()),
+            current: algorithm,
+            fading: None,
+            layer_cap: crate::render::MAX_LAYERS as u32,
+            scratch: vec![0.0; wide],
+            layer_buf: vec![0.0; wide],
+            cloud_buf: vec![0.0; wide],
+            declick: 0,
+            stand_in: false,
+            feedback: None,
+            bank: Some(LayerBank::build(algorithm, layers, max_block, channels, sample_rate)),
+            layer_at: vec![u64::MAX; crate::render::MAX_LAYERS],
+            position: 0,
+            map: None,
         }
     }
 
@@ -246,11 +295,54 @@ impl Stretcher {
     /// Hand WSOLA a freshly built transient map, or `None` for a straight line.
     /// Built off the audio thread; see `crate::stream`.
     pub fn set_map(&mut self, map: Option<crate::transient::TimeMap>) {
-        self.wsola.inner_mut().set_map(map.clone());
+        self.adopt_map(map.map(Arc::new));
+    }
+
+    /// The same map, shared: a voice takes what the deck has been given, and a
+    /// clone of the map itself would be an allocation on the audio thread.
+    pub fn adopt_map(&mut self, map: Option<Arc<crate::transient::TimeMap>>) {
+        self.map = map.clone();
+        if let Some(w) = self.wsola.as_mut() {
+            w.inner_mut().adopt_map(map.clone());
+        }
         // The hybrid stretches its percussive part with preservation held on,
         // so it wants a map too — of that part rather than of the whole sound,
         // which is what having separated it is for. The caller decides which.
-        self.hybrid.set_map(map);
+        if let Some(h) = self.hybrid.as_mut() {
+            h.adopt_map(map);
+        }
+    }
+
+    /// The transient map in force.
+    pub fn map(&self) -> Option<&Arc<crate::transient::TimeMap>> {
+        self.map.as_ref()
+    }
+
+    /// The source, split three ways, as this was last given it.
+    pub fn parts(&self) -> &Arc<Parts> {
+        &self.parts
+    }
+
+    /// A voice's own semitones under a map built for no pitch at all: its
+    /// engine's timeline runs that much faster, and the map is read that much
+    /// further along.
+    pub fn set_map_pitch(&mut self, semitones: f32) {
+        let pitch = crate::stream::PitchRing::factor(semitones) as f64;
+        if let Some(w) = self.wsola.as_mut() {
+            w.inner_mut().set_map_scale(1.0 / pitch);
+        }
+        if let Some(h) = self.hybrid.as_mut() {
+            h.set_map_scale(1.0 / pitch);
+        }
+    }
+
+    /// The deck's feedback over a block that came from nowhere else: every note
+    /// is a voice and the transport is silent. The same stage [`Self::render`]
+    /// ends with.
+    pub fn feedback_only(&mut self, out: &mut [f32], channels: usize, sp: &StreamParams) {
+        if let Some(fb) = self.feedback.as_mut() {
+            fb.process(out, channels, &sp.grain, sp.sample_rate);
+        }
     }
 
     /// Adopt a bank of extra layers. Built off the audio thread.
@@ -299,14 +391,16 @@ impl Stretcher {
     }
 
     pub fn overflows(&self) -> u64 {
-        self.grain.overflows + self.wsola.inner().overflows
+        self.grain.overflows + self.wsola.as_ref().map_or(0, |w| w.inner().overflows)
     }
 
     pub fn seek(&mut self, out_frame: u64, sp: &StreamParams) {
         self.position = out_frame;
         // A seek starts the loop empty, as a render from the top does. A
         // rescale keeps it: the stretch moved, not the playhead.
-        self.feedback.reset();
+        if let Some(fb) = self.feedback.as_mut() {
+            fb.reset();
+        }
         self.current = resolve(sp.algorithm);
         // A seek is a jump anyway; there is nothing to fade from.
         self.fading = None;
@@ -361,24 +455,25 @@ impl Stretcher {
     fn seek_one(&mut self, alg: Algorithm, out_frame: u64, sp: &StreamParams) {
         match alg {
             Algorithm::Wsola => {
-                self.wsola
-                    .seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones)
+                if let Some(e) = self.wsola.as_mut() {
+                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones);
+                }
             }
             Algorithm::Vocoder => {
-                self.vocoder
-                    .seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones)
+                if let Some(e) = self.vocoder.as_mut() {
+                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones);
+                }
             }
-            Algorithm::Pvsola => self.pvsola.seek(
-                out_frame,
-                sp.in_frames,
-                &stretch_params(sp),
-                &sp.pvsola,
-                sp.semitones,
-            ),
+            Algorithm::Pvsola => {
+                if let Some(e) = self.pvsola.as_mut() {
+                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), &sp.pvsola, sp.semitones);
+                }
+            }
             Algorithm::Hybrid => {
                 let parts = std::sync::Arc::clone(&self.parts);
-                self.hybrid
-                    .seek(out_frame, &parts, &stretch_params(sp), sp.hybrid, sp.semitones)
+                if let Some(e) = self.hybrid.as_mut() {
+                    e.seek(out_frame, &parts, &stretch_params(sp), sp.hybrid, sp.semitones);
+                }
             }
             _ => self.grain.seek(out_frame, sp),
         }
@@ -396,6 +491,20 @@ impl Stretcher {
         src: &Source,
         sp: &StreamParams,
         events: &mut [GrainEvent],
+    ) -> usize {
+        self.render_with(out, channels, src, sp, events, None)
+    }
+
+    /// [`Self::render`], with `add` summed in before the feedback: the keys'
+    /// voices, which reach the feedback and the rack with the rest of the block.
+    pub fn render_with(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        src: &Source,
+        sp: &StreamParams,
+        events: &mut [GrainEvent],
+        add: Option<&[f32]>,
     ) -> usize {
         let want = resolve(sp.algorithm);
         if want != self.current {
@@ -489,9 +598,17 @@ impl Stretcher {
             };
         }
 
+        if let Some(add) = add {
+            for (o, a) in out.iter_mut().zip(add) {
+                *o += *a;
+            }
+        }
+
         // Feedback last, over the engine, its layers and the cloud together,
         // as the offline render ends.
-        self.feedback.process(&mut out[..frames * channels], channels, &sp.grain, sp.sample_rate);
+        if let Some(fb) = self.feedback.as_mut() {
+            fb.process(&mut out[..frames * channels], channels, &sp.grain, sp.sample_rate);
+        }
 
         self.position += frames as u64;
         reported
@@ -738,34 +855,21 @@ impl Stretcher {
     ) -> usize {
         match alg {
             Algorithm::Wsola => {
-                self.wsola.render_pitched(
-                    out,
-                    channels,
-                    &src.samples,
-                    &stretch_params(sp),
-                    sp.semitones,
-                );
+                if let Some(e) = self.wsola.as_mut() {
+                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), sp.semitones);
+                }
                 0
             }
             Algorithm::Vocoder => {
-                self.vocoder.render_pitched(
-                    out,
-                    channels,
-                    &src.samples,
-                    &stretch_params(sp),
-                    sp.semitones,
-                );
+                if let Some(e) = self.vocoder.as_mut() {
+                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), sp.semitones);
+                }
                 0
             }
             Algorithm::Pvsola => {
-                self.pvsola.render_pitched(
-                    out,
-                    channels,
-                    &src.samples,
-                    &stretch_params(sp),
-                    &sp.pvsola,
-                    sp.semitones,
-                );
+                if let Some(e) = self.pvsola.as_mut() {
+                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), &sp.pvsola, sp.semitones);
+                }
                 0
             }
             Algorithm::Hybrid => {
@@ -783,14 +887,9 @@ impl Stretcher {
                     return self.grain.render(out, channels, src, sp, events);
                 }
                 let parts = std::sync::Arc::clone(&self.parts);
-                self.hybrid.render_pitched(
-                    out,
-                    channels,
-                    &parts,
-                    &stretch_params(sp),
-                    sp.hybrid,
-                    sp.semitones,
-                );
+                if let Some(e) = self.hybrid.as_mut() {
+                    e.render_pitched(out, channels, &parts, &stretch_params(sp), sp.hybrid, sp.semitones);
+                }
                 0
             }
             _ => self.grain.render(out, channels, src, sp, events),

@@ -110,7 +110,10 @@ pub struct WsolaStream {
     ///
     /// Built off the audio thread when it is needed at all, because deriving it
     /// runs an onset detector over the whole file and allocates.
-    map: Option<crate::transient::TimeMap>,
+    map: Option<std::sync::Arc<crate::transient::TimeMap>>,
+    /// How far along the map a frame of this stream's timeline is. One, except
+    /// on a voice with its own pitch: see `Stretcher::set_map_pitch`.
+    map_scale: f64,
     /// Keeps the read continuous when the ratio moves. See `anchor.rs`.
     anchor: crate::anchor::Anchor,
     /// Dropped because the ring could not hold the window. Surfaced rather than
@@ -145,6 +148,7 @@ impl WsolaStream {
             drift: crate::grain::DriftClock::default(),
             first: true,
             map: None,
+            map_scale: 1.0,
             anchor: crate::anchor::Anchor::default(),
             overflows: 0,
         }
@@ -156,7 +160,16 @@ impl WsolaStream {
     /// caller does it on its own thread and leaves the result here, which is
     /// the same arrangement the rack uses for the same reason.
     pub fn set_map(&mut self, map: Option<crate::transient::TimeMap>) {
+        self.map = map.map(std::sync::Arc::new);
+    }
+
+    /// The same, for a map somebody else holds too.
+    pub fn adopt_map(&mut self, map: Option<std::sync::Arc<crate::transient::TimeMap>>) {
         self.map = map;
+    }
+
+    pub fn set_map_scale(&mut self, scale: f64) {
+        self.map_scale = scale;
     }
 
     /// Where the read pointer nominally sits for an output frame.
@@ -164,11 +177,24 @@ impl WsolaStream {
     /// Without transient preservation this is a straight line and needs no map
     /// at all, which is what lets the ratio move freely without anything being
     /// rebuilt off-thread.
+    ///
+    /// Before Scan: under a Scan of less than one the sweep needs output frames
+    /// past the document to reach the end of the file, so the line may carry on
+    /// that far before it is held.
     #[inline]
-    fn nominal(&self, out_frame: f64, ratio: f32, in_frames: usize) -> f32 {
+    fn nominal(&self, out_frame: f64, ratio: f32, in_frames: usize, scan: f32) -> f32 {
+        let reach = in_frames as f64 / (scan.abs().clamp(1e-3, 1.0) as f64);
         match &self.map {
-            Some(m) => m.input_at(out_frame) as f32,
-            None => self.anchor.source(out_frame, ratio).clamp(0.0, in_frames as f64) as f32,
+            Some(m) => {
+                let along = out_frame * self.map_scale;
+                let last = m.out_end();
+                if along > last && scan.abs() < 1.0 {
+                    (m.input_at(last) + (along - last) / ratio.max(1e-6) as f64).clamp(0.0, reach) as f32
+                } else {
+                    m.input_at(along) as f32
+                }
+            }
+            None => self.anchor.source(out_frame, ratio).clamp(0.0, reach) as f32,
         }
     }
 
@@ -234,8 +260,8 @@ impl Streamer for WsolaStream {
         // as playing to it. The grain cloud does the same, for the same reason.
         self.index = out_frame / hop as u64;
         self.anchor.reset(p.ratio.clamp(0.01, 100.0));
-        let nominal = self.nominal(out_frame as f64, p.ratio, input_frames);
         let scan = p.grain.scan.clamp(-4.0, 4.0);
+        let nominal = self.nominal(out_frame as f64, p.ratio, input_frames, scan);
         let swept = if scan < 0.0 {
             input_frames as f32 + nominal * scan
         } else {
@@ -375,7 +401,7 @@ impl Streamer for WsolaStream {
 
             self.write += hop_out as u64;
             self.index += 1;
-            let nominal = self.nominal(self.write as f64, ratio, in_frames);
+            let nominal = self.nominal(self.write as f64, ratio, in_frames, scan);
             let swept = if scan < 0.0 {
                 in_frames as f32 + nominal * scan
             } else {

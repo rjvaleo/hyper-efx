@@ -130,6 +130,7 @@ impl BlockRenderer {
                 size: 0,
                 rate: 1.0,
                 pitch_semis: 0.0,
+                voice: 0,
             },
             played: 0,
             shape: Shape {
