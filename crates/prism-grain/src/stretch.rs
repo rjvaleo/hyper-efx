@@ -354,7 +354,10 @@ impl Default for Stretch {
 
 impl Stretch {
     pub fn is_identity(&self) -> bool {
-        (self.ratio - 1.0).abs() < 1e-4
+        // Granular is grains at any ratio: the one engine not trying to be
+        // transparent, so an export has to carry what playback plays.
+        self.algorithm != Algorithm::Granular
+            && (self.ratio - 1.0).abs() < 1e-4
             && self.semitones.abs() < 1e-4
             && self.grain.is_clean()
             // A cloud over a document at unity is still a cloud. Without this
