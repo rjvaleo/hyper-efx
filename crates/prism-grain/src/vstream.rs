@@ -576,6 +576,7 @@ mod tests {
             wsola: spec.wsola,
             vocoder: spec.vocoder,
             grain: spec.grain,
+            soundhack: spec.soundhack,
         }
     }
 

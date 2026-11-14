@@ -272,6 +272,7 @@ mod tests {
             wsola: s.wsola,
             vocoder: s.vocoder,
             grain: s.grain,
+            soundhack: s.soundhack,
         };
         let win = (((s.window_ms / 1000.0) * RATE as f32) as usize).max(64);
         let hop = crate::stretch::hop_frames(&s.grain, win, RATE as f32).max(1);

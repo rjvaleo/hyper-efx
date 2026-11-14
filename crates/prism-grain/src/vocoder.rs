@@ -412,6 +412,7 @@ pub fn stretch_with(
             stereo_link: s.stereo_link,
         },
         grain: s.grain,
+        soundhack: crate::soundhack::SoundHackParams::default(),
     };
 
     // Driven in chunks rather than one enormous block, so a hundred-times
