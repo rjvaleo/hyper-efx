@@ -22,10 +22,15 @@
 //!
 //! - `PhaseInterpolate`. 0.888 wraps the raw frame-to-frame phase difference
 //!   into ±π and then scales it by I/D, and never wraps the sum it keeps.
-//!   0.896 scales the raw difference and wraps the sum. Neither takes out the
-//!   bin-centre advance 2πkD/N first, so wherever a bin's true advance passes
-//!   ±π the scaled phase is out by 2π·m·I/D — part of the sound, so kept. At a
-//!   whole-number I/D the two are the same phase mod 2π.
+//!   0.896 scales the raw difference and wraps the sum. Neither takes out a
+//!   bin-centre advance first (see `WindowFold` below for why there is little
+//!   to take out), and wherever the difference passes ±π the scaled phase is
+//!   out by 2π·m·I/D — part of the sound, so kept. At a whole-number I/D the
+//!   two are the same phase mod 2π. At any other, 0.896
+//!   turns every pass of a partial's measured phase through ±π into a phase
+//!   flip of 2π·s, so a partial off its bin's centre cancels itself (a steady
+//!   sine at 1.5× comes out 30 dB and more down, against 0.888's 3 dB), while
+//!   one on a centre is kept by both.
 //! - `FindBestRatio`. 0.896 tries a tolerance of 1.004 before 1.01. The break
 //!   order the report left open is pinned here from the disassembly
 //!   (0x2cda3): test 1.004 → step the hop → test 1.01, so a 1.01 hit returns
@@ -40,10 +45,12 @@
 //! output pointer is the input one times s, so scaling the accumulated phase
 //! by s scales the window's own centre offset as well: each resynthesised
 //! grain lands (s − 1)·(Nw − 1)/2 samples off the synthesis window, circularly
-//! within the frame. With the defaults a sine comes out about 7 dB down at 2×
-//! and 4×, about 2.7 dB down at 1.5× and 0.5×, and level at 1×. That follows
-//! from the decoded pointer arithmetic and is kept; it is pinned by
-//! `the_grain_lands_where_soundhacks_pointers_put_it`.
+//! within the frame. A tone on a bin centre comes out at the window's
+//! autocorrelation at that lag: with the defaults 0.73 of its level (−2.7 dB)
+//! at 1.5× and 0.5×, 0.47 (−6.6 dB) at 2× and 4×, all of it at 1×; one off a
+//! centre loses a little more, where the wrapped end of the grain disagrees
+//! with the rest. That follows from the decoded pointer arithmetic and is
+//! kept; it is pinned by `the_grain_lands_where_soundhacks_pointers_put_it`.
 //!
 //! 0.896's peak-locking branch in `PhaseInterpolate` is dead code there
 //! (`SetPvocDefaults` forces its flag off and no dialog item sets it), so it is
@@ -1317,30 +1324,45 @@ mod tests {
     /// SoundHack's time pointers mark where a window *starts*, and the
     /// output pointer is the input one times s. Scaling the accumulated phase
     /// by s therefore scales the window's own centre offset too, and each
-    /// resynthesised grain lands (s − 1)·(Nw − 1)/2 samples off the synthesis
-    /// window, circularly within the frame. With the defaults that is a level
-    /// the decoded program loses and this one loses with it:
+    /// resynthesised grain lands K = (s − 1)·(Nw − 1)/2 samples off the
+    /// synthesis window, circularly within the frame.
     ///
-    /// - 2× and 4× put the grain ±511 samples out (mod 1024): the same loss;
-    /// - 1.5× and 0.5× put it ±256 out: the same, smaller, loss;
-    /// - 1× puts it nowhere.
+    /// For a tone on a bin centre (where the circular shift costs nothing
+    /// else) that predicts its level outright: the Hamming window's
+    /// autocorrelation at lag K over its value at zero,
+    /// (a² + b²/2·cos 2πK/N) / (a² + b²/2) with a = 0.54, b = 0.46. So 0.73 at
+    /// 1.5× and 0.5× (K ≈ ±256), 0.47 at 2× and 4× (K ≈ 512 and 1534 ≡ 510),
+    /// and 1 at 1×. Measured with 0.888, which a fractional scale does not
+    /// otherwise disturb.
     #[test]
     fn the_grain_lands_where_soundhacks_pointers_put_it() {
+        let sr = 48_000.0f64;
+        let f = 5.0 * sr / 1024.0;
         let x: Vec<f32> =
-            (0..40_000).map(|i| (2.0 * PI32 * 220.7 * i as f32 / 44_100.0).sin() * 0.5).collect();
+            (0..96_000).map(|i| ((2.0 * std::f64::consts::PI * f * i as f64 / sr).sin() * 0.5) as f32).collect();
         let cfg = Config { under_max: 0.0, min_amp: 0.0, ..DEFAULT_CONFIG };
-        let rms = |v: &[f32]| (v.iter().map(|s| s * s).sum::<f32>() / v.len() as f32).sqrt();
-        let gain = |r: f32| {
-            let y = render_with(&x, 1, r, Version::V0896, cfg);
-            let n = y.len();
-            rms(&y[n / 4..n * 3 / 4]) / rms(&x)
+        let level = |r: f32| {
+            let y = render_with(&x, 1, r, Version::V0888, cfg);
+            let mid = &y[y.len() / 4..y.len() * 3 / 4];
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, s) in mid.iter().enumerate() {
+                let p = 2.0 * std::f64::consts::PI * f * i as f64 / sr;
+                re += *s as f64 * p.cos();
+                im += *s as f64 * p.sin();
+            }
+            2.0 * (re * re + im * im).sqrt() / mid.len() as f64 / 0.5
         };
-        let (g1, g15, g05, g2, g4) = (gain(1.0), gain(1.5), gain(0.5), gain(2.0), gain(4.0));
-        assert!((g1 - 1.0).abs() < 2e-3, "{g1}");
-        assert!((g2 - g4).abs() < 0.03 * g2, "{g2} {g4}");
-        assert!((g15 - g05).abs() < 0.03 * g15, "{g15} {g05}");
-        assert!(g2 > 0.35 && g2 < 0.47, "{g2}");
-        assert!(g15 > 0.65 && g15 < 0.8, "{g15}");
+        let predicted = |r: f64| {
+            let (d, i) = find_best_ratio(Version::V0888, r, 1024);
+            let s = i as f64 / d as f64;
+            let k = (s - 1.0) * 1023.0 / 2.0;
+            let (a2, b2) = (0.54f64 * 0.54, 0.46f64 * 0.46 / 2.0);
+            (a2 + b2 * (2.0 * std::f64::consts::PI * k / 1024.0).cos()) / (a2 + b2)
+        };
+        for r in [1.0f32, 1.5, 0.5, 2.0, 4.0] {
+            let (got, want) = (level(r), predicted(r as f64));
+            assert!((got - want).abs() < 0.02, "{r}: {got} against {want}");
+        }
     }
 
     /// Streaming in blocks of any size is the offline render, sample for
@@ -1409,6 +1431,42 @@ mod tests {
         assert_eq!(Version::from_str("0.896"), Some(Version::V0896));
         assert_eq!(Version::from_str("1.0"), None);
         assert_eq!(Version::default(), Version::V0896);
+    }
+
+    /// The two versions part company on any partial off its bin's centre at
+    /// a scale that is not a whole number. Such a partial's measured phase
+    /// drifts through ±π; 0.888 wraps the difference first, so the drift is
+    /// all it scales, while 0.896 scales the raw difference, so every pass
+    /// through ±π scales a 2π jump into 2π·s — π at 1.5× — and the partial
+    /// flips sign and cancels itself. A tone on a bin centre never drifts, and
+    /// both keep it. Measured on a steady sine at 1.5× (Goertzel, at the
+    /// tone): 0.888 about 0.35 of 0.5 on and off the centre; 0.896 the same on
+    /// it and 30 dB and more down off it.
+    #[test]
+    fn at_a_fractional_ratio_0896_loses_a_partial_off_its_bin_centre() {
+        let sr = 48_000.0f64;
+        let level = |bin: f64, v: Version| {
+            let f = bin * sr / 1024.0;
+            let x: Vec<f32> =
+                (0..96_000).map(|i| ((2.0 * std::f64::consts::PI * f * i as f64 / sr).sin() * 0.5) as f32).collect();
+            let y = stretch_with(&x, 1, 1.5, SoundHackParams { version: v }, None);
+            let mid = &y[y.len() / 4..y.len() * 3 / 4];
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, s) in mid.iter().enumerate() {
+                let p = 2.0 * std::f64::consts::PI * f * i as f64 / sr;
+                re += *s as f64 * p.cos();
+                im += *s as f64 * p.sin();
+            }
+            (2.0 * (re * re + im * im).sqrt() / mid.len() as f64) as f32
+        };
+        for bin in [5.0, 20.0] {
+            assert!(level(bin, Version::V0888) > 0.3, "{bin}");
+            assert!(level(bin, Version::V0896) > 0.3, "{bin}");
+        }
+        for bin in [4.5, 4.693, 20.5] {
+            assert!(level(bin, Version::V0888) > 0.3, "{bin}");
+            assert!(level(bin, Version::V0896) < 0.02, "{bin}: {}", level(bin, Version::V0896));
+        }
     }
 
     fn params() -> StretchParams {
