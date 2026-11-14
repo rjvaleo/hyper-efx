@@ -53,6 +53,11 @@ pub enum Algorithm {
     /// that suits it; sum. The expensive one, and the only one that is not
     /// applying a single compromise to material that is not one thing.
     Hybrid,
+    /// Tom Erbe's SoundHack phase vocoder time scale, rebuilt exactly from the
+    /// decoded program, 0.888 or 0.896 (`soundhack.rs`). Not a better vocoder:
+    /// that one, quirks and all. It answers none of the grain controls, as
+    /// the program had none.
+    SoundHack,
 }
 
 impl Algorithm {
@@ -63,6 +68,7 @@ impl Algorithm {
             Algorithm::Granular => "granular",
             Algorithm::Pvsola => "pvsola",
             Algorithm::Hybrid => "hybrid",
+            Algorithm::SoundHack => "soundhack",
         }
     }
 
@@ -73,6 +79,7 @@ impl Algorithm {
             "granular" => Some(Algorithm::Granular),
             "pvsola" => Some(Algorithm::Pvsola),
             "hybrid" => Some(Algorithm::Hybrid),
+            "soundhack" => Some(Algorithm::SoundHack),
             _ => None,
         }
     }
@@ -327,6 +334,8 @@ pub struct Stretch {
     /// How the hybrid engine splits the sound up and what it does with each
     /// part.
     pub hybrid: crate::hybrid::HybridParams,
+    /// SoundHack's time scale: which version it behaves like.
+    pub soundhack: crate::soundhack::SoundHackParams,
     /// Per-grain variation. Inert by default.
     pub grain: crate::Grain,
 }
@@ -347,6 +356,7 @@ impl Default for Stretch {
             cloud_mix: 0.5,
             pvsola: crate::pvsola::PvsolaParams::default(),
             hybrid: crate::hybrid::HybridParams::default(),
+            soundhack: crate::soundhack::SoundHackParams::default(),
             grain: crate::Grain::default(),
         }
     }
@@ -357,6 +367,9 @@ impl Stretch {
         // Granular is grains at any ratio: the one engine not trying to be
         // transparent, so an export has to carry what playback plays.
         self.algorithm != Algorithm::Granular
+            // Nor is SoundHack: at 1x it still gates, lags a hop and ripples,
+            // and that is the program's sound.
+            && self.algorithm != Algorithm::SoundHack
             && (self.ratio - 1.0).abs() < 1e-4
             && self.semitones.abs() < 1e-4
             && self.grain.is_clean()
@@ -492,6 +505,8 @@ impl Stretch {
         let passes = match self.algorithm {
             // Counted once: the layers happen inside them.
             Algorithm::Pvsola | Algorithm::Hybrid => 1,
+            // Not layered at all: see below.
+            Algorithm::SoundHack => 1,
             _ => layers,
         };
         let cloud = if self.cloud && self.algorithm != Algorithm::Granular { 1 } else { 0 };
@@ -571,6 +586,11 @@ impl Stretch {
                 self.hybrid,
                 prog,
             ),
+            // SoundHack's own, from the top, and nothing else: the program has
+            // no grain controls and no layers, so neither reaches it.
+            Algorithm::SoundHack => {
+                crate::soundhack::stretch_with(input, channels, ratio * pitch, self.soundhack, prog)
+            }
             Algorithm::Wsola => {
                 let win = (((self.window_ms.clamp(5.0, 2000.0) / 1000.0) * sr) as usize).max(64);
                 layered(&self.grain, channels, hop_frames(&self.grain, win, sr), sample_rate, |g| {
@@ -908,6 +928,7 @@ fn wsola(
         wsola: params,
         vocoder: VocoderParams::default(),
         grain: *g,
+        soundhack: crate::soundhack::SoundHackParams::default(),
     };
 
     // Driven in chunks rather than as one enormous block. The streamer sizes

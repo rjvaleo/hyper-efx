@@ -131,6 +131,7 @@ pub fn stretch_with(
         wsola: spec.wsola,
         vocoder: spec.vocoder,
         grain: spec.grain,
+        soundhack: spec.soundhack,
     };
 
     // Layered like the other four, so the shared grain controls reach this one

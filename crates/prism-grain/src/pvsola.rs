@@ -97,6 +97,7 @@ pub fn stretch_with(
         wsola: spec.wsola,
         vocoder: spec.vocoder,
         grain: spec.grain,
+        soundhack: spec.soundhack,
     };
 
     // Too short for even one anchored segment. The plain vocoder is the honest

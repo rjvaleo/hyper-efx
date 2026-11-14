@@ -1,8 +1,9 @@
 //! MultiGrainLive's sound engine, shared with idMLab.
 //!
-//! The five ways it plays a file — grains, WSOLA, a phase vocoder, PVSOLA and
-//! the hybrid of the three — each as an offline render and as a streamer, the
-//! `Stretcher` that holds all five resident and crossfades between them, and
+//! The ways it plays a file — grains, WSOLA, a phase vocoder, PVSOLA, the
+//! hybrid of the three, and SoundHack's own phase vocoder rebuilt exactly —
+//! each as an offline render and as a streamer, the `Stretcher` that holds
+//! them all resident and crossfades between them, and
 //! the `BlockRenderer` that plays a grain stream a block at a time.
 //!
 //! Moved here from MultiGrainLive's `fx` and `engine` crates unchanged, so
@@ -23,6 +24,7 @@ pub mod nstream;
 pub mod pstream;
 pub mod pvsola;
 pub mod render;
+pub mod soundhack;
 pub mod stream;
 pub mod stretch;
 pub mod stretcher;

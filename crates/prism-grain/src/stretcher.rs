@@ -18,6 +18,7 @@
 use crate::grain::{GrainEvent, StreamParams};
 use crate::hstream::{Parts, PitchedHybrid};
 use crate::pstream::PitchedPvsola;
+use crate::soundhack::SoundHackStream;
 use crate::stream::{Pitched, StretchParams, WsolaStream};
 use crate::stretch::Algorithm;
 use crate::vstream::VocoderStream;
@@ -81,8 +82,9 @@ impl LayerBank {
                         .push(PitchedHybrid::new(max_block, channels, sample_rate))
                 }
                 // The grain cloud layers inside its own renderer: a layer there
-                // is another schedule, not another engine.
-                Algorithm::Granular => {}
+                // is another schedule, not another engine. SoundHack has no
+                // layers, as the program had none.
+                Algorithm::Granular | Algorithm::SoundHack => {}
             }
         }
         bank
@@ -94,7 +96,7 @@ impl LayerBank {
             Algorithm::Vocoder => self.vocoder.len(),
             Algorithm::Pvsola => self.pvsola.len(),
             Algorithm::Hybrid => self.hybrid.len(),
-            Algorithm::Granular => 0,
+            Algorithm::Granular | Algorithm::SoundHack => 0,
         }
     }
 }
@@ -111,6 +113,7 @@ pub struct Stretcher {
     vocoder: Option<Pitched<VocoderStream>>,
     pvsola: Option<PitchedPvsola>,
     hybrid: Option<PitchedHybrid>,
+    soundhack: Option<Pitched<SoundHackStream>>,
     /// The source, split three ways. Handed over from off the audio thread; an
     /// empty one simply means the hybrid has nothing to play yet.
     parts: std::sync::Arc<Parts>,
@@ -202,6 +205,16 @@ fn layer_hop(alg: Algorithm, sp: &StreamParams) -> u64 {
             (crate::stretch::fft_size_for(sp.vocoder.window_ms, sp.sample_rate) / 4).max(1)
         }
         Algorithm::Granular => sp.plan().hop,
+        // Never layered (its bank is empty), but it has a hop all the same:
+        // the synthesis one `FindBestRatio` picks.
+        Algorithm::SoundHack => {
+            crate::soundhack::find_best_ratio(
+                sp.soundhack.version,
+                sp.ratio.clamp(0.01, 100.0) as f64,
+                crate::soundhack::DEFAULT_CONFIG.nw,
+            )
+            .1
+        }
     };
     hop.max(1) as u64
 }
@@ -214,6 +227,7 @@ fn stretch_params(sp: &StreamParams) -> StretchParams {
         wsola: sp.wsola,
         vocoder: sp.vocoder,
         grain: sp.grain,
+        soundhack: sp.soundhack,
     }
 }
 
@@ -229,6 +243,7 @@ impl Stretcher {
             vocoder: Some(Pitched::new(VocoderStream::new(max_block, channels), max_block, channels)),
             pvsola: Some(PitchedPvsola::new(max_block, channels)),
             hybrid: Some(PitchedHybrid::new(max_block, channels, sample_rate)),
+            soundhack: Some(Pitched::new(SoundHackStream::new(max_block, channels), max_block, channels)),
             parts: std::sync::Arc::new(Parts::default()),
             current: Algorithm::Granular,
             fading: None,
@@ -271,6 +286,8 @@ impl Stretcher {
                 .then(|| Pitched::new(VocoderStream::new(max_block, channels), max_block, channels)),
             pvsola: is(Algorithm::Pvsola).then(|| PitchedPvsola::new(max_block, channels)),
             hybrid: is(Algorithm::Hybrid).then(|| PitchedHybrid::new(max_block, channels, sample_rate)),
+            soundhack: is(Algorithm::SoundHack)
+                .then(|| Pitched::new(SoundHackStream::new(max_block, channels), max_block, channels)),
             parts: Arc::new(Parts::default()),
             current: algorithm,
             fading: None,
@@ -473,6 +490,11 @@ impl Stretcher {
                 let parts = std::sync::Arc::clone(&self.parts);
                 if let Some(e) = self.hybrid.as_mut() {
                     e.seek(out_frame, &parts, &stretch_params(sp), sp.hybrid, sp.semitones);
+                }
+            }
+            Algorithm::SoundHack => {
+                if let Some(e) = self.soundhack.as_mut() {
+                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones);
                 }
             }
             _ => self.grain.seek(out_frame, sp),
@@ -788,7 +810,7 @@ impl Stretcher {
                     e.seek(at, &parts, &stretch_params(lp), lp.hybrid, lp.semitones);
                 }
             }
-            Algorithm::Granular => {}
+            Algorithm::Granular | Algorithm::SoundHack => {}
         }
     }
 
@@ -840,7 +862,7 @@ impl Stretcher {
                     );
                 }
             }
-            Algorithm::Granular => out.fill(0.0),
+            Algorithm::Granular | Algorithm::SoundHack => out.fill(0.0),
         }
     }
 
@@ -889,6 +911,12 @@ impl Stretcher {
                 let parts = std::sync::Arc::clone(&self.parts);
                 if let Some(e) = self.hybrid.as_mut() {
                     e.render_pitched(out, channels, &parts, &stretch_params(sp), sp.hybrid, sp.semitones);
+                }
+                0
+            }
+            Algorithm::SoundHack => {
+                if let Some(e) = self.soundhack.as_mut() {
+                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), sp.semitones);
                 }
                 0
             }

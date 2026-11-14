@@ -47,6 +47,8 @@ pub struct StretchParams {
     pub wsola: WsolaParams,
     pub vocoder: VocoderParams,
     pub grain: Grain,
+    /// SoundHack's time scale: which version it behaves like.
+    pub soundhack: crate::soundhack::SoundHackParams,
 }
 
 /// How a block-at-a-time engine is driven.
@@ -897,6 +899,7 @@ mod tests {
             wsola: spec.wsola,
             vocoder: spec.vocoder,
             grain: spec.grain,
+            soundhack: spec.soundhack,
         }
     }
 
