@@ -17,6 +17,7 @@ pub mod contract;
 pub mod effects;
 pub mod fft;
 mod kernel;
+pub mod par;
 mod smooth;
 mod spec;
 
