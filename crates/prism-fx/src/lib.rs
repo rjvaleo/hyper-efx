@@ -123,6 +123,7 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::compressor::DESCRIPTOR, make: boxed::<effects::Compressor> },
     Entry { descriptor: &effects::freeverb::DESCRIPTOR, make: boxed::<effects::Freeverb> },
     Entry { descriptor: &effects::jcrev::DESCRIPTOR, make: boxed::<effects::Jcrev> },
+    Entry { descriptor: &effects::ambient::DESCRIPTOR, make: boxed::<effects::AmbientFdn> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {

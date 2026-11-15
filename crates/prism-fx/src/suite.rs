@@ -162,6 +162,10 @@ pub static SUITES: &[Suite] = &[
                     m("lxp-room", "Studio Room", Ours, "Our own design in the style of the Lexicon LXP (not a model of it)"),
                 ],
             },
+            Family {
+                label: "Ambient",
+                modes: &[m("ambient-fdn", "Ambient FDN", Static, "Stone Voices Ambient Reverb 4.3, sources/reports/001-ambientreverb.md (static decode; ramps and EQ steps on a fixed 256-frame block are ours)")],
+            },
             Family { label: "Impulse", modes: &[m("convolution", "Convolution", Port(Unchecked), "SoundHack convolution (Tom Erbe)")] },
             Family { label: "Parts", modes: &[m("allpass-diffuser", "All-pass Diffuser", Paper, DAT)] },
         ],
