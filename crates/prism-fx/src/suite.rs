@@ -121,7 +121,7 @@ const fn unlisted(mut mode: Mode) -> Mode {
     mode
 }
 
-use Exactness::{Ours, Paper, Port};
+use Exactness::{Ours, Paper, Port, Static};
 use Verdict::{Differs, Matches, Unchecked};
 
 const HP: &str = "Hyperprism (Arboretum Systems), as decoded in decoded/hyperprism.md";
@@ -142,6 +142,7 @@ pub static SUITES: &[Suite] = &[
                     m("schroeder-reverb", "Schroeder", Paper, "M. R. Schroeder, \"Natural sounding artificial reverberation\" (1962)"),
                     m("moorer-reverb", "Moorer", Paper, "J. A. Moorer, \"About this reverberation business\" (1979)"),
                     m("dattorro-plate", "Plate", Paper, DAT),
+                    m("freeverb", "Comb Hall", Static, "Jezar's Freeverb (2000, public domain), as copied bit for bit in Black Water Reverb: sources/reports/001-black-water-reverb.md"),
                 ],
             },
             Family {
