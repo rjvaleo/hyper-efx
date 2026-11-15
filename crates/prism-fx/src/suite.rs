@@ -143,6 +143,7 @@ pub static SUITES: &[Suite] = &[
                     m("moorer-reverb", "Moorer", Paper, "J. A. Moorer, \"About this reverberation business\" (1979)"),
                     m("dattorro-plate", "Plate", Paper, DAT),
                     m("freeverb", "Comb Hall", Static, "Jezar's Freeverb (2000, public domain), as copied bit for bit in Black Water Reverb: sources/reports/001-black-water-reverb.md"),
+                    m("jcrev", "JC Reverb", Static, "Pluggo cverb~ (Cycling '74): the Schroeder/Chowning JCRev, sources/reports/003-pluggo-externals.md. Mono in and out; the stereo pair (one per channel) is ours"),
                 ],
             },
             Family {
