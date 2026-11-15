@@ -18,12 +18,13 @@ pub mod effects;
 pub mod fft;
 mod kernel;
 pub mod par;
+pub mod suite;
 mod smooth;
 mod spec;
 
 pub use kernel::{DynKernel, Kernel};
 pub use smooth::Smoothed;
-pub use spec::{Category, Descriptor, Display, Group, PadPair, Panel, ParamKind, ParamSpec, SoundInput};
+pub use spec::{Category, Descriptor, Display, Group, PadPair, Panel, ParamKind, ParamSpec, Role, SoundInput};
 
 /// One effect in the catalogue: what it is, and how to build it.
 #[derive(Clone, Copy)]

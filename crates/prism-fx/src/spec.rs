@@ -51,6 +51,26 @@ pub struct ParamSpec {
     /// it out, and the contract holds it to changing nothing rather than to
     /// reaching the output.
     pub inert: bool,
+    /// Which group of a module's face the control sits in (SUITE-PLAN §2.0).
+    /// One face layout serves every mode of a module while each mode keeps
+    /// its own exact controls. None until the face work assigns it.
+    pub role: Option<Role>,
+}
+
+/// The face groups controls are placed in by role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Time,
+    Space,
+    Tone,
+    Motion,
+    Drive,
+    Noise,
+    Dynamics,
+    Pitch,
+    Stereo,
+    Output,
+    Engine,
 }
 
 impl ParamSpec {
@@ -68,7 +88,14 @@ impl ParamSpec {
             glides: None,
             when: None,
             inert: false,
+            role: None,
         }
+    }
+
+    /// Place this control in a face group.
+    pub const fn role(mut self, role: Role) -> Self {
+        self.role = Some(role);
+        self
     }
 
     pub const fn log(mut self) -> Self {
@@ -270,6 +297,13 @@ mod tests {
         let lin = ParamSpec::new("mix", "Mix", 0.0, 1.0, 0.5);
         assert_eq!(lin.to_unit(0.25), 0.25);
         assert_eq!(lin.from_unit(f32::NAN), 0.5);
+    }
+
+    #[test]
+    fn a_role_is_none_until_given() {
+        let p = ParamSpec::new("mix", "Mix", 0.0, 1.0, 0.5);
+        assert_eq!(p.role, None);
+        assert_eq!(p.role(Role::Output).role, Some(Role::Output));
     }
 
     #[test]
