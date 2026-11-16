@@ -18,6 +18,7 @@ pub mod effects;
 pub mod fft;
 mod kernel;
 pub mod par;
+pub mod place;
 pub mod suite;
 mod smooth;
 mod spec;
