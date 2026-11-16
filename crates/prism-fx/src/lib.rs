@@ -124,6 +124,18 @@ pub static CATALOG: &[Entry] = &[
     Entry { descriptor: &effects::freeverb::DESCRIPTOR, make: boxed::<effects::Freeverb> },
     Entry { descriptor: &effects::jcrev::DESCRIPTOR, make: boxed::<effects::Jcrev> },
     Entry { descriptor: &effects::ambient::DESCRIPTOR, make: boxed::<effects::AmbientFdn> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[0], make: boxed::<effects::Supermassive<0>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[1], make: boxed::<effects::Supermassive<1>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[2], make: boxed::<effects::Supermassive<2>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[3], make: boxed::<effects::Supermassive<3>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[4], make: boxed::<effects::Supermassive<4>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[5], make: boxed::<effects::Supermassive<5>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[6], make: boxed::<effects::Supermassive<6>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[7], make: boxed::<effects::Supermassive<7>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[8], make: boxed::<effects::Supermassive<8>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[9], make: boxed::<effects::Supermassive<9>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[10], make: boxed::<effects::Supermassive<10>> },
+    Entry { descriptor: &effects::supermassive::DESCRIPTORS[11], make: boxed::<effects::Supermassive<11>> },
 ];
 
 fn boxed<K: Kernel + 'static>(sample_rate: f32) -> Box<dyn DynKernel> {

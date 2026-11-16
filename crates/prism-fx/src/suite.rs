@@ -121,7 +121,7 @@ const fn unlisted(mut mode: Mode) -> Mode {
     mode
 }
 
-use Exactness::{Ours, Paper, Port, Static};
+use Exactness::{Measured, Ours, Paper, Port, Static};
 use Verdict::{Differs, Matches, Unchecked};
 
 const HP: &str = "Hyperprism (Arboretum Systems), as decoded in decoded/hyperprism.md";
@@ -136,6 +136,23 @@ pub static SUITES: &[Suite] = &[
         label: "Reverb",
         face: FaceKind::Reverb,
         families: &[
+            Family {
+                label: "Network",
+                modes: &[
+                    m("sm-gemini", "Mesh 16", Measured, "Valhalla Supermassive 1.3.0, mode \"Gemini\": decoded/valhalla-supermassive.md §10.1; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-hydra", "Mesh 8 + Diffuser", Measured, "Valhalla Supermassive 1.3.0, mode \"Hydra\": decoded/valhalla-supermassive.md §10.2; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-centaurus", "Quad Cascade", Measured, "Valhalla Supermassive 1.3.0, mode \"Centaurus\": decoded/valhalla-supermassive.md §10.3; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-sagittarius", "Stereo Cascade", Measured, "Valhalla Supermassive 1.3.0, mode \"Sagittarius\": decoded/valhalla-supermassive.md §10.4; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-great-annihilator", "Quad Loop + Diffusers", Measured, "Valhalla Supermassive 1.3.0, mode \"Great Annihilator\": decoded/valhalla-supermassive.md §10.5; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-andromeda", "Echo Loop + Diffusers", Measured, "Valhalla Supermassive 1.3.0, mode \"Andromeda\": decoded/valhalla-supermassive.md §10.6; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-lyra", "Mesh 4", Measured, "Valhalla Supermassive 1.3.0, mode \"Lyra\": decoded/valhalla-supermassive.md §10.7; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-capricorn", "Mesh 8", Measured, "Valhalla Supermassive 1.3.0, mode \"Capricorn\": decoded/valhalla-supermassive.md §10.8; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-triangulum", "Ping-Pong Diffuse", Measured, "Valhalla Supermassive 1.3.0, mode \"Triangulum\": decoded/valhalla-supermassive.md §10.9; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-lmc", "Householder Loop", Measured, "Valhalla Supermassive 1.3.0, mode \"Large Magellanic Cloud\": decoded/valhalla-supermassive.md §10.10; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-cirrus-major", "Filtered Mesh + Diffuser", Measured, "Valhalla Supermassive 1.3.0, mode \"Cirrus Major\": decoded/valhalla-supermassive.md §10.11; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                    m("sm-cirrus-minor", "Filtered Mesh 8", Measured, "Valhalla Supermassive 1.3.0, mode \"Cirrus Minor\": decoded/valhalla-supermassive.md §10.12; measured against the original (sources/reports/001-valhalla-measured.md S3, S5)"),
+                ],
+            },
             Family {
                 label: "Classic",
                 modes: &[
