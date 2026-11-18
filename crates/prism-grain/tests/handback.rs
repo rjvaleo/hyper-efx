@@ -38,3 +38,14 @@ fn a_replaced_bank_comes_back() {
     let old = s.replace_bank(bank(2)).expect("the one just given comes back");
     assert_eq!(old.layers, 3);
 }
+
+#[test]
+fn a_replaced_separation_comes_back() {
+    use prism_grain::hstream::Parts;
+    let mut s = Stretcher::new(512, 2, SR);
+    let first = Arc::new(Parts::default());
+    let own = s.replace_parts(Arc::clone(&first));
+    assert_eq!(Arc::strong_count(&own), 1, "the empty one it was built with, and the caller is its last holder");
+    let old = s.replace_parts(Arc::new(Parts::default()));
+    assert!(Arc::ptr_eq(&old, &first), "then the one it was given");
+}

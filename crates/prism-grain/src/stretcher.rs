@@ -432,7 +432,15 @@ impl Stretcher {
 
     /// Adopt a freshly separated source. Built off the audio thread.
     pub fn set_parts(&mut self, parts: std::sync::Arc<Parts>) {
-        self.parts = parts;
+        drop(self.replace_parts(parts));
+    }
+
+    /// [`Self::set_parts`], handing back the separation it replaces. A voice
+    /// is built holding an empty one of its own, so the first one a voice is
+    /// given replaces the last hold on that: dropped on the audio thread it
+    /// is a free there.
+    pub fn replace_parts(&mut self, parts: std::sync::Arc<Parts>) -> std::sync::Arc<Parts> {
+        std::mem::replace(&mut self.parts, parts)
     }
 
     /// Adopt copies of the source an octave or more up (`octave.rs`). Built
