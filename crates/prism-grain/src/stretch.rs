@@ -996,13 +996,16 @@ pub(crate) fn best_offset(
     // choice lands on a grid you can hear.
     let step = params.stride.clamp(1, 256) as usize;
     let mut p = lo;
+    // Every other frame of what is wanted, cut once. The loop below is the
+    // same sums in the same order as indexing each sample was; only the
+    // working out of where each sample is, and the checks on it, are gone.
+    let expect = &expect[..len * channels];
     while p <= hi {
         let mut dot = 0f32;
         let mut energy = 0f32;
-        for i in (0..len).step_by(2) {
-            for ch in 0..channels {
-                let a = input[(p + i) * channels + ch];
-                let b = expect[i * channels + ch];
+        let here = &input[p * channels..(p + len) * channels];
+        for (a, b) in here.chunks_exact(channels).zip(expect.chunks_exact(channels)).step_by(2) {
+            for (a, b) in a.iter().zip(b) {
                 dot += a * b;
                 energy += a * a;
             }

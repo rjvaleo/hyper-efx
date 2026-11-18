@@ -42,6 +42,10 @@ pub struct PvsolaStream {
     /// One round of the run being prepared, before it is spliced in.
     piece: Vec<f32>,
     piece_frames: usize,
+    /// The splice search's two sounds mixed to one channel, made once a
+    /// search. Room for a whole round each, so the search never grows them.
+    mono_want: Vec<f32>,
+    mono_piece: Vec<f32>,
     /// How much of that round has been produced so far, and what it is for.
     ///
     /// A round is a whole vocoder run and takes far longer to make than one
@@ -98,6 +102,8 @@ impl PvsolaStream {
             b: VocoderStream::new(MAX_SPAN + MAX_LEAD, channels),
             piece: vec![0.0; (MAX_SPAN + MAX_LEAD) * channels],
             piece_frames: 0,
+            mono_want: vec![0.0; MAX_SPAN + MAX_LEAD],
+            mono_piece: vec![0.0; MAX_SPAN + MAX_LEAD],
             prep: None,
             held: None,
             held_p: None,
@@ -376,7 +382,7 @@ impl PvsolaStream {
     /// one channel, and searching per channel would let a stereo pair land at
     /// two different offsets and smear the image.
     fn best_offset(
-        &self,
+        &mut self,
         channels: usize,
         join: u64,
         span: usize,
@@ -395,25 +401,39 @@ impl PvsolaStream {
             return at.min(hi);
         }
 
-        let want_at = |i: usize| -> f32 {
-            let slot = ((join + i as u64) % self.ring as u64) as usize;
+        // Both sounds mixed to one channel, once. The search used to mix each
+        // sample again at every place it tried (with a remainder and two
+        // divisions each time); the numbers, and the order they are added
+        // in, are the same as then, so it chooses the same place.
+        let mut want = std::mem::take(&mut self.mono_want);
+        let mut mono = std::mem::take(&mut self.mono_piece);
+        let fits = span <= want.len() && hi + span <= mono.len();
+        for (i, slot) in want.iter_mut().enumerate().take(if fits { span } else { 0 }) {
+            let from = ((join + i as u64) % self.ring as u64) as usize;
             let mut acc = 0.0;
             for ch in 0..channels {
-                acc += self.acc[slot * self.channels + ch];
+                acc += self.acc[from * self.channels + ch];
             }
-            acc / channels as f32
-        };
-        let piece_at = |f: usize| -> f32 {
+            *slot = acc / channels as f32;
+        }
+        for f in if fits { lo..hi + span } else { 0..0 } {
             let mut acc = 0.0;
             for ch in 0..channels {
                 acc += self.piece[f * channels + ch];
             }
-            acc / channels as f32
-        };
+            mono[f] = acc / channels as f32;
+        }
+        let best = if fits { Self::search(&want[..span], &mono, lo, hi, at, self.stride) } else { at };
+        self.mono_want = want;
+        self.mono_piece = mono;
+        best
+    }
 
+    /// The place between `lo` and `hi` where `mono` best continues `want`.
+    fn search(want: &[f32], mono: &[f32], lo: usize, hi: usize, at: usize, stride: usize) -> usize {
+        let span = want.len();
         let mut want_energy = 0f32;
-        for i in 0..span {
-            let v = want_at(i);
+        for v in want {
             want_energy += v * v;
         }
         let want_energy = want_energy.sqrt();
@@ -430,9 +450,8 @@ impl PvsolaStream {
         while off <= hi {
             let mut dot = 0f32;
             let mut energy = 0f32;
-            for i in 0..span {
-                let v = piece_at(off + i);
-                dot += want_at(i) * v;
+            for (w, v) in want.iter().zip(&mono[off..off + span]) {
+                dot += w * v;
                 energy += v * v;
             }
             let score = dot / (want_energy * energy.sqrt() + 1e-9);
@@ -440,7 +459,7 @@ impl PvsolaStream {
                 best_score = score;
                 best = off;
             }
-            off += self.stride;
+            off += stride;
         }
         best
     }
