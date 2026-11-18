@@ -434,15 +434,8 @@ impl PitchedHybrid {
             return;
         }
         let inner = PitchRing::inner_params(p, pitch);
-        let frames = out.len() / channels.max(1);
-        let need = self.ring.need(frames, pitch);
-        while self.ring.made() < need {
-            let n = self.ring.chunk().min((need - self.ring.made()) as usize);
-            self.inner
-                .render(&mut self.scratch[..n * channels], channels, parts, &inner, h);
-            self.ring.push(&self.scratch, n, channels);
-        }
-        self.ring.read(out, channels, pitch);
+        let engine = &mut self.inner;
+        self.ring.pull(out, channels, pitch, &mut self.scratch, |buf| engine.render(buf, channels, parts, &inner, h));
     }
 
     pub fn seek(

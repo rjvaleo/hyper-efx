@@ -442,17 +442,29 @@ impl Streamer for WsolaStream {
 ///
 /// The resampler pulls: to hand out N frames it needs about N × pitch frames of
 /// stretched audio, which it takes from the inner engine in chunks and keeps in
-/// a ring. Sized for the widest pitch the control allows, so nothing is
-/// allocated once it exists.
+/// a ring. The ring is a fixed size, so nothing is allocated once it exists; a
+/// read faster than it was sized for is taken in pieces ([`PitchRing::pull`]).
 pub struct Pitched<S: Streamer> {
     inner: S,
     ring: PitchRing,
     scratch: Vec<f32>,
 }
 
-/// The widest pitch shift the control allows, as a rate multiplier. Buffers are
-/// sized from this, not from the current setting.
-const MAX_PITCH: f32 = 20.0;
+/// The widest pitch shift there is, in semitones each way: eight octaves, the
+/// grain cloud's own limit (a rate of 256, `grain.rs`). A key's pitch rides on
+/// top of the document's, and the top of MIDI is 67 semitones above middle C,
+/// so this is what lets note 127 (G9) play at its own pitch (RJ, 16 Nov 2026:
+/// the keys stopped at C8, where the old ±48 ran out).
+pub const MAX_SEMITONES: f32 = 96.0;
+
+/// [`MAX_SEMITONES`] as a rate multiplier.
+pub const MAX_PITCH: f32 = 256.0;
+
+/// The read rate the ring is sized for: a block at this rate or slower is one
+/// read, exactly as it always was. A faster one is read in pieces, each small
+/// enough to fit, so the ring does not have to be sized for the fastest rate
+/// (at 256 that would be megabytes per voice for a rate nobody holds).
+const RING_PITCH: f32 = 20.0;
 
 /// The resampling half of pitch shifting, with no engine attached.
 ///
@@ -465,7 +477,8 @@ const MAX_PITCH: f32 = 20.0;
 ///
 /// It **pulls**. To hand out N frames it needs about N × pitch frames of
 /// stretched audio, which the owner renders in chunks and pushes in. Sized for
-/// the widest pitch the control allows, so nothing is allocated once it exists.
+/// [`RING_PITCH`], so nothing is allocated once it exists; [`PitchRing::pull`]
+/// takes a faster read in pieces that fit.
 pub struct PitchRing {
     /// Stretched audio waiting to be read back at a rate.
     buf: Vec<f32>,
@@ -528,10 +541,10 @@ impl PitchRing {
     pub fn new(max_block: usize, channels: usize) -> Self {
         let channels = channels.max(1);
         let chunk = max_block.max(1);
-        // Room for the fastest read the control allows, plus one chunk so a
+        // Room for a whole block read at `RING_PITCH`, plus one chunk so a
         // pull always has somewhere to land, plus the four frames the
-        // interpolator spans.
-        let ring = ((max_block as f32 * MAX_PITCH) as usize) + chunk + 8;
+        // interpolator spans. Faster reads are taken in pieces (`pull`).
+        let ring = ((max_block as f32 * RING_PITCH) as usize) + chunk + 8;
         PitchRing {
             buf: vec![0.0; ring * channels],
             ring,
@@ -585,9 +598,60 @@ impl PitchRing {
         (self.glide - self.last_pitch).abs() > 1e-4
     }
 
-    /// Semitones as a rate multiplier, clamped where the buffers assume.
+    /// Semitones as a rate multiplier, within [`MAX_SEMITONES`] each way.
     pub fn factor(semitones: f32) -> f32 {
         2f32.powf(semitones / 12.0).clamp(1.0 / MAX_PITCH, MAX_PITCH)
+    }
+
+    /// The most output frames one read at `pitch` can take, so that every
+    /// stretched frame it spans is still in the ring when it is read.
+    ///
+    /// A read of `n` frames spans `(n - 1) × rate` stretched frames plus the
+    /// interpolator's four; the ring holds `RING_PITCH` blocks' worth plus a
+    /// chunk and eight. At `RING_PITCH` or slower this is at least a whole
+    /// block, so a block is one read, as it always was.
+    fn reach(&self, pitch: f32) -> usize {
+        let rate = self.glide.max(self.last_pitch).max(pitch).max(1.0) as f64;
+        let room = (self.ring - self.chunk - 8) as f64;
+        ((room / rate).floor() as usize).max(1)
+    }
+
+    /// Hand out `out` at `pitch`, asking `make` for stretched frames as they
+    /// are needed: `make(buf)` fills `buf` (from `scratch`, at most a chunk)
+    /// with the engine's next frames.
+    ///
+    /// A block read faster than the ring was sized for is taken in pieces,
+    /// each one filled and read before the next, so the frames a read spans
+    /// are never overwritten by the frames that come after them. The read
+    /// position carries on exactly from piece to piece, so a split block is
+    /// the same sound as a whole one.
+    pub fn pull(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        pitch: f32,
+        scratch: &mut [f32],
+        mut make: impl FnMut(&mut [f32]),
+    ) {
+        let ch = channels.max(1);
+        let frames = out.len() / ch;
+        if frames == 0 {
+            self.need(0, pitch);
+            self.read(out, ch, pitch);
+            return;
+        }
+        let mut at = 0;
+        while at < frames {
+            let n = (frames - at).min(self.reach(pitch));
+            let need = self.need(n, pitch);
+            while self.made < need {
+                let k = self.chunk.min((need - self.made) as usize);
+                make(&mut scratch[..k * ch]);
+                self.push(scratch, k, ch);
+            }
+            self.read(&mut out[at * ch..(at + n) * ch], ch, pitch);
+            at += n;
+        }
     }
 
     /// The ratio the engine underneath must be driven at.
@@ -789,14 +853,8 @@ impl<S: Streamer> Pitched<S> {
             return;
         }
         let inner = PitchRing::inner_params(p, pitch);
-        let frames = out.len() / channels.max(1);
-        let need = self.ring.need(frames, pitch);
-        while self.ring.made() < need {
-            let n = self.ring.chunk().min((need - self.ring.made()) as usize);
-            self.inner.render(&mut self.scratch[..n * channels], channels, input, &inner);
-            self.ring.push(&self.scratch, n, channels);
-        }
-        self.ring.read(out, channels, pitch);
+        let engine = &mut self.inner;
+        self.ring.pull(out, channels, pitch, &mut self.scratch, |buf| engine.render(buf, channels, input, &inner));
     }
 
     pub fn position(&self) -> u64 {
@@ -863,6 +921,45 @@ mod tests {
             ring.read(&mut out, 1, want);
         }
         assert!(!ring.gliding(), "the read rate never arrived");
+    }
+
+    /// The top of MIDI is a read 48 times faster than the source, and the
+    /// ring is sized for 20 (RJ, 16 Nov 2026: the keys stopped at C8). A read
+    /// too fast for the ring is taken in pieces; if a piece ever outran the
+    /// ring, frames it needed would be overwritten before it read them. Every
+    /// output frame is checked against the same four-point read of the line
+    /// itself, so a single lost frame shows.
+    #[test]
+    fn a_read_faster_than_the_ring_reads_every_frame_it_spans() {
+        let line = |j: i64| ((j.max(0) as f32) * 0.0007).sin() * 0.5;
+        for semis in [48.0f32, 60.0, 67.0, MAX_SEMITONES] {
+            let pitch = PitchRing::factor(semis);
+            let mut ring = PitchRing::new(512, 1);
+            ring.seek(0, pitch);
+            let mut scratch = vec![0.0f32; 512];
+            let mut next = 0i64;
+            let mut out = vec![0.0f32; 512];
+            let mut f = 0u64;
+            for _ in 0..12 {
+                ring.pull(&mut out, 1, pitch, &mut scratch, |buf| {
+                    for v in buf.iter_mut() {
+                        *v = line(next);
+                        next += 1;
+                    }
+                });
+                for &got in &out {
+                    let at = f as f64 * pitch as f64;
+                    let i = at.floor() as i64;
+                    let t = (at - i as f64) as f32;
+                    let want = crate::stretch::hermite(line(i - 1), line(i), line(i + 1), line(i + 2), t);
+                    assert_eq!(got, want, "{semis} semitones up, frame {f}: a frame the read needed was gone");
+                    f += 1;
+                }
+            }
+            assert!(next as f64 >= f as f64 * pitch as f64 * 0.99, "the engine was asked for too little at {semis}");
+        }
+        assert!((PitchRing::factor(67.0) - 2f32.powf(67.0 / 12.0)).abs() < 1e-3, "G9 is not clamped");
+        assert_eq!(PitchRing::factor(200.0), MAX_PITCH);
     }
     use super::*;
     use crate::stretch::{Algorithm, Stretch};
