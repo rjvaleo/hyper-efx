@@ -35,7 +35,64 @@ const TWO_PI: f32 = 2.0 * PI;
 /// consistent explanation, which is the right one whenever the analysis hop is
 /// short enough — and is why hop size bounds how far a partial may drift.
 fn wrap(p: f32) -> f32 {
+    // Far from nought the definition below takes hundreds of steps (a turn
+    // at a time from as much as `hop * pi`), twice a bin, every frame: it
+    // was most of what the vocoder did. `turns_off` lands where those steps
+    // land, to the bit, in a step or two per power of two.
+    let p = if p >= 16.0 {
+        turns_off(p)
+    } else if p <= -16.0 {
+        // Rounding is the same either side of nought.
+        -turns_off(-p)
+    } else {
+        p
+    };
     wrap_by_steps(p)
+}
+
+/// `TWO_PI`'s 24 significant bits: `TWO_PI` is this many 2^-21sts.
+const TURN_BITS: u32 = 0x00C9_0FDB;
+
+/// What is left of `p` (16 or more) once whole turns have been taken off it
+/// one by one until it is under 16: the same number, bit for bit, that
+/// `p -= TWO_PI` repeated gives.
+///
+/// Between two powers of two every `f32` is a whole number of one step `g`,
+/// and so is `p - TWO_PI` once rounded: taking a turn off moves `p` down a
+/// fixed whole number of steps (`TWO_PI / g` rounded to the nearest, and it
+/// is never exactly half way, `TURN_BITS` being odd). So a run of
+/// subtractions that stays between the same two powers of two is one
+/// subtraction of whole numbers. The subtraction that crosses down to the
+/// next power of two rounds on a finer step, so that one is done as written.
+fn turns_off(mut p: f32) -> f32 {
+    while p >= 16.0 {
+        let bits = p.to_bits();
+        let exponent = (bits >> 23) as i32 - 127;
+        if exponent >= 26 {
+            // A turn is less than half a step here: taking one off changes
+            // nothing, and the definition would never end. No phase is ever
+            // this size; anything in range will do.
+            return p % TWO_PI;
+        }
+        // TWO_PI in steps of this `p`: a whole part and a remainder.
+        let shift = (exponent - 2) as u32;
+        let whole = TURN_BITS >> shift;
+        let rest = TURN_BITS & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let per_turn = if rest > half { whole + 1 } else { whole };
+        // Steps above the power of two below `p`. A turn may only be taken
+        // off this way while the answer stays at least one step above it:
+        // any closer, and the true difference is under the power of two,
+        // where the rounding is finer.
+        let above = bits & 0x007f_ffff;
+        let turns = if rest != half && per_turn > 0 && above > 0 { (above - 1) / per_turn } else { 0 };
+        if turns > 0 {
+            p = f32::from_bits(bits - turns * per_turn);
+        } else {
+            p -= TWO_PI;
+        }
+    }
+    p
 }
 
 /// The definition: take a turn off, or put one on, until it fits. Every
