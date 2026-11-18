@@ -283,6 +283,7 @@ impl Place {
     /// Clear the room's memory, keeping the settings.
     pub fn reset(&mut self) {
         self.buf.fill(0.0);
+        self.w = 0;
         self.air = 0.0;
         self.shelf_lp = 0.0;
         self.wall = [0.0; 2];
@@ -337,7 +338,10 @@ impl Place {
             self.wall[1] += (wr - self.wall[1]) * self.wall_k;
             *l = dl + self.wall[0];
             *r = dr + self.wall[1];
-            self.w = self.w.wrapping_add(1);
+            // Kept inside the buffer. The tap positions are worked out from it as
+            // a 32-bit float, and a counter left to run lost them: a sixteenth of
+            // a sample out after 21 s at 48 kHz, whole samples after six minutes.
+            self.w = (self.w + 1) & self.mask;
         }
     }
 

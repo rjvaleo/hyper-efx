@@ -119,3 +119,52 @@ fn moving_the_sound_does_not_click() {
     assert!(worst < 0.05, "step of {worst}");
     assert!(out.iter().all(|x| x.is_finite()));
 }
+
+/// What the room gives back for one click, after `before` frames of silence.
+fn click_after(frames: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut p = Place::new(SR);
+    p.set(PlaceSettings::default());
+    let (mut l, mut r) = (vec![0.0f32; 4096], vec![0.0f32; 4096]);
+    let mut left = frames;
+    while left > 0 {
+        let n = left.min(4096);
+        l[..n].fill(0.0);
+        r[..n].fill(0.0);
+        p.before(&mut l[..n], &mut r[..n]);
+        left -= n;
+    }
+    let (mut l, mut r) = (vec![0.0f32; 24_000], vec![0.0f32; 24_000]);
+    l[0] = 1.0;
+    r[0] = 1.0;
+    p.before(&mut l, &mut r);
+    (l, r)
+}
+
+#[test]
+fn the_room_answers_the_same_after_ten_minutes_as_at_the_start() {
+    // The write counter ran on for ever and the taps were placed from it as a
+    // 32-bit float: after six minutes they sat on whole even samples.
+    let (l0, r0) = click_after(0);
+    let (l1, r1) = click_after(10 * 60 * SR as usize);
+    let peak = l0.iter().chain(&r0).fold(0.0f32, |m, x| m.max(x.abs()));
+    let worst = l0.iter().zip(&l1).chain(r0.iter().zip(&r1)).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(peak > 0.05, "the room gave nothing back ({peak})");
+    assert!(worst < peak * 0.02, "the answer moved by {worst} against a peak of {peak}");
+}
+
+#[test]
+fn a_reset_room_is_a_new_room_to_the_last_bit() {
+    let mut p = Place::new(SR);
+    p.set(PlaceSettings::default());
+    let (mut l, mut r) = (noise(30_011, 3), noise(30_011, 4));
+    p.before(&mut l, &mut r);
+    p.reset();
+    let (mut l1, mut r1) = (noise(5000, 5), noise(5000, 6));
+    p.before(&mut l1, &mut r1);
+    let mut fresh = Place::new(SR);
+    fresh.set(PlaceSettings::default());
+    let (mut l2, mut r2) = (noise(5000, 5), noise(5000, 6));
+    fresh.before(&mut l2, &mut r2);
+    assert_eq!(l1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), l2.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+    assert_eq!(r1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), r2.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+}

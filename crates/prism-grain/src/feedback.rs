@@ -184,7 +184,9 @@ impl Feedback {
 
                 let x = buf[f * channels + ch];
                 let into = if hold { ret } else { x + amount * ret };
-                self.ring[self.write * LOOP_CHANNELS + ch] = into.clamp(-LOOP_LIMIT, LOOP_LIMIT);
+                // A sample that is not a number is kept out of the loop: `clamp`
+                // passes one through, and it would go round for good.
+                self.ring[self.write * LOOP_CHANNELS + ch] = if into.is_finite() { into.clamp(-LOOP_LIMIT, LOOP_LIMIT) } else { 0.0 };
                 buf[f * channels + ch] = x + amount * ret;
             }
             for a in &mut self.diff_at {
@@ -313,5 +315,20 @@ mod tests {
         let mut buf = vec![1.0; 96_000 * 2];
         Feedback::new().process(&mut buf, 2, &p, SR);
         assert!(buf.iter().all(|v| v.is_finite() && v.abs() <= 1.0 + 0.95 * LOOP_LIMIT));
+    }
+
+    #[test]
+    fn one_bad_sample_does_not_go_round_for_good() {
+        let p = g(|g| { g.fb_amount = 0.9; g.fb_time_ms = 20.0; g.fb_smear = 0.5; });
+        let mut fb = Feedback::new();
+        let mut buf = vec![0.25; 4800 * 2];
+        buf[100] = f32::NAN;
+        buf[201] = f32::INFINITY;
+        fb.process(&mut buf, 2, &p, SR);
+        // The bad samples themselves pass through (the engine's last stage
+        // deals with those); nothing after them is touched by them.
+        let mut later = vec![0.25; 48_000 * 2];
+        fb.process(&mut later, 2, &p, SR);
+        assert!(later.iter().all(|v| v.is_finite()), "the loop kept a sample that is not a number");
     }
 }
