@@ -330,6 +330,20 @@ impl Stretcher {
         }
     }
 
+    /// [`Self::adopt_map`], handing back the map it replaces. The engines let
+    /// go of the old map first, so the caller ends up its last holder here
+    /// and can pass it somewhere it is safe to free: dropped on the audio
+    /// thread, the last hold on a map is a free there. Voices sharing the
+    /// map must take the new one before the caller lets the old one go.
+    pub fn replace_map(
+        &mut self,
+        map: Option<Arc<crate::transient::TimeMap>>,
+    ) -> Option<Arc<crate::transient::TimeMap>> {
+        let old = self.map.take();
+        self.adopt_map(map);
+        old
+    }
+
     /// The transient map in force.
     pub fn map(&self) -> Option<&Arc<crate::transient::TimeMap>> {
         self.map.as_ref()
@@ -362,11 +376,20 @@ impl Stretcher {
         }
     }
 
-    /// Adopt a bank of extra layers. Built off the audio thread.
+    /// Adopt a bank of extra layers. Built off the audio thread. The bank it
+    /// replaces is freed here: on the audio thread, use
+    /// [`Self::replace_bank`].
     pub fn set_bank(&mut self, bank: LayerBank) {
-        self.bank = Some(bank);
+        drop(self.replace_bank(bank));
+    }
+
+    /// [`Self::set_bank`], handing back the bank it replaces, for the caller
+    /// to free somewhere it is safe to: a bank is megabytes.
+    pub fn replace_bank(&mut self, bank: LayerBank) -> Option<LayerBank> {
+        let old = self.bank.replace(bank);
         // A fresh bank knows nothing about where the transport is.
         self.layer_at.iter_mut().for_each(|v| *v = u64::MAX);
+        old
     }
 
     /// What the callback can actually layer right now, which is not always what
