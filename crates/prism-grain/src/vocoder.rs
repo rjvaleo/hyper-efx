@@ -34,7 +34,15 @@ const TWO_PI: f32 = 2.0 * PI;
 /// where it ended up. Wrapping is what turns the ambiguity into the *smallest*
 /// consistent explanation, which is the right one whenever the analysis hop is
 /// short enough — and is why hop size bounds how far a partial may drift.
-fn wrap(mut p: f32) -> f32 {
+fn wrap(p: f32) -> f32 {
+    wrap_by_steps(p)
+}
+
+/// The definition: take a turn off, or put one on, until it fits. Every
+/// subtraction rounds, so the answer is this exact sequence of roundings and
+/// no closed form: `p - TWO_PI * (p / TWO_PI).round()` differs in the last
+/// bits, and those bits are in every recorded render.
+fn wrap_by_steps(mut p: f32) -> f32 {
     while p >= PI {
         p -= TWO_PI;
     }
@@ -42,6 +50,63 @@ fn wrap(mut p: f32) -> f32 {
         p += TWO_PI;
     }
     p
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    fn check(p: f32) {
+        let want = wrap_by_steps(p);
+        let got = wrap(p);
+        assert!(want.to_bits() == got.to_bits(), "wrap({p:?} = {:#010x}): {got:?}, by steps {want:?}", p.to_bits());
+    }
+
+    /// The wrap, against the definition, to the last bit: a sweep of every
+    /// 251st number from nought to 20,000 either side, the numbers right at
+    /// every power of two and every whole turn, and a scatter of others. A
+    /// phase vocoder with a hop of 4,096 never asks for more than 13,000.
+    #[test]
+    fn the_wrap_is_the_step_by_step_wrap_to_the_last_bit() {
+        let top = 20_000.0f32.to_bits();
+        let mut bits = 0u32;
+        while bits <= top {
+            check(f32::from_bits(bits));
+            check(-f32::from_bits(bits));
+            bits += 251;
+        }
+        for e in 0..15 {
+            let edge = (1u32 << e) as f32;
+            for near in -40i32..=40 {
+                let p = f32::from_bits((edge.to_bits() as i32 + near) as u32);
+                check(p);
+                check(-p);
+            }
+        }
+        for turns in 1..3_000 {
+            let centre = TWO_PI * turns as f32;
+            for near in -3i32..=3 {
+                let p = f32::from_bits((centre.to_bits() as i32 + near) as u32);
+                check(p);
+                check(-p);
+                check(p + PI);
+                check(-p - PI);
+            }
+        }
+        let mut seed = 1u32;
+        for _ in 0..400_000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let p = ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 26_000.0;
+            check(p);
+        }
+    }
+
+    #[test]
+    fn what_is_not_a_number_comes_back_as_it_was() {
+        assert!(wrap(f32::NAN).is_nan());
+        assert_eq!(wrap(0.0), 0.0);
+        assert_eq!(wrap(-0.0).to_bits(), (-0.0f32).to_bits());
+    }
 }
 
 
