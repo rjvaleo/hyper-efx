@@ -63,6 +63,11 @@ pub trait Streamer: Send {
     /// Move to an output frame. Anything in flight belongs to where we were.
     fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams);
 
+    /// The source is `factor` times shorter than the one any transient map
+    /// was built on (a copy an octave or more up, `octave.rs`): read the map
+    /// that much further along, and divide what it says by as much.
+    fn set_octave(&mut self, _factor: f64) {}
+
     /// Output frames produced so far.
     fn position(&self) -> u64;
 }
@@ -116,6 +121,9 @@ pub struct WsolaStream {
     /// How far along the map a frame of this stream's timeline is. One, except
     /// on a voice with its own pitch: see `Stretcher::set_map_pitch`.
     map_scale: f64,
+    /// How many times shorter the source is than the one the map was built
+    /// on: one, except above C8 (`octave.rs`).
+    map_octave: f64,
     /// Keeps the read continuous when the ratio moves. See `anchor.rs`.
     anchor: crate::anchor::Anchor,
     /// Dropped because the ring could not hold the window. Surfaced rather than
@@ -151,6 +159,7 @@ impl WsolaStream {
             first: true,
             map: None,
             map_scale: 1.0,
+            map_octave: 1.0,
             anchor: crate::anchor::Anchor::default(),
             overflows: 0,
         }
@@ -188,12 +197,15 @@ impl WsolaStream {
         let reach = in_frames as f64 / (scan.abs().clamp(1e-3, 1.0) as f64);
         match &self.map {
             Some(m) => {
-                let along = out_frame * self.map_scale;
+                let o = self.map_octave;
+                let along = out_frame * self.map_scale * o;
                 let last = m.out_end();
                 if along > last && scan.abs() < 1.0 {
-                    (m.input_at(last) + (along - last) / ratio.max(1e-6) as f64).clamp(0.0, reach) as f32
-                } else {
+                    ((m.input_at(last) + (along - last) / ratio.max(1e-6) as f64) / o).clamp(0.0, reach) as f32
+                } else if o == 1.0 {
                     m.input_at(along) as f32
+                } else {
+                    (m.input_at(along) / o) as f32
                 }
             }
             None => self.anchor.source(out_frame, ratio).clamp(0.0, reach) as f32,
@@ -246,6 +258,10 @@ impl WsolaStream {
 impl Streamer for WsolaStream {
     fn position(&self) -> u64 {
         self.emitted
+    }
+
+    fn set_octave(&mut self, factor: f64) {
+        self.map_octave = factor;
     }
 
     fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams) {
@@ -523,7 +539,21 @@ pub struct PitchRing {
     origin: u64,
     /// How much the engine is asked for at a time.
     chunk: usize,
+    /// How many octaves up the source the engine is reading (`octave.rs`).
+    /// Nought at C8 and below, always.
+    level: u32,
+    /// A note wanted a copy of the source further up than there was: whoever
+    /// owns the copies should make them.
+    wants: bool,
+    /// The last frame handed out, and the step to smooth away at the start of
+    /// the next read after a change of level.
+    last: Vec<f32>,
+    join: Vec<f32>,
+    joining: u32,
 }
+
+/// Frames over which the step at a change of level is smoothed away.
+const JOIN_FRAMES: u32 = 256;
 
 /// How long the read rate takes to reach a new pitch, in frames.
 ///
@@ -558,6 +588,11 @@ impl PitchRing {
             engaged: false,
             origin: 0,
             chunk,
+            level: 0,
+            wants: false,
+            last: vec![0.0; channels],
+            join: vec![0.0; channels],
+            joining: 0,
         }
     }
 
@@ -652,6 +687,107 @@ impl PitchRing {
             self.read(&mut out[at * ch..(at + n) * ch], ch, pitch);
             at += n;
         }
+        self.smooth(out, ch);
+    }
+
+    /// After a change of level the first frame of the new read is not where
+    /// the last one of the old read was. Take that step out, fading the
+    /// correction away, and remember where this block ended.
+    fn smooth(&mut self, out: &mut [f32], ch: usize) {
+        let frames = out.len() / ch;
+        if frames == 0 {
+            return;
+        }
+        let chans = ch.min(self.last.len());
+        if self.joining == JOIN_FRAMES {
+            for c in 0..chans {
+                self.join[c] = self.last[c] - out[c];
+            }
+        }
+        let mut f = 0;
+        while self.joining > 0 && f < frames {
+            let g = self.joining as f32 / JOIN_FRAMES as f32;
+            for c in 0..chans {
+                out[f * ch + c] += self.join[c] * g;
+            }
+            self.joining -= 1;
+            f += 1;
+        }
+        for c in 0..chans {
+            self.last[c] = out[(frames - 1) * ch + c];
+        }
+    }
+
+    /// How many octaves up the source the engine is reading.
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// Whether a note has asked for a copy of the source that was not there,
+    /// since this was last asked. The owner builds them off the audio thread.
+    pub fn take_wants(&mut self) -> bool {
+        std::mem::take(&mut self.wants)
+    }
+
+    /// The level a seek at `pitch` starts on, given the copies there are
+    /// (`have` levels of them).
+    pub fn start_level(&mut self, pitch: f32, have: u32) -> u32 {
+        let want = crate::octave::level_for(pitch);
+        if want > have {
+            self.wants = true;
+        }
+        want.min(have)
+    }
+
+    /// Whether the level should change now, mid-note, and to what. Copies that
+    /// have gone (a new sound) send it back to nought.
+    pub fn next_level(&mut self, pitch: f32, have: u32) -> Option<u32> {
+        let mut want = crate::octave::level_while(pitch, self.level);
+        if want > have {
+            self.wants = true;
+            want = if self.level <= have { self.level } else { have };
+        }
+        (want != self.level).then_some(want)
+    }
+
+    /// The rate the ring reads at for `pitch`, on the level it is on.
+    pub fn rate(&self, pitch: f32) -> f32 {
+        pitch / crate::octave::factor(self.level) as f32
+    }
+
+    /// Seek on `level`. Returns the frame of the engine's timeline to seek it
+    /// to, on that level.
+    pub fn seek_level(&mut self, out_frame: u64, pitch: f32, level: u32) -> u64 {
+        self.level = level;
+        self.joining = 0;
+        self.seek(out_frame, pitch / crate::octave::factor(level) as f32)
+    }
+
+    /// Move to `level` where the read is now, mid-note. The engine underneath
+    /// is re-seeked to the answer; the step that leaves in the waveform is
+    /// smoothed away over the next few milliseconds.
+    pub fn change_level(&mut self, pitch: f32, level: u32) -> u64 {
+        let here = self.position();
+        let at = self.seek_level(here, pitch, level);
+        self.joining = JOIN_FRAMES;
+        at
+    }
+
+    /// The engine at `pitch` on `level`: stretched as far as the ratio and the
+    /// pitch together ask, at the sample rate of the copy it is reading.
+    pub fn inner_params_at(p: &StretchParams, pitch: f32, level: u32) -> StretchParams {
+        let mut inner = Self::inner_params(p, pitch);
+        if level > 0 {
+            let d = crate::octave::factor(level);
+            inner.sample_rate = (p.sample_rate / d).max(1);
+            // WSOLA's search steps in frames, and a frame of the copy is `d`
+            // frames of the sound: the same step in time is `d` times fewer
+            // frames. Left at four, a splice two octaves up could only land
+            // within sixteen frames of the best join, the joins wandered out
+            // of phase hop after hop, and a held tone cancelled itself out.
+            inner.wsola.stride = (p.wsola.stride / d).max(1);
+        }
+        inner
     }
 
     /// The ratio the engine underneath must be driven at.
@@ -843,6 +979,20 @@ impl<S: Streamer> Pitched<S> {
         p: &StretchParams,
         semitones: f32,
     ) {
+        self.render_octaves(out, channels, input, None, p, semitones);
+    }
+
+    /// The same, reading a copy of `input` an octave or more up when the note
+    /// is above C8 and `octaves` has one (`octave.rs`).
+    pub fn render_octaves(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        input: &[f32],
+        octaves: Option<&crate::octave::Octaves>,
+        p: &StretchParams,
+        semitones: f32,
+    ) {
         let pitch = PitchRing::factor(semitones);
         if self.ring.bypassed(pitch) {
             // Nothing to resample; the engine is already producing at the right
@@ -852,21 +1002,56 @@ impl<S: Streamer> Pitched<S> {
             self.ring.advance_unpitched(frames);
             return;
         }
-        let inner = PitchRing::inner_params(p, pitch);
+        let oct = octaves.filter(|o| o.is_for(input));
+        let have = oct.map_or(0, |o| o.levels.len() as u32);
+        if let Some(level) = self.ring.next_level(pitch, have) {
+            let frames = crate::octave::frames_at(input.len() / channels.max(1), level);
+            let at = self.ring.change_level(pitch, level);
+            self.inner.set_octave(crate::octave::factor(level) as f64);
+            self.inner.seek(at, frames, &PitchRing::inner_params_at(p, pitch, level));
+        }
+        let level = self.ring.level();
+        let src = match oct {
+            Some(o) => o.source(input, level),
+            None => input,
+        };
+        let inner = PitchRing::inner_params_at(p, pitch, level);
+        let rate = self.ring.rate(pitch);
         let engine = &mut self.inner;
-        self.ring.pull(out, channels, pitch, &mut self.scratch, |buf| engine.render(buf, channels, input, &inner));
+        self.ring.pull(out, channels, rate, &mut self.scratch, |buf| engine.render(buf, channels, src, &inner));
     }
 
     pub fn position(&self) -> u64 {
         self.ring.position()
     }
 
+    /// Whether a note has asked for copies of the source that were not there.
+    pub fn take_wants(&mut self) -> bool {
+        self.ring.take_wants()
+    }
+
     /// Move to an output frame. The engine underneath is seeked to the matching
     /// place on the *stretched* timeline, which runs `pitch` times faster.
     pub fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams, semitones: f32) {
+        self.seek_octaves(out_frame, input_frames, None, p, semitones);
+    }
+
+    /// The same, starting on a copy of the source an octave or more up when
+    /// the note is above C8 and `octaves` has one.
+    pub fn seek_octaves(
+        &mut self,
+        out_frame: u64,
+        input_frames: usize,
+        octaves: Option<&crate::octave::Octaves>,
+        p: &StretchParams,
+        semitones: f32,
+    ) {
         let pitch = PitchRing::factor(semitones);
-        let at = self.ring.seek(out_frame, pitch);
-        self.inner.seek(at, input_frames, &PitchRing::inner_params(p, pitch));
+        let have = octaves.filter(|o| o.is_length(input_frames)).map_or(0, |o| o.levels.len() as u32);
+        let level = self.ring.start_level(pitch, have);
+        let at = self.ring.seek_level(out_frame, pitch, level);
+        self.inner.set_octave(crate::octave::factor(level) as f64);
+        self.inner.seek(at, crate::octave::frames_at(input_frames, level), &PitchRing::inner_params_at(p, pitch, level));
     }
 }
 

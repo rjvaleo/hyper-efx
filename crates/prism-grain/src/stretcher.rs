@@ -117,6 +117,13 @@ pub struct Stretcher {
     /// The source, split three ways. Handed over from off the audio thread; an
     /// empty one simply means the hybrid has nothing to play yet.
     parts: std::sync::Arc<Parts>,
+    /// The source and its parts an octave or more up, for notes above C8
+    /// (`octave.rs`). Handed over from off the audio thread when a note asks;
+    /// until then a high note costs what it always did.
+    octaves: Option<Arc<crate::octave::Octaves>>,
+    /// The source last rendered from, so a seek, which is not handed it, can
+    /// tell whether the copies are of it.
+    src_id: (usize, usize),
     /// What was running last block, so a change can be noticed and acted on.
     current: Algorithm,
     /// The engine being faded out of, and how many frames of the fade are left.
@@ -245,6 +252,8 @@ impl Stretcher {
             hybrid: Some(PitchedHybrid::new(max_block, channels, sample_rate)),
             soundhack: Some(Pitched::new(SoundHackStream::new(max_block, channels), max_block, channels)),
             parts: std::sync::Arc::new(Parts::default()),
+            octaves: None,
+            src_id: (0, 0),
             current: Algorithm::Granular,
             fading: None,
             layer_cap: crate::render::MAX_LAYERS as u32,
@@ -289,6 +298,8 @@ impl Stretcher {
             soundhack: is(Algorithm::SoundHack)
                 .then(|| Pitched::new(SoundHackStream::new(max_block, channels), max_block, channels)),
             parts: Arc::new(Parts::default()),
+            octaves: None,
+            src_id: (0, 0),
             current: algorithm,
             fading: None,
             layer_cap: crate::render::MAX_LAYERS as u32,
@@ -424,6 +435,55 @@ impl Stretcher {
         self.parts = parts;
     }
 
+    /// Adopt copies of the source an octave or more up (`octave.rs`). Built
+    /// off the audio thread. Answers the ones they replace, so the caller can
+    /// make sure they are not freed here.
+    pub fn set_octaves(&mut self, octaves: Option<Arc<crate::octave::Octaves>>) -> Option<Arc<crate::octave::Octaves>> {
+        std::mem::replace(&mut self.octaves, octaves)
+    }
+
+    pub fn octaves(&self) -> Option<&Arc<crate::octave::Octaves>> {
+        self.octaves.as_ref()
+    }
+
+    /// Whether a note above C8 has asked, since this was last asked, for
+    /// copies of the source that are not here. Whoever owns the sound makes
+    /// them, off the audio thread, and hands them over with `set_octaves`.
+    pub fn take_wants_octaves(&mut self) -> bool {
+        let mut w = false;
+        if let Some(e) = self.wsola.as_mut() {
+            w |= e.take_wants();
+        }
+        if let Some(e) = self.vocoder.as_mut() {
+            w |= e.take_wants();
+        }
+        if let Some(e) = self.pvsola.as_mut() {
+            w |= e.take_wants();
+        }
+        if let Some(e) = self.hybrid.as_mut() {
+            w |= e.take_wants();
+        }
+        if let Some(e) = self.soundhack.as_mut() {
+            w |= e.take_wants();
+        }
+        if let Some(b) = self.bank.as_mut() {
+            b.wsola.iter_mut().for_each(|e| w |= e.take_wants());
+            b.vocoder.iter_mut().for_each(|e| w |= e.take_wants());
+            b.pvsola.iter_mut().for_each(|e| w |= e.take_wants());
+            b.hybrid.iter_mut().for_each(|e| w |= e.take_wants());
+        }
+        w
+    }
+
+    /// The copies, if they are of a source `frames` long and of the one last
+    /// played (for a seek, which is not handed the source).
+    fn octaves_for_seek(&self, frames: usize) -> Option<Arc<crate::octave::Octaves>> {
+        self.octaves
+            .as_ref()
+            .filter(|o| o.is_length(frames) && (self.src_id == (0, 0) || o.source_id() == self.src_id))
+            .cloned()
+    }
+
     /// The Hybrid is the engine and there is nothing separated for it yet, so
     /// the grain renderer is playing in its place.
     fn standing_in(&self) -> bool {
@@ -493,31 +553,34 @@ impl Stretcher {
     }
 
     fn seek_one(&mut self, alg: Algorithm, out_frame: u64, sp: &StreamParams) {
+        let held = self.octaves_for_seek(sp.in_frames);
+        let oct = held.as_deref();
         match alg {
             Algorithm::Wsola => {
                 if let Some(e) = self.wsola.as_mut() {
-                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones);
+                    e.seek_octaves(out_frame, sp.in_frames, oct, &stretch_params(sp), sp.semitones);
                 }
             }
             Algorithm::Vocoder => {
                 if let Some(e) = self.vocoder.as_mut() {
-                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones);
+                    e.seek_octaves(out_frame, sp.in_frames, oct, &stretch_params(sp), sp.semitones);
                 }
             }
             Algorithm::Pvsola => {
                 if let Some(e) = self.pvsola.as_mut() {
-                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), &sp.pvsola, sp.semitones);
+                    e.seek_octaves(out_frame, sp.in_frames, oct, &stretch_params(sp), &sp.pvsola, sp.semitones);
                 }
             }
             Algorithm::Hybrid => {
                 let parts = std::sync::Arc::clone(&self.parts);
+                let oct = self.octaves.clone();
                 if let Some(e) = self.hybrid.as_mut() {
-                    e.seek(out_frame, &parts, &stretch_params(sp), sp.hybrid, sp.semitones);
+                    e.seek_octaves(out_frame, &parts, oct.as_deref(), &stretch_params(sp), sp.hybrid, sp.semitones);
                 }
             }
             Algorithm::SoundHack => {
                 if let Some(e) = self.soundhack.as_mut() {
-                    e.seek(out_frame, sp.in_frames, &stretch_params(sp), sp.semitones);
+                    e.seek_octaves(out_frame, sp.in_frames, oct, &stretch_params(sp), sp.semitones);
                 }
             }
             _ => self.grain.seek(out_frame, sp),
@@ -551,6 +614,7 @@ impl Stretcher {
         events: &mut [GrainEvent],
         add: Option<&[f32]>,
     ) -> usize {
+        self.src_id = (src.samples.as_ptr() as usize, src.samples.len());
         let want = resolve(sp.algorithm);
         if want != self.current {
             // The engine being switched to may be anywhere, or nowhere. Put it
@@ -810,27 +874,30 @@ impl Stretcher {
     }
 
     fn seek_layer(&mut self, i: usize, at: u64, lp: &StreamParams) {
+        let held = self.octaves_for_seek(lp.in_frames);
+        let oct = held.as_deref();
+        let all = self.octaves.clone();
+        let parts = std::sync::Arc::clone(&self.parts);
         let Some(bank) = self.bank.as_mut() else { return };
         match bank.algorithm {
             Algorithm::Wsola => {
                 if let Some(e) = bank.wsola.get_mut(i) {
-                    e.seek(at, lp.in_frames, &stretch_params(lp), lp.semitones);
+                    e.seek_octaves(at, lp.in_frames, oct, &stretch_params(lp), lp.semitones);
                 }
             }
             Algorithm::Vocoder => {
                 if let Some(e) = bank.vocoder.get_mut(i) {
-                    e.seek(at, lp.in_frames, &stretch_params(lp), lp.semitones);
+                    e.seek_octaves(at, lp.in_frames, oct, &stretch_params(lp), lp.semitones);
                 }
             }
             Algorithm::Pvsola => {
                 if let Some(e) = bank.pvsola.get_mut(i) {
-                    e.seek(at, lp.in_frames, &stretch_params(lp), &lp.pvsola, lp.semitones);
+                    e.seek_octaves(at, lp.in_frames, oct, &stretch_params(lp), &lp.pvsola, lp.semitones);
                 }
             }
             Algorithm::Hybrid => {
-                let parts = std::sync::Arc::clone(&self.parts);
                 if let Some(e) = bank.hybrid.get_mut(i) {
-                    e.seek(at, &parts, &stretch_params(lp), lp.hybrid, lp.semitones);
+                    e.seek_octaves(at, &parts, all.as_deref(), &stretch_params(lp), lp.hybrid, lp.semitones);
                 }
             }
             Algorithm::Granular | Algorithm::SoundHack => {}
@@ -846,6 +913,8 @@ impl Stretcher {
         lp: &StreamParams,
     ) {
         let parts = std::sync::Arc::clone(&self.parts);
+        let held = self.octaves.clone();
+        let oct = held.as_deref();
         let Some(bank) = self.bank.as_mut() else {
             out.fill(0.0);
             return;
@@ -853,20 +922,21 @@ impl Stretcher {
         match bank.algorithm {
             Algorithm::Wsola => {
                 if let Some(e) = bank.wsola.get_mut(i) {
-                    e.render_pitched(out, channels, &src.samples, &stretch_params(lp), lp.semitones);
+                    e.render_octaves(out, channels, &src.samples, oct, &stretch_params(lp), lp.semitones);
                 }
             }
             Algorithm::Vocoder => {
                 if let Some(e) = bank.vocoder.get_mut(i) {
-                    e.render_pitched(out, channels, &src.samples, &stretch_params(lp), lp.semitones);
+                    e.render_octaves(out, channels, &src.samples, oct, &stretch_params(lp), lp.semitones);
                 }
             }
             Algorithm::Pvsola => {
                 if let Some(e) = bank.pvsola.get_mut(i) {
-                    e.render_pitched(
+                    e.render_octaves(
                         out,
                         channels,
                         &src.samples,
+                        oct,
                         &stretch_params(lp),
                         &lp.pvsola,
                         lp.semitones,
@@ -875,10 +945,11 @@ impl Stretcher {
             }
             Algorithm::Hybrid => {
                 if let Some(e) = bank.hybrid.get_mut(i) {
-                    e.render_pitched(
+                    e.render_octaves(
                         out,
                         channels,
                         &parts,
+                        oct,
                         &stretch_params(lp),
                         lp.hybrid,
                         lp.semitones,
@@ -898,22 +969,24 @@ impl Stretcher {
         sp: &StreamParams,
         events: &mut [GrainEvent],
     ) -> usize {
+        let held = self.octaves.clone();
+        let oct = held.as_deref();
         match alg {
             Algorithm::Wsola => {
                 if let Some(e) = self.wsola.as_mut() {
-                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), sp.semitones);
+                    e.render_octaves(out, channels, &src.samples, oct, &stretch_params(sp), sp.semitones);
                 }
                 0
             }
             Algorithm::Vocoder => {
                 if let Some(e) = self.vocoder.as_mut() {
-                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), sp.semitones);
+                    e.render_octaves(out, channels, &src.samples, oct, &stretch_params(sp), sp.semitones);
                 }
                 0
             }
             Algorithm::Pvsola => {
                 if let Some(e) = self.pvsola.as_mut() {
-                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), &sp.pvsola, sp.semitones);
+                    e.render_octaves(out, channels, &src.samples, oct, &stretch_params(sp), &sp.pvsola, sp.semitones);
                 }
                 0
             }
@@ -933,13 +1006,13 @@ impl Stretcher {
                 }
                 let parts = std::sync::Arc::clone(&self.parts);
                 if let Some(e) = self.hybrid.as_mut() {
-                    e.render_pitched(out, channels, &parts, &stretch_params(sp), sp.hybrid, sp.semitones);
+                    e.render_octaves(out, channels, &parts, oct, &stretch_params(sp), sp.hybrid, sp.semitones);
                 }
                 0
             }
             Algorithm::SoundHack => {
                 if let Some(e) = self.soundhack.as_mut() {
-                    e.render_pitched(out, channels, &src.samples, &stretch_params(sp), sp.semitones);
+                    e.render_octaves(out, channels, &src.samples, oct, &stretch_params(sp), sp.semitones);
                 }
                 0
             }

@@ -128,6 +128,11 @@ impl HybridStream {
         self.percussive.set_map_scale(scale);
     }
 
+    /// The parts are a copy this many times shorter (`octave.rs`).
+    pub fn set_octave(&mut self, factor: f64) {
+        crate::stream::Streamer::set_octave(&mut self.percussive, factor);
+    }
+
     pub fn seek(&mut self, out_frame: u64, parts: &Parts, p: &StretchParams, h: HybridParams) {
         self.emitted = out_frame;
         let frames = parts.frames();
@@ -426,6 +431,21 @@ impl PitchedHybrid {
         h: HybridParams,
         semitones: f32,
     ) {
+        self.render_octaves(out, channels, parts, None, p, h, semitones);
+    }
+
+    /// The same, on the parts an octave or more up above C8 (`octave.rs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_octaves(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        parts: &Parts,
+        octaves: Option<&crate::octave::Octaves>,
+        p: &StretchParams,
+        h: HybridParams,
+        semitones: f32,
+    ) {
         let pitch = PitchRing::factor(semitones);
         if self.ring.bypassed(pitch) {
             let frames = out.len() / channels.max(1);
@@ -433,9 +453,24 @@ impl PitchedHybrid {
             self.ring.advance_unpitched(frames);
             return;
         }
-        let inner = PitchRing::inner_params(p, pitch);
+        let oct = octaves.filter(|o| o.is_for_parts(parts));
+        let have = oct.map_or(0, |o| o.parts.len() as u32);
+        if let Some(level) = self.ring.next_level(pitch, have) {
+            let at = self.ring.change_level(pitch, level);
+            let src = oct.map_or(parts, |o| o.parts_at(parts, level));
+            self.inner.set_octave(crate::octave::factor(level) as f64);
+            self.inner.seek(at, src, &PitchRing::inner_params_at(p, pitch, level), h);
+        }
+        let level = self.ring.level();
+        let src = oct.map_or(parts, |o| o.parts_at(parts, level));
+        let inner = PitchRing::inner_params_at(p, pitch, level);
+        let rate = self.ring.rate(pitch);
         let engine = &mut self.inner;
-        self.ring.pull(out, channels, pitch, &mut self.scratch, |buf| engine.render(buf, channels, parts, &inner, h));
+        self.ring.pull(out, channels, rate, &mut self.scratch, |buf| engine.render(buf, channels, src, &inner, h));
+    }
+
+    pub fn take_wants(&mut self) -> bool {
+        self.ring.take_wants()
     }
 
     pub fn seek(
@@ -446,9 +481,25 @@ impl PitchedHybrid {
         h: HybridParams,
         semitones: f32,
     ) {
+        self.seek_octaves(out_frame, parts, None, p, h, semitones);
+    }
+
+    pub fn seek_octaves(
+        &mut self,
+        out_frame: u64,
+        parts: &Parts,
+        octaves: Option<&crate::octave::Octaves>,
+        p: &StretchParams,
+        h: HybridParams,
+        semitones: f32,
+    ) {
         let pitch = PitchRing::factor(semitones);
-        let at = self.ring.seek(out_frame, pitch);
-        self.inner
-            .seek(at, parts, &PitchRing::inner_params(p, pitch), h);
+        let oct = octaves.filter(|o| o.is_for_parts(parts));
+        let have = oct.map_or(0, |o| o.parts.len() as u32);
+        let level = self.ring.start_level(pitch, have);
+        let at = self.ring.seek_level(out_frame, pitch, level);
+        let src = oct.map_or(parts, |o| o.parts_at(parts, level));
+        self.inner.set_octave(crate::octave::factor(level) as f64);
+        self.inner.seek(at, src, &PitchRing::inner_params_at(p, pitch, level), h);
     }
 }

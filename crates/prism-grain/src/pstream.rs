@@ -31,6 +31,10 @@ const MAX_SPAN: usize = 64 * (8192 / 4);
 const MAX_LEAD: usize = 8192 + 9600 + 8192;
 
 pub struct PvsolaStream {
+    /// Frames between the places the splice search tries: four, or fewer on
+    /// a copy of the sound an octave or more up, whose frames are longer
+    /// (`octave.rs`), so the search keeps the same step in time.
+    stride: usize,
     /// The run currently sounding, and the one being prepared. They swap at
     /// every anchor; neither is ever rebuilt.
     a: VocoderStream,
@@ -89,6 +93,7 @@ impl PvsolaStream {
         // whatever the callback has not yet collected.
         let ring = max_block.max(1) + MAX_SPAN + MAX_LEAD + 1;
         PvsolaStream {
+            stride: 4,
             a: VocoderStream::new(MAX_SPAN + MAX_LEAD, channels),
             b: VocoderStream::new(MAX_SPAN + MAX_LEAD, channels),
             piece: vec![0.0; (MAX_SPAN + MAX_LEAD) * channels],
@@ -435,9 +440,14 @@ impl PvsolaStream {
                 best_score = score;
                 best = off;
             }
-            off += 4;
+            off += self.stride;
         }
         best
+    }
+
+    /// The source is a copy `factor` times shorter (`octave.rs`).
+    pub fn set_octave(&mut self, factor: u32) {
+        self.stride = (4 / factor.max(1) as usize).max(1);
     }
 }
 
@@ -721,6 +731,22 @@ impl PitchedPvsola {
         pv: &PvsolaParams,
         semitones: f32,
     ) {
+        self.render_octaves(out, channels, input, None, p, pv, semitones);
+    }
+
+    /// The same, on a copy of the source an octave or more up above C8
+    /// (`octave.rs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_octaves(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        input: &[f32],
+        octaves: Option<&crate::octave::Octaves>,
+        p: &StretchParams,
+        pv: &PvsolaParams,
+        semitones: f32,
+    ) {
         let pitch = PitchRing::factor(semitones);
         if self.ring.bypassed(pitch) {
             // Already at the right rate; do not pay for a trip through the ring.
@@ -729,9 +755,27 @@ impl PitchedPvsola {
             self.ring.advance_unpitched(frames);
             return;
         }
-        let inner = PitchRing::inner_params(p, pitch);
+        let oct = octaves.filter(|o| o.is_for(input));
+        let have = oct.map_or(0, |o| o.levels.len() as u32);
+        if let Some(level) = self.ring.next_level(pitch, have) {
+            let frames = crate::octave::frames_at(input.len() / channels.max(1), level);
+            let at = self.ring.change_level(pitch, level);
+            self.inner.set_octave(crate::octave::factor(level));
+            self.inner.seek(at, frames, &PitchRing::inner_params_at(p, pitch, level), pv);
+        }
+        let level = self.ring.level();
+        let src = match oct {
+            Some(o) => o.source(input, level),
+            None => input,
+        };
+        let inner = PitchRing::inner_params_at(p, pitch, level);
+        let rate = self.ring.rate(pitch);
         let engine = &mut self.inner;
-        self.ring.pull(out, channels, pitch, &mut self.scratch, |buf| engine.render(buf, channels, input, &inner, pv));
+        self.ring.pull(out, channels, rate, &mut self.scratch, |buf| engine.render(buf, channels, src, &inner, pv));
+    }
+
+    pub fn take_wants(&mut self) -> bool {
+        self.ring.take_wants()
     }
 
     pub fn seek(
@@ -742,9 +786,28 @@ impl PitchedPvsola {
         pv: &PvsolaParams,
         semitones: f32,
     ) {
+        self.seek_octaves(out_frame, input_frames, None, p, pv, semitones);
+    }
+
+    pub fn seek_octaves(
+        &mut self,
+        out_frame: u64,
+        input_frames: usize,
+        octaves: Option<&crate::octave::Octaves>,
+        p: &StretchParams,
+        pv: &PvsolaParams,
+        semitones: f32,
+    ) {
         let pitch = PitchRing::factor(semitones);
-        let at = self.ring.seek(out_frame, pitch);
-        self.inner
-            .seek(at, input_frames, &PitchRing::inner_params(p, pitch), pv);
+        let have = octaves.filter(|o| o.is_length(input_frames)).map_or(0, |o| o.levels.len() as u32);
+        let level = self.ring.start_level(pitch, have);
+        let at = self.ring.seek_level(out_frame, pitch, level);
+        self.inner.set_octave(crate::octave::factor(level));
+        self.inner.seek(
+            at,
+            crate::octave::frames_at(input_frames, level),
+            &PitchRing::inner_params_at(p, pitch, level),
+            pv,
+        );
     }
 }

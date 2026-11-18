@@ -21,6 +21,7 @@ pub mod hstream;
 pub mod hybrid;
 pub mod noise;
 pub mod nstream;
+pub mod octave;
 pub mod pstream;
 pub mod pvsola;
 pub mod render;
