@@ -24,7 +24,11 @@ use crate::stretch::Algorithm;
 use crate::vstream::VocoderStream;
 
 use crate::render::{BlockRenderer, Source};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Monotonic voice index used to stagger FFT frame schedules across polyphonic voices.
+static NEXT_VOICE_STAGGER: AtomicUsize = AtomicUsize::new(0);
 
 /// Extra engine instances, for layers past the first.
 ///
@@ -64,22 +68,28 @@ impl LayerBank {
             pvsola: Vec::new(),
             hybrid: Vec::new(),
         };
-        for _ in 0..extra {
+        for idx in 0..extra {
+            let stagger = idx + 1;
             match algorithm {
                 Algorithm::Wsola => bank.wsola.push(Pitched::new(
                     WsolaStream::new(max_block, channels, sample_rate),
                     max_block,
                     channels,
                 )),
-                Algorithm::Vocoder => bank.vocoder.push(Pitched::new(
-                    VocoderStream::new(max_block, channels),
-                    max_block,
-                    channels,
-                )),
-                Algorithm::Pvsola => bank.pvsola.push(PitchedPvsola::new(max_block, channels)),
+                Algorithm::Vocoder => {
+                    let mut v = VocoderStream::new(max_block, channels);
+                    v.set_stagger(stagger);
+                    bank.vocoder.push(Pitched::new(v, max_block, channels));
+                }
+                Algorithm::Pvsola => {
+                    let mut pv = PitchedPvsola::new(max_block, channels);
+                    pv.set_stagger(stagger);
+                    bank.pvsola.push(pv);
+                }
                 Algorithm::Hybrid => {
-                    bank.hybrid
-                        .push(PitchedHybrid::new(max_block, channels, sample_rate))
+                    let mut hy = PitchedHybrid::new(max_block, channels, sample_rate);
+                    hy.set_stagger(stagger);
+                    bank.hybrid.push(hy);
                 }
                 // The grain cloud layers inside its own renderer: a layer there
                 // is another schedule, not another engine. SoundHack has no
@@ -292,15 +302,27 @@ impl Stretcher {
     ) -> Self {
         let wide = max_block.max(1) * channels.max(1);
         let is = |a: Algorithm| algorithm == a;
+        let stagger = NEXT_VOICE_STAGGER.fetch_add(1, Ordering::Relaxed);
         Stretcher {
             grain: BlockRenderer::new(max_block),
             wsola: is(Algorithm::Wsola).then(|| {
                 Pitched::new(WsolaStream::new(max_block, channels, sample_rate), max_block, channels)
             }),
-            vocoder: is(Algorithm::Vocoder)
-                .then(|| Pitched::new(VocoderStream::new(max_block, channels), max_block, channels)),
-            pvsola: is(Algorithm::Pvsola).then(|| PitchedPvsola::new(max_block, channels)),
-            hybrid: is(Algorithm::Hybrid).then(|| PitchedHybrid::new(max_block, channels, sample_rate)),
+            vocoder: is(Algorithm::Vocoder).then(|| {
+                let mut v = VocoderStream::new(max_block, channels);
+                v.set_stagger(stagger);
+                Pitched::new(v, max_block, channels)
+            }),
+            pvsola: is(Algorithm::Pvsola).then(|| {
+                let mut pv = PitchedPvsola::new(max_block, channels);
+                pv.set_stagger(stagger);
+                pv
+            }),
+            hybrid: is(Algorithm::Hybrid).then(|| {
+                let mut hy = PitchedHybrid::new(max_block, channels, sample_rate);
+                hy.set_stagger(stagger);
+                hy
+            }),
             soundhack: is(Algorithm::SoundHack)
                 .then(|| Pitched::new(SoundHackStream::new(max_block, channels), max_block, channels)),
             parts: Arc::new(Parts::default()),

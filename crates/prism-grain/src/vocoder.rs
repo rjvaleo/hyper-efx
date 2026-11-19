@@ -377,41 +377,28 @@ pub fn settings_for(p: &crate::stream::StretchParams) -> Settings {
     }
 }
 
-/// Advance the synthesis phase by one hop — locked to the peaks, or bin by bin.
-///
-/// Pulled out of the render loop so the streaming engine runs this and not a
-/// copy of it. A second implementation of phase propagation is a second sound,
-/// and the difference would only show up after a long stretch, which is the one
-/// case nobody checks by ear.
+/// Process peaks `p_start..p_end` of phase-locked propagation, returning the
+/// total number of bins updated (used to charge incremental work budgets).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn propagate(
+pub(crate) fn propagate_peaks_range(
     phase: &[f32],
     prev: &[f32],
     sum: &mut [f32],
-    mag: &[f32],
-    peak_idx: &mut Vec<usize>,
+    peak_idx: &[usize],
+    p_start: usize,
+    p_end: usize,
     n: usize,
     ha: f32,
     hs: f32,
-    s: &Settings,
-) {
+    trust: f32,
+    spread: f32,
+    width: f32,
+) -> usize {
     let bins = phase.len();
-    if !s.phase_lock {
-        propagate_all(phase, prev, sum, n, ha, hs, s);
-        return;
-    }
-    peaks(mag, s.peak_width.clamp(1, 32), peak_idx);
-    if peak_idx.is_empty() {
-        propagate_all(phase, prev, sum, n, ha, hs, s);
-        return;
-    }
-    // Every peak advances on its own instantaneous frequency; the bins around
-    // it keep the phase relationship they had in the analysis frame. So a
-    // partial moves as one object instead of dissolving into its own skirts.
-    let trust = s.freq_trust.clamp(0.0, 4.0);
-    let spread = s.phase_spread.clamp(0.0, 4.0);
-    let width = s.lock_width.clamp(0.0, 4.0);
-    for (p, &k) in peak_idx.iter().enumerate() {
+    let end = p_end.min(peak_idx.len());
+    let mut touched = 0usize;
+    for p in p_start..end {
+        let k = peak_idx[p];
         let omega = TWO_PI * k as f32 / n as f32;
         let delta = wrap(phase[k] - prev[k] - ha * omega);
         let freq = omega + (delta / ha) * trust;
@@ -429,14 +416,19 @@ pub(crate) fn propagate(
                 sum[j] = wrap(sum[k] + (phase[j] - phase[k]) * spread);
             }
         }
+        touched += (hi - lo).max(1);
     }
+    touched
 }
 
-/// Equations 5.10 to 5.12, applied to every bin independently.
-pub(crate) fn propagate_all(
+/// Equations 5.10 to 5.12, applied to bins `k_start..k_end` independently.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn propagate_all_range(
     phase: &[f32],
     prev: &[f32],
     sum: &mut [f32],
+    k_start: usize,
+    k_end: usize,
     n: usize,
     ha: f32,
     hs: f32,
@@ -446,7 +438,8 @@ pub(crate) fn propagate_all(
     // written; at zero every bin is declared to sit exactly on its own centre
     // frequency, which quantises the whole sound to the transform's grid.
     let trust = s.freq_trust.clamp(0.0, 4.0);
-    for k in 0..phase.len() {
+    let end = k_end.min(phase.len());
+    for k in k_start..end {
         // 5.10 — the heterodyned phase increment: what actually happened,
         // less what a partial sitting exactly on the bin centre would have done.
         let omega = TWO_PI * k as f32 / n as f32;

@@ -15,7 +15,7 @@
 //! matching instant, which is the same comparison made locally instead of
 //! globally, and ramped between measurements so nothing steps.
 
-use crate::fft::fft;
+use crate::fft::FftStepper;
 
 use crate::noise::Morph;
 use crate::stream::{RingDirty, StretchParams};
@@ -28,8 +28,10 @@ pub struct NoiseStream {
 
     win: Vec<f32>,
     win_for: Option<usize>,
+    win_sq_sum: f32,
     re: Vec<f32>,
     im: Vec<f32>,
+    out_re: Vec<f32>,
     mag: Vec<f32>,
     env_a: Vec<f32>,
     env_b: Vec<f32>,
@@ -51,6 +53,96 @@ pub struct NoiseStream {
     gain_at: u64,
     /// Keeps the read continuous when the ratio moves. See `anchor.rs`.
     anchor: crate::anchor::Anchor,
+
+    /// In-flight next noise-morph frame, stepped across blocks.
+    job: Option<NoiseJob>,
+    /// Voice/layer phase offset (0..8) for staggering stage boundaries.
+    stagger: usize,
+}
+
+#[derive(Clone, Copy)]
+struct NoiseJob {
+    channels: usize,
+    n: usize,
+    hop: usize,
+    bins: usize,
+    span: usize,
+    a_start: usize,
+    b_start: usize,
+    t: f32,
+    seed: u32,
+    stage: NoiseStage,
+    started: bool,
+}
+
+#[derive(Clone, Copy)]
+enum NoiseStage {
+    EnvWin { ch: usize, is_b: bool, i: usize },
+    EnvFft { ch: usize, is_b: bool, stepper: FftStepper },
+    EnvMag { ch: usize, is_b: bool, k: usize },
+    EnvSmooth { ch: usize, is_b: bool, k: usize },
+    SynthSpec { ch: usize, k: usize },
+    SynthMirror { ch: usize },
+    SynthIfft { ch: usize, stepper: FftStepper },
+    Ready,
+}
+
+const NOISE_SPEC_WEIGHT: usize = 14;
+const NOISE_MAG_WEIGHT: usize = 2;
+
+impl NoiseJob {
+    fn is_ready(&self) -> bool {
+        matches!(self.stage, NoiseStage::Ready)
+    }
+
+    fn one_env_work(n: usize, bins: usize, span: usize) -> usize {
+        n / 2 + FftStepper::total_work(n, false) + bins * NOISE_MAG_WEIGHT + (bins * span.max(1)) / 4
+    }
+
+    fn one_synth_work(n: usize, bins: usize) -> usize {
+        bins * NOISE_SPEC_WEIGHT + n / 4 + FftStepper::total_work(n, true)
+    }
+
+    fn one_channel_work(n: usize, bins: usize, span: usize) -> usize {
+        2 * Self::one_env_work(n, bins, span) + Self::one_synth_work(n, bins)
+    }
+
+    fn remaining_work(&self) -> usize {
+        let n = self.n;
+        let bins = self.bins;
+        let span = self.span;
+        let one_env = Self::one_env_work(n, bins, span);
+        let one_synth = Self::one_synth_work(n, bins);
+        let one_ch = Self::one_channel_work(n, bins, span);
+        let ch_tail = |ch: usize| (self.channels - 1 - ch) * one_ch;
+        let env_tail = |ch: usize, is_b: bool| (if is_b { 0 } else { one_env }) + one_synth + ch_tail(ch);
+        match self.stage {
+            NoiseStage::EnvWin { ch, is_b, i } => {
+                (n - i).div_ceil(2)
+                    + FftStepper::total_work(n, false)
+                    + bins * NOISE_MAG_WEIGHT
+                    + (bins * span) / 4
+                    + env_tail(ch, is_b)
+            }
+            NoiseStage::EnvFft { ch, is_b, stepper } => {
+                stepper.remaining_work() + bins * NOISE_MAG_WEIGHT + (bins * span) / 4 + env_tail(ch, is_b)
+            }
+            NoiseStage::EnvMag { ch, is_b, k } => {
+                (bins - k) * NOISE_MAG_WEIGHT + (bins * span) / 4 + env_tail(ch, is_b)
+            }
+            NoiseStage::EnvSmooth { ch, is_b, k } => {
+                ((bins - k) * span) / 4 + env_tail(ch, is_b)
+            }
+            NoiseStage::SynthSpec { ch, k } => {
+                (bins - k) * NOISE_SPEC_WEIGHT + n / 4 + FftStepper::total_work(n, true) + ch_tail(ch)
+            }
+            NoiseStage::SynthMirror { ch } => {
+                n / 4 + FftStepper::total_work(n, true) + ch_tail(ch)
+            }
+            NoiseStage::SynthIfft { ch, stepper } => stepper.remaining_work() + ch_tail(ch),
+            NoiseStage::Ready => 0,
+        }
+    }
 }
 
 impl NoiseStream {
@@ -62,8 +154,10 @@ impl NoiseStream {
             channels,
             win: Vec::with_capacity(MAX_FFT),
             win_for: None,
+            win_sq_sum: 0.0,
             re: vec![0.0; MAX_FFT],
             im: vec![0.0; MAX_FFT],
+            out_re: vec![0.0; channels * MAX_FFT],
             mag: vec![0.0; bins],
             env_a: vec![0.0; bins],
             env_b: vec![0.0; bins],
@@ -78,10 +172,17 @@ impl NoiseStream {
             gain_to: 1.0,
             gain_at: 0,
             anchor: crate::anchor::Anchor::default(),
+            job: None,
+            stagger: 0,
         }
     }
 
+    pub fn set_stagger(&mut self, id: usize) {
+        self.stagger = id & 7;
+    }
+
     pub fn seek(&mut self, out_frame: u64, p: &StretchParams, m: Morph) {
+        self.job = None;
         let n = (m.fft_size.max(64).next_power_of_two()).min(MAX_FFT);
         let hop = (n / 4).max(1);
         let ch = self.channels;
@@ -131,45 +232,218 @@ impl NoiseStream {
                     .push(0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos());
             }
         }
+        let mut full = 0f32;
+        for i in 0..n {
+            full += self.win[i] * self.win[i];
+        }
+        self.win_sq_sum = full;
         self.win_for = Some(n);
     }
 
-    /// The smoothed magnitude envelope of one analysis frame, into `out`.
-    fn envelope(&mut self, input: &[f32], channels: usize, ch: usize, start: usize, n: usize, span: usize, into_a: bool) {
+    fn begin_job(&mut self, in_frames: usize, channels: usize, p: &StretchParams, m: Morph) {
+        let n = (m.fft_size.max(64).next_power_of_two()).min(MAX_FFT);
+        let hop = (n / 4).max(1);
+        let ratio = p.ratio.clamp(0.01, 100.0);
+        self.anchor.retune(self.write, ratio);
+        let span = m.smooth_bins.max(1) | 1;
         let bins = n / 2 + 1;
-        let in_frames = input.len() / channels;
-        for i in 0..n {
-            let f = (start + i).min(in_frames.saturating_sub(1));
-            self.re[i] = input[f * channels + ch] * self.win[i];
-            self.im[i] = 0.0;
+        let scan = p.grain.scan.clamp(-4.0, 4.0);
+        self.ensure_window(n);
+
+        let src = self.source_at(self.write as f64, ratio, scan, in_frames).max(0.0) as f32;
+        let a_start = (src as usize).min(in_frames.saturating_sub(n));
+        let b_start = (a_start + hop).min(in_frames.saturating_sub(n));
+        let t = (src - a_start as f32).clamp(0.0, 1.0);
+
+        self.job = Some(NoiseJob {
+            channels,
+            n,
+            hop,
+            bins,
+            span,
+            a_start,
+            b_start,
+            t,
+            seed: m.seed,
+            stage: NoiseStage::EnvWin { ch: 0, is_b: false, i: 0 },
+            started: false,
+        });
+    }
+
+    fn step_job(&mut self, input: &[f32], in_frames: usize, budget: usize) -> usize {
+        let Some(mut job) = self.job else { return 0 };
+        if job.is_ready() {
+            return 0;
         }
-        if !fft(&mut self.re[..n], &mut self.im[..n]) {
-            return;
-        }
-        for k in 0..bins {
-            let (r, i) = (self.re[k], self.im[k]);
-            self.mag[k] = (r * r + i * i).sqrt();
-        }
-        // Running mean across frequency, in energy rather than amplitude —
-        // averaging amplitudes would quietly lose level wherever the spectrum
-        // is uneven, which is everywhere. Smoothing at all is the point: the
-        // fine structure of a noise spectrum *is* the particular realisation,
-        // and keeping it would put back the repetition being avoided.
-        let half = span / 2;
-        for k in 0..bins {
-            let lo = k.saturating_sub(half);
-            let hi = (k + half + 1).min(bins);
-            let mut acc = 0f32;
-            for kk in lo..hi {
-                acc += self.mag[kk] * self.mag[kk];
+        job.started = true;
+        let cap = budget.max(1);
+        let mut spent = 0usize;
+        let n = job.n;
+        let bins = job.bins;
+        let channels = job.channels;
+        let last_in = in_frames.saturating_sub(1);
+
+        while spent < cap {
+            let left = cap - spent;
+            match job.stage {
+                NoiseStage::Ready => break,
+                NoiseStage::EnvWin { ch, is_b, i } => {
+                    let start = if is_b { job.b_start } else { job.a_start };
+                    let take = (left.saturating_mul(2)).max(1);
+                    let end = i.saturating_add(take).min(n);
+                    let win = &self.win[..n];
+                    for idx in i..end {
+                        let f = (start + idx).min(last_in);
+                        self.re[idx] = input[f * channels + ch] * win[idx];
+                        self.im[idx] = 0.0;
+                    }
+                    spent = spent.saturating_add((end - i).div_ceil(2));
+                    job.stage = if end == n {
+                        NoiseStage::EnvFft { ch, is_b, stepper: FftStepper::new(n, false) }
+                    } else {
+                        NoiseStage::EnvWin { ch, is_b, i: end }
+                    };
+                }
+                NoiseStage::EnvFft { ch, is_b, mut stepper } => {
+                    spent = spent.saturating_add(stepper.step(&mut self.re[..n], &mut self.im[..n], left));
+                    job.stage = if stepper.is_done() {
+                        NoiseStage::EnvMag { ch, is_b, k: 0 }
+                    } else {
+                        NoiseStage::EnvFft { ch, is_b, stepper }
+                    };
+                }
+                NoiseStage::EnvMag { ch, is_b, k } => {
+                    let take = (left / NOISE_MAG_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    for idx in k..end {
+                        let (r, i) = (self.re[idx], self.im[idx]);
+                        self.mag[idx] = (r * r + i * i).sqrt();
+                    }
+                    spent = spent.saturating_add((end - k) * NOISE_MAG_WEIGHT);
+                    job.stage = if end == bins {
+                        NoiseStage::EnvSmooth { ch, is_b, k: 0 }
+                    } else {
+                        NoiseStage::EnvMag { ch, is_b, k: end }
+                    };
+                }
+                NoiseStage::EnvSmooth { ch, is_b, k } => {
+                    let half = job.span / 2;
+                    let w_per_bin = (job.span / 4).max(1);
+                    let take = (left / w_per_bin).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    let dst = if is_b { &mut self.env_b } else { &mut self.env_a };
+                    for idx in k..end {
+                        let lo = idx.saturating_sub(half);
+                        let hi = (idx + half + 1).min(bins);
+                        let mut acc = 0f32;
+                        for kk in lo..hi {
+                            acc += self.mag[kk] * self.mag[kk];
+                        }
+                        dst[idx] = (acc / (hi - lo) as f32).sqrt();
+                    }
+                    spent = spent.saturating_add((end - k) * w_per_bin);
+                    job.stage = if end == bins {
+                        if !is_b {
+                            NoiseStage::EnvWin { ch, is_b: true, i: 0 }
+                        } else {
+                            NoiseStage::SynthSpec { ch, k: 0 }
+                        }
+                    } else {
+                        NoiseStage::EnvSmooth { ch, is_b, k: end }
+                    };
+                }
+                NoiseStage::SynthSpec { ch, k } => {
+                    let take = (left / NOISE_SPEC_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    let salt = job.seed.wrapping_add(ch as u32 * 7919);
+                    let base = self.index * bins as u64;
+                    for idx in k..end {
+                        let mg = self.env_a[idx] + (self.env_b[idx] - self.env_a[idx]) * job.t;
+                        let ph = rand01(base + idx as u64, salt) * std::f32::consts::TAU;
+                        self.re[idx] = mg * ph.cos();
+                        self.im[idx] = mg * ph.sin();
+                    }
+                    spent = spent.saturating_add((end - k) * NOISE_SPEC_WEIGHT);
+                    job.stage = if end == bins {
+                        NoiseStage::SynthMirror { ch }
+                    } else {
+                        NoiseStage::SynthSpec { ch, k: end }
+                    };
+                }
+                NoiseStage::SynthMirror { ch } => {
+                    for k in bins..n {
+                        self.re[k] = self.re[n - k];
+                        self.im[k] = -self.im[n - k];
+                    }
+                    self.im[0] = 0.0;
+                    if n % 2 == 0 {
+                        self.im[n / 2] = 0.0;
+                    }
+                    spent = spent.saturating_add(n / 4);
+                    job.stage = NoiseStage::SynthIfft { ch, stepper: FftStepper::new(n, true) };
+                }
+                NoiseStage::SynthIfft { ch, mut stepper } => {
+                    spent = spent.saturating_add(stepper.step(&mut self.re[..n], &mut self.im[..n], left));
+                    if stepper.is_done() {
+                        let oo = ch * MAX_FFT;
+                        self.out_re[oo..oo + n].copy_from_slice(&self.re[..n]);
+                        job.stage = if ch + 1 < channels {
+                            NoiseStage::EnvWin { ch: ch + 1, is_b: false, i: 0 }
+                        } else {
+                            NoiseStage::Ready
+                        };
+                    } else {
+                        job.stage = NoiseStage::SynthIfft { ch, stepper };
+                    }
+                }
             }
-            let v = (acc / (hi - lo) as f32).sqrt();
-            if into_a {
-                self.env_a[k] = v;
-            } else {
-                self.env_b[k] = v;
+        }
+        self.job = Some(job);
+        spent
+    }
+
+    fn commit_job(&mut self) {
+        let Some(job) = self.job.take() else { return };
+        debug_assert!(job.is_ready());
+        let n = job.n;
+        let win = &self.win[..n];
+        let stride = self.channels;
+        for ch in 0..job.channels {
+            let re = &self.out_re[ch * MAX_FFT..ch * MAX_FFT + n];
+            let mut done = 0usize;
+            let mut slot = (self.write % self.ring as u64) as usize;
+            while done < n {
+                let run = (n - done).min(self.ring - slot);
+                let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                for ((a, &r), &w) in acc
+                    .chunks_exact_mut(stride)
+                    .zip(&re[done..done + run])
+                    .zip(&win[done..done + run])
+                {
+                    a[ch] += r * w;
+                }
+                done += run;
+                slot = 0;
             }
         }
+        {
+            let mut done = 0usize;
+            let mut slot = (self.write % self.ring as u64) as usize;
+            while done < n {
+                let run = (n - done).min(self.ring - slot);
+                for (dst, &w) in self.norm[slot..slot + run]
+                    .iter_mut()
+                    .zip(&win[done..done + run])
+                {
+                    *dst += w * w;
+                }
+                done += run;
+                slot = 0;
+            }
+        }
+        self.dirty.mark(self.write, self.write + n as u64);
+        self.write += job.hop as u64;
+        self.index += 1;
     }
 
     /// Fill one block. Must not allocate.
@@ -191,96 +465,33 @@ impl NoiseStream {
         let n = (m.fft_size.max(64).next_power_of_two()).min(MAX_FFT);
         let hop = (n / 4).max(1);
         let ratio = p.ratio.clamp(0.01, 100.0);
-        self.anchor.retune(self.write, ratio);
-        let span = m.smooth_bins.max(1) | 1;
-        let bins = n / 2 + 1;
         let scan = p.grain.scan.clamp(-4.0, 4.0);
-        self.ensure_window(n);
+
+        if let Some(job) = self.job {
+            if job.channels != channels {
+                self.job = None;
+            }
+        }
 
         let need = self.emitted + frames as u64;
         while self.write < need {
-            // Where in the source this output frame is looking.
-            let src = self.source_at(self.write as f64, ratio, scan, in_frames).max(0.0) as f32;
-            let a_start = (src as usize).min(in_frames.saturating_sub(n));
-            let b_start = (a_start + hop).min(in_frames.saturating_sub(n));
-            let t = (src - a_start as f32).clamp(0.0, 1.0);
-
-            for ch in 0..channels {
-                self.envelope(input, channels, ch, a_start, n, span, true);
-                self.envelope(input, channels, ch, b_start, n, span, false);
-
-                for k in 0..bins {
-                    let mg = self.env_a[k] + (self.env_b[k] - self.env_a[k]) * t;
-                    // A fresh phase per frame per bin, and per channel — one
-                    // shared phase would put identical noise in both and
-                    // collapse the image to the centre, which is the opposite
-                    // of what the residual of a stereo recording sounds like.
-                    let ph = rand01(
-                        self.index * bins as u64 + k as u64,
-                        m.seed.wrapping_add(ch as u32 * 7919),
-                    ) * std::f32::consts::TAU;
-                    self.re[k] = mg * ph.cos();
-                    self.im[k] = mg * ph.sin();
-                }
-                for k in bins..n {
-                    self.re[k] = self.re[n - k];
-                    self.im[k] = -self.im[n - k];
-                }
-                self.im[0] = 0.0;
-                if n % 2 == 0 {
-                    self.im[n / 2] = 0.0;
-                }
-                crate::vstream::ifft(&mut self.re[..n], &mut self.im[..n]);
-
-                let re = &self.re[..n];
-                let win = &self.win[..n];
-                let stride = self.channels;
-                let mut done = 0usize;
-                let mut slot = (self.write % self.ring as u64) as usize;
-                while done < n {
-                    let run = (n - done).min(self.ring - slot);
-                    let acc = &mut self.acc[slot * stride..(slot + run) * stride];
-                    for ((a, &r), &w) in acc
-                        .chunks_exact_mut(stride)
-                        .zip(&re[done..done + run])
-                        .zip(&win[done..done + run])
-                    {
-                        a[ch] += r * w;
-                    }
-                    done += run;
-                    slot = 0;
-                }
+            if self.job.is_none() {
+                self.begin_job(in_frames, channels, p, m);
             }
-            {
-                let win = &self.win[..n];
-                let mut done = 0usize;
-                let mut slot = (self.write % self.ring as u64) as usize;
-                while done < n {
-                    let run = (n - done).min(self.ring - slot);
-                    for (dst, &w) in self.norm[slot..slot + run]
-                        .iter_mut()
-                        .zip(&win[done..done + run])
-                    {
-                        *dst += w * w;
-                    }
-                    done += run;
-                    slot = 0;
-                }
-            }
-            self.dirty.mark(self.write, self.write + n as u64);
-
-            self.write += hop as u64;
-            self.index += 1;
+            self.step_job(input, in_frames, usize::MAX);
+            self.commit_job();
+        }
+        if self.job.is_none() {
+            self.ensure_window(n);
+            self.anchor.retune(self.write, ratio);
         }
 
-        // The normalisation floor, as a share of the full overlap. Same
-        // reasoning as the vocoder's: a maximum over the output needs the whole
-        // output first.
-        let mut full = 0f32;
-        for i in 0..n {
-            full += self.win[i] * self.win[i];
-        }
-        let floor = (full / (n as f32 / hop as f32).max(1.0)) * 0.05;
+        // The normalisation floor, as a share of the full overlap.
+        let (eff_n, eff_hop) = match self.job {
+            Some(job) => (job.n, job.hop),
+            None => (n, hop),
+        };
+        let floor = (self.win_sq_sum / (eff_n as f32 / eff_hop as f32).max(1.0)) * 0.05;
 
         let stride = self.channels;
         let mut done = 0usize;
@@ -319,6 +530,25 @@ impl NoiseStream {
             self.dirty.cleared_prefix(self.emitted, need, self.ring);
         }
         self.emitted = need;
+
+        // Spread the next noise-morph frame across the blocks remaining before `self.write`.
+        if self.write >= self.emitted {
+            let rem_frames = (self.write - self.emitted) as usize;
+            if self.job.is_none() && rem_frames > 0 {
+                self.begin_job(in_frames, channels, p, m);
+            }
+            if let Some(job) = self.job {
+                if !job.is_ready() {
+                    let blocks_left = (rem_frames / frames.max(1)) + 1;
+                    let rem_work = job.remaining_work();
+                    let mut budget = rem_work.div_ceil(blocks_left).max(1);
+                    if !job.started && self.stagger > 0 && blocks_left > 1 {
+                        budget = ((budget * (8 - self.stagger)) / 8).max(1);
+                    }
+                    self.step_job(input, in_frames, budget);
+                }
+            }
+        }
     }
 
     /// How far the synthesised level is from the source's, right here.

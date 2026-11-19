@@ -97,10 +97,12 @@ pub struct HybridStream {
 impl HybridStream {
     pub fn new(max_block: usize, channels: usize, sample_rate: u32) -> Self {
         let channels = channels.max(1);
+        let mut residual = NoiseStream::new(max_block, channels);
+        residual.set_stagger(4);
         HybridStream {
             harmonic: VocoderStream::new(max_block, channels),
             percussive: WsolaStream::new(max_block, channels, sample_rate),
-            residual: NoiseStream::new(max_block, channels),
+            residual,
             residual_wsola: WsolaStream::new(max_block, channels, sample_rate),
             scratch: vec![0.0; max_block.max(1) * channels],
             channels,
@@ -110,6 +112,13 @@ impl HybridStream {
 
     pub fn position(&self) -> u64 {
         self.emitted
+    }
+
+    /// Assign a voice/layer phase offset; harmonic and residual are staggered
+    /// half a cycle apart even within a single voice.
+    pub fn set_stagger(&mut self, id: usize) {
+        self.harmonic.set_stagger(id);
+        self.residual.set_stagger(id.wrapping_add(4));
     }
 
     /// The percussive part is stretched with transient preservation held on —
@@ -330,8 +339,9 @@ mod tests {
         let s = spec(3.0);
         let a = streamed(&src, 2, &s, 64);
         let b = streamed(&src, 2, &s, 2048);
-        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        assert!(worst < 1e-6, "the block size changed the audio by {worst:.2e}");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "bit mismatch at sample {i}: {x} vs {y}");
+        }
     }
 
     /// The separation is a property of the sound, not of the stretch — so the
@@ -406,6 +416,10 @@ impl PitchedHybrid {
 
     pub fn position(&self) -> u64 {
         self.ring.position()
+    }
+
+    pub fn set_stagger(&mut self, id: usize) {
+        self.inner.set_stagger(id);
     }
 
     /// The percussive part wants a transient map, as it does unpitched.

@@ -89,6 +89,8 @@ pub struct PvsolaStream {
     read: usize,
     first: bool,
     ended: bool,
+    /// Voice/layer phase offset (0..8) for staggering round prep and search.
+    stagger: usize,
 }
 
 impl PvsolaStream {
@@ -117,7 +119,14 @@ impl PvsolaStream {
             read: 0,
             first: true,
             ended: false,
+            stagger: 0,
         }
+    }
+
+    pub fn set_stagger(&mut self, id: usize) {
+        self.stagger = id & 7;
+        self.a.set_stagger(id);
+        self.b.set_stagger(id);
     }
 
     pub fn position(&self) -> u64 {
@@ -204,12 +213,19 @@ impl PvsolaStream {
         let p = &hp;
         let need = self.emitted + frames as u64;
 
-        // How much of the next round to make this time round. A round of output
-        // lasts `out_span` frames, so making it at the rate it is consumed
-        // spreads the cost evenly instead of paying all of it in one callback.
-        // The margin keeps it comfortably ahead at small block sizes.
-        let quota = (pl.piece_len() * frames.max(1) / pl.out_span.max(1)) + 256;
-        self.prepare(input, channels, in_frames, p, &pl, quota);
+        // Steady-state spreading: while the previous round still covers this
+        // block plus the crossfade margin, advance the next round's vocoder
+        // frames and splice correlation in bounded per-block steps so no single
+        // callback pays a whole FFT frame or correlation search.
+        // On `self.first` (right after a seek), `self.written < need + blend`
+        // enters the catch-up loop below immediately, leaving seek timing and
+        // bits untouched.
+        if !self.first && self.written >= need + pl.blend as u64 && !self.ended {
+            let rem_frames = (self.written - (need + pl.blend as u64)) as usize;
+            let blocks_left = (rem_frames / frames.max(1)) + 1;
+            let round_blocks = (pl.out_span / frames.max(1)).max(1);
+            self.prepare_step(input, channels, in_frames, p, &pl, blocks_left, round_blocks);
+        }
 
         // A round fades *backwards* into the one before it, so a frame is not
         // finished when the write pointer reaches it — it is finished when the
@@ -255,6 +271,148 @@ impl PvsolaStream {
         self.emitted = need;
     }
 
+    /// Ensure `self.prep` has been initialised for the next round.
+    fn ensure_prep(
+        &mut self,
+        channels: usize,
+        in_frames: usize,
+        p: &StretchParams,
+        pl: &Plan,
+    ) {
+        if self.ended || self.prep.is_some() {
+            return;
+        }
+        let want = pl.piece_len().min(self.piece.len() / channels);
+        // A backward run reads down from the top of its segment, so its
+        // run-up is above the anchor rather than below it.
+        let (from, lead) = if pl.backward {
+            let top = (self.read + pl.pre_in + pl.n).min(in_frames);
+            let lead = top.saturating_sub(self.read + pl.n);
+            let used = pl.n + ((want as f32 / pl.ratio).ceil() as usize);
+            (top.saturating_sub(used), lead)
+        } else {
+            // Back up for the run-up, taking whatever is there.
+            let from = self.read.saturating_sub(pl.pre_in);
+            (from, self.read - from)
+        };
+        let at = if lead == pl.pre_in {
+            pl.pre_out
+        } else {
+            ((lead as f32) * pl.ratio).round() as usize
+        };
+
+        // The segment is bounded exactly as the offline renderer bounds it.
+        // Handing the vocoder the rest of the file instead would give it a
+        // different idea of where the end is, and its wrap and stop
+        // conditions are measured against that — so the runs would diverge
+        // near the end of every file, which is the one place nobody listens.
+        let need_out = pl.out_span + pl.blend + pl.search;
+        let need_in = ((need_out as f32) / pl.ratio).ceil() as usize + pl.n;
+        let take = if pl.backward {
+            // Everything from the bottom of what the run will read to the
+            // top it starts at.
+            (self.read + lead + pl.n).min(in_frames).saturating_sub(from)
+        } else {
+            (lead + need_in).min(in_frames.saturating_sub(from))
+        };
+        if take < pl.n || at >= want {
+            self.ended = true;
+            return;
+        }
+
+        // The run being prepared starts fresh from the input's own phase.
+        // That is the engine: nothing carries across an anchor, so nothing
+        // has time to drift.
+        self.b.seek(0, take, p);
+        self.prep = Some(Prep {
+            from,
+            take,
+            at,
+            want,
+            done: 0,
+            started: false,
+            search: None,
+            best_off: None,
+        });
+    }
+
+    /// Advance the next round's vocoder preparation or splice correlation by
+    /// one bounded per-block slice, paced across `blocks_left` blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_step(
+        &mut self,
+        input: &[f32],
+        channels: usize,
+        in_frames: usize,
+        p: &StretchParams,
+        pl: &Plan,
+        blocks_left: usize,
+        round_blocks: usize,
+    ) {
+        self.ensure_prep(channels, in_frames, p, pl);
+        let Some(mut pr) = self.prep.take() else { return };
+
+        if pr.done < pr.want {
+            // Reserve a fixed tail of blocks at the end of the round for the
+            // incremental splice correlation search (computed from the round's
+            // total length so it does not shrink as `blocks_left` counts down).
+            let search_blocks = if pl.search > 0 {
+                (16 + (self.stagger % 4) * 2).min(round_blocks / 4)
+            } else {
+                0
+            };
+            let prep_blocks = blocks_left.saturating_sub(search_blocks).max(1);
+            let rem_work = self.b.remaining_work_for(pr.want, channels, p);
+            let mut budget = if prep_blocks == 1 {
+                // Final prep block before search begins: finish any rounding
+                // residual cleanly so search gets its full reserved window.
+                rem_work.saturating_add(rem_work / 4 + 4096)
+            } else {
+                rem_work.div_ceil(prep_blocks).max(1)
+            };
+            if !pr.started && self.stagger > 0 && prep_blocks > 1 {
+                budget = ((budget * (8 - self.stagger)) / 8).max(1);
+            }
+            pr.started = true;
+            let seg = &input[pr.from * channels..(pr.from + pr.take) * channels];
+            let got = self.b.render_budgeted(
+                &mut self.piece[pr.done * channels..pr.want * channels],
+                channels,
+                seg,
+                p,
+                budget,
+            );
+            pr.done += got;
+            self.prep = Some(pr);
+            return;
+        }
+
+        // `self.piece` is complete; spread the splice correlation search across
+        // the remaining blocks before `splice()` runs.
+        if pr.best_off.is_none() {
+            self.piece_frames = pr.want;
+            let join = self.written.saturating_sub(pl.blend as u64);
+            let span = pl.blend.max(1);
+            if pr.search.is_none() {
+                match self.init_search(channels, join, span, pr.at, pl.search) {
+                    Ok(job) => pr.search = Some(job),
+                    Err(done_off) => pr.best_off = Some(done_off),
+                }
+            }
+            if let Some(mut sj) = pr.search {
+                let rem_offsets = ((sj.hi - sj.off) / self.stride) + 1;
+                let step = rem_offsets.div_ceil(blocks_left).max(1);
+                if let Some(best) = self.step_search(&mut sj, step) {
+                    pr.best_off = Some(best);
+                    pr.search = None;
+                } else {
+                    pr.search = Some(sj);
+                }
+            }
+        }
+        self.prep = Some(pr);
+    }
+
     /// Make up to `quota` more frames of the round being prepared, starting a
     /// new one if there is none.
     fn prepare(
@@ -266,55 +424,7 @@ impl PvsolaStream {
         pl: &Plan,
         quota: usize,
     ) {
-        if self.ended {
-            return;
-        }
-        if self.prep.is_none() {
-            let want = pl.piece_len().min(self.piece.len() / channels);
-            // A backward run reads down from the top of its segment, so its
-            // run-up is above the anchor rather than below it.
-            let (from, lead) = if pl.backward {
-                let top = (self.read + pl.pre_in + pl.n).min(in_frames);
-                let lead = top.saturating_sub(self.read + pl.n);
-                let used = pl.n + ((want as f32 / pl.ratio).ceil() as usize);
-                (top.saturating_sub(used), lead)
-            } else {
-                // Back up for the run-up, taking whatever is there.
-                let from = self.read.saturating_sub(pl.pre_in);
-                (from, self.read - from)
-            };
-            let at = if lead == pl.pre_in {
-                pl.pre_out
-            } else {
-                ((lead as f32) * pl.ratio).round() as usize
-            };
-
-            // The segment is bounded exactly as the offline renderer bounds it.
-            // Handing the vocoder the rest of the file instead would give it a
-            // different idea of where the end is, and its wrap and stop
-            // conditions are measured against that — so the runs would diverge
-            // near the end of every file, which is the one place nobody listens.
-            let need_out = pl.out_span + pl.blend + pl.search;
-            let need_in = ((need_out as f32) / pl.ratio).ceil() as usize + pl.n;
-            let take = if pl.backward {
-                // Everything from the bottom of what the run will read to the
-                // top it starts at.
-                (self.read + lead + pl.n).min(in_frames).saturating_sub(from)
-            } else {
-                (lead + need_in).min(in_frames.saturating_sub(from))
-            };
-            if take < pl.n || at >= want {
-                self.ended = true;
-                return;
-            }
-
-            // The run being prepared starts fresh from the input's own phase.
-            // That is the engine: nothing carries across an anchor, so nothing
-            // has time to drift.
-            self.b.seek(0, take, p);
-            self.prep = Some(Prep { from, take, at, want, done: 0 });
-        }
-
+        self.ensure_prep(channels, in_frames, p, pl);
         let Some(mut pr) = self.prep.take() else { return };
         let step = quota.min(pr.want - pr.done);
         if step > 0 {
@@ -329,7 +439,7 @@ impl PvsolaStream {
 
     /// Splice the prepared round onto what is written.
     fn splice(&mut self, channels: usize, _in_frames: usize, pl: &Plan) {
-        let Some(pr) = self.prep.take() else {
+        let Some(mut pr) = self.prep.take() else {
             self.ended = true;
             return;
         };
@@ -368,7 +478,13 @@ impl PvsolaStream {
             // written — the same normalised correlation WSOLA uses, and the
             // reason the joins are not audible as joins.
             let join = self.written.saturating_sub(pl.blend as u64);
-            let off = self.best_offset(channels, join, pl.blend.max(1), at, pl.search);
+            let off = if let Some(best) = pr.best_off {
+                best
+            } else if let Some(mut sj) = pr.search.take() {
+                self.step_search(&mut sj, usize::MAX).unwrap_or(sj.best)
+            } else {
+                self.best_offset(channels, join, pl.blend.max(1), at, pl.search)
+            };
             let len = (want - off).min(pl.out_span + pl.blend);
             let stride = self.channels;
             let mut done = 0usize;
@@ -422,6 +538,105 @@ impl PvsolaStream {
         std::mem::swap(&mut self.a, &mut self.b);
     }
 
+    /// Prepare the mono mix buffers and energy for an incremental splice search.
+    /// Returns `Err(offset)` if no search loop is needed, or `Ok(SearchJob)`.
+    fn init_search(
+        &mut self,
+        channels: usize,
+        join: u64,
+        span: usize,
+        at: usize,
+        search: usize,
+    ) -> Result<SearchJob, usize> {
+        if span == 0 || self.piece_frames <= span + at {
+            return Err(at.min(self.piece_frames.saturating_sub(1)));
+        }
+        if search == 0 {
+            return Err(at);
+        }
+        let lo = at.saturating_sub(search);
+        let hi = (at + search).min(self.piece_frames - span - 1);
+        if hi <= lo {
+            return Err(at.min(hi));
+        }
+
+        let fits = span <= self.mono_want.len() && hi + span <= self.mono_piece.len();
+        if !fits {
+            return Err(at);
+        }
+
+        let stride = self.channels;
+        let mut done = 0usize;
+        let mut slot = (join % self.ring as u64) as usize;
+        while done < span {
+            let run = (span - done).min(self.ring - slot);
+            let acc = &self.acc[slot * stride..(slot + run) * stride];
+            for (dst, a) in self.mono_want[done..done + run]
+                .iter_mut()
+                .zip(acc.chunks_exact(stride))
+            {
+                let mut sum = 0.0;
+                for &v in &a[..channels] {
+                    sum += v;
+                }
+                *dst = sum / channels as f32;
+            }
+            done += run;
+            slot = 0;
+        }
+        for f in lo..hi + span {
+            let mut acc = 0.0;
+            for ch in 0..channels {
+                acc += self.piece[f * channels + ch];
+            }
+            self.mono_piece[f] = acc / channels as f32;
+        }
+        let mut want_energy = 0f32;
+        for &v in &self.mono_want[..span] {
+            want_energy += v * v;
+        }
+        let want_energy = want_energy.sqrt();
+        if want_energy < 1e-9 {
+            return Err(at);
+        }
+        Ok(SearchJob {
+            span,
+            hi,
+            off: lo,
+            want_energy,
+            best: at,
+            best_score: f32::NEG_INFINITY,
+        })
+    }
+
+    /// Evaluate up to `max_offsets` candidate offsets in an incremental search.
+    /// Returns `Some(best)` once `sj.off > sj.hi`.
+    fn step_search(&self, sj: &mut SearchJob, max_offsets: usize) -> Option<usize> {
+        let want = &self.mono_want[..sj.span];
+        let mono = &self.mono_piece;
+        let mut done = 0usize;
+        while sj.off <= sj.hi && done < max_offsets {
+            let mut dot = 0f32;
+            let mut energy = 0f32;
+            for (w, v) in want.iter().zip(&mono[sj.off..sj.off + sj.span]) {
+                dot += w * v;
+                energy += v * v;
+            }
+            let score = dot / (sj.want_energy * energy.sqrt() + 1e-9);
+            if score > sj.best_score {
+                sj.best_score = score;
+                sj.best = sj.off;
+            }
+            sj.off += self.stride;
+            done += 1;
+        }
+        if sj.off > sj.hi {
+            Some(sj.best)
+        } else {
+            None
+        }
+    }
+
     /// Which offset into the prepared run best continues what is written.
     ///
     /// Mixed to mono first: the alignment is a property of the moment, not of
@@ -435,98 +650,27 @@ impl PvsolaStream {
         at: usize,
         search: usize,
     ) -> usize {
-        if span == 0 || self.piece_frames <= span + at {
-            return at.min(self.piece_frames.saturating_sub(1));
+        match self.init_search(channels, join, span, at, search) {
+            Err(off) => off,
+            Ok(mut sj) => self.step_search(&mut sj, usize::MAX).unwrap_or(sj.best),
         }
-        if search == 0 {
-            return at;
-        }
-        let lo = at.saturating_sub(search);
-        let hi = (at + search).min(self.piece_frames - span - 1);
-        if hi <= lo {
-            return at.min(hi);
-        }
-
-        // Both sounds mixed to one channel, once. The search used to mix each
-        // sample again at every place it tried (with a remainder and two
-        // divisions each time); the numbers, and the order they are added
-        // in, are the same as then, so it chooses the same place.
-        let mut want = std::mem::take(&mut self.mono_want);
-        let mut mono = std::mem::take(&mut self.mono_piece);
-        let fits = span <= want.len() && hi + span <= mono.len();
-        if fits {
-            let stride = self.channels;
-            let mut done = 0usize;
-            let mut slot = (join % self.ring as u64) as usize;
-            while done < span {
-                let run = (span - done).min(self.ring - slot);
-                let acc = &self.acc[slot * stride..(slot + run) * stride];
-                for (dst, a) in want[done..done + run]
-                    .iter_mut()
-                    .zip(acc.chunks_exact(stride))
-                {
-                    let mut sum = 0.0;
-                    for &v in &a[..channels] {
-                        sum += v;
-                    }
-                    *dst = sum / channels as f32;
-                }
-                done += run;
-                slot = 0;
-            }
-        }
-        for f in if fits { lo..hi + span } else { 0..0 } {
-            let mut acc = 0.0;
-            for ch in 0..channels {
-                acc += self.piece[f * channels + ch];
-            }
-            mono[f] = acc / channels as f32;
-        }
-        let best = if fits { Self::search(&want[..span], &mono, lo, hi, at, self.stride) } else { at };
-        self.mono_want = want;
-        self.mono_piece = mono;
-        best
-    }
-
-    /// The place between `lo` and `hi` where `mono` best continues `want`.
-    fn search(want: &[f32], mono: &[f32], lo: usize, hi: usize, at: usize, stride: usize) -> usize {
-        let span = want.len();
-        let mut want_energy = 0f32;
-        for v in want {
-            want_energy += v * v;
-        }
-        let want_energy = want_energy.sqrt();
-        if want_energy < 1e-9 {
-            return at;
-        }
-
-        let mut best = at;
-        let mut best_score = f32::NEG_INFINITY;
-        // Every fourth frame: the correlation surface is smooth at this scale
-        // and a full search costs four times as much for a splice a sample or
-        // two different. The same stride WSOLA settled on.
-        let mut off = lo;
-        while off <= hi {
-            let mut dot = 0f32;
-            let mut energy = 0f32;
-            for (w, v) in want.iter().zip(&mono[off..off + span]) {
-                dot += w * v;
-                energy += v * v;
-            }
-            let score = dot / (want_energy * energy.sqrt() + 1e-9);
-            if score > best_score {
-                best_score = score;
-                best = off;
-            }
-            off += stride;
-        }
-        best
     }
 
     /// The source is a copy `factor` times shorter (`octave.rs`).
     pub fn set_octave(&mut self, factor: u32) {
         self.stride = (4 / factor.max(1) as usize).max(1);
     }
+}
+
+/// Incremental state for the splice correlation search.
+#[derive(Clone, Copy)]
+struct SearchJob {
+    span: usize,
+    hi: usize,
+    off: usize,
+    want_energy: f32,
+    best: usize,
+    best_score: f32,
 }
 
 /// A round being made, a slice at a time.
@@ -536,6 +680,9 @@ struct Prep {
     at: usize,
     want: usize,
     done: usize,
+    started: bool,
+    search: Option<SearchJob>,
+    best_off: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -649,8 +796,40 @@ mod tests {
         let s = spec(3.0);
         let a = streamed(&src, 2, &s, 64);
         let b = streamed(&src, 2, &s, 2048);
-        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        assert!(worst < 1e-6, "the block size changed the audio by {worst:.2e}");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "bit mismatch at sample {i}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn spread_pvsola_and_stagger_are_bit_identical_when_params_hold_still() {
+        let src = chord(1.0, 2);
+        let s = spec(2.0);
+        let offline = s.process(&src, 2, RATE);
+        let p = params(&s);
+        let in_frames = src.len() / 2;
+        let want = offline.len() / 2;
+        for stagger in [0usize, 2, 5] {
+            let mut pv = PvsolaStream::new(64, 2);
+            pv.set_stagger(stagger);
+            pv.seek(0, in_frames, &p, &s.pvsola);
+            let mut out = vec![0f32; want * 2];
+            let mut at = 0usize;
+            let mut buf = vec![0f32; 64 * 2];
+            while at < want {
+                let n = 64.min(want - at);
+                pv.render(&mut buf[..n * 2], 2, &src, &p, &s.pvsola);
+                out[at * 2..(at + n) * 2].copy_from_slice(&buf[..n * 2]);
+                at += n;
+            }
+            for (i, (a, b)) in offline.iter().zip(&out).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "pvsola stagger={stagger} sample {i}: {a} vs {b}"
+                );
+            }
+        }
     }
 
     /// Render while turning a control, the way a hand on a slider does.
@@ -818,6 +997,10 @@ impl PitchedPvsola {
 
     pub fn position(&self) -> u64 {
         self.ring.position()
+    }
+
+    pub fn set_stagger(&mut self, id: usize) {
+        self.inner.set_stagger(id);
     }
 
     pub fn render_pitched(

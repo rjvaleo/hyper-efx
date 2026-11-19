@@ -176,6 +176,241 @@ pub fn prime() {
     let _ = bitrev_tables();
 }
 
+/// Incremental driver for [`fft`] and real-output [`crate::vstream::ifft`].
+///
+/// Runs the exact same bit-reversal swaps (from `bitrev_tables()`), the exact
+/// same radix-2 butterflies in `(len, start, k)` order (from `twiddles()`), and
+/// for inverse transforms the exact same pre-conjugation and `1.0 / n` real
+/// scaling — bounded by a caller-supplied butterfly-equivalent work budget per
+/// call so large transforms can be spread across audio blocks bit-identically.
+#[derive(Clone, Copy, Debug)]
+pub struct FftStepper {
+    n: usize,
+    inverse: bool,
+    phase: FftPhase,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FftPhase {
+    Conj { i: usize },
+    BitRev { idx: usize },
+    Butterfly { len: usize, start: usize, k: usize },
+    Scale { i: usize },
+    Done,
+}
+
+impl FftStepper {
+    /// Start an incremental transform of length `n` (power of two `<= TWIDDLE_N`).
+    /// When `inverse` is `true`, performs the real-output inverse transform
+    /// identical to [`crate::vstream::ifft`] (conjugate `im`, forward FFT, scale `re`).
+    pub fn new(n: usize, inverse: bool) -> Self {
+        let phase = if n == 0 || !n.is_power_of_two() || n > TWIDDLE_N {
+            FftPhase::Done
+        } else if inverse {
+            FftPhase::Conj { i: 0 }
+        } else if n == 1 {
+            FftPhase::Done
+        } else {
+            FftPhase::BitRev { idx: 0 }
+        };
+        FftStepper { n, inverse, phase }
+    }
+
+    pub fn is_done(&self) -> bool {
+        matches!(self.phase, FftPhase::Done)
+    }
+
+    /// Estimated total work units for a transform of length `n`.
+    pub fn total_work(n: usize, inverse: bool) -> usize {
+        if n <= 1 || !n.is_power_of_two() || n > TWIDDLE_N {
+            return 0;
+        }
+        let log2 = n.trailing_zeros() as usize;
+        // ~n/2 bit-rev swaps at weight 2 (= n) + (n/2)*log2 butterflies at weight 1.
+        let base = n + (n / 2) * log2;
+        if inverse {
+            base + n // Conj (n/2) + Scale (n/2)
+        } else {
+            base
+        }
+    }
+
+    /// Remaining estimated work units.
+    pub fn remaining_work(&self) -> usize {
+        let n = self.n;
+        if n <= 1 || !n.is_power_of_two() || n > TWIDDLE_N {
+            return 0;
+        }
+        let log2 = n.trailing_zeros() as usize;
+        let tail_scale = if self.inverse { n / 2 } else { 0 };
+        match self.phase {
+            FftPhase::Done => 0,
+            FftPhase::Conj { i } => (n - i) / 2 + n + (n / 2) * log2 + tail_scale,
+            FftPhase::BitRev { idx } => {
+                let pairs = bitrev_tables()[log2].len();
+                pairs.saturating_sub(idx) * 2 + (n / 2) * log2 + tail_scale
+            }
+            FftPhase::Butterfly { len, start, k } => {
+                let stage = len.trailing_zeros() as usize; // 1..=log2
+                let stages_after = log2.saturating_sub(stage);
+                let half = len / 2;
+                let done_in_stage = (start / len) * half + k;
+                let rem_in_stage = (n / 2).saturating_sub(done_in_stage);
+                rem_in_stage + stages_after * (n / 2) + tail_scale
+            }
+            FftPhase::Scale { i } => (n - i).div_ceil(2),
+        }
+    }
+
+    /// Advance by at most `budget` work units, returning how many units were
+    /// spent. Call [`Self::is_done`] to check completion.
+    pub fn step(&mut self, re: &mut [f32], im: &mut [f32], budget: usize) -> usize {
+        let n = self.n;
+        if matches!(self.phase, FftPhase::Done) {
+            return 0;
+        }
+        debug_assert!(n.is_power_of_two() && n <= TWIDDLE_N && re.len() == n && im.len() == n);
+        let mut spent = 0usize;
+        let cap = budget.max(1);
+
+        while spent < cap {
+            let left = cap - spent;
+            match self.phase {
+                FftPhase::Done => break,
+                FftPhase::Conj { i } => {
+                    let take = left.saturating_mul(2).max(1);
+                    let end = i.saturating_add(take).min(n);
+                    for v in &mut im[i..end] {
+                        *v = -*v;
+                    }
+                    spent = spent.saturating_add((end - i).div_ceil(2));
+                    self.phase = if end == n {
+                        if n == 1 {
+                            FftPhase::Scale { i: 0 }
+                        } else {
+                            FftPhase::BitRev { idx: 0 }
+                        }
+                    } else {
+                        FftPhase::Conj { i: end }
+                    };
+                }
+                FftPhase::BitRev { idx } => {
+                    let pairs = &bitrev_tables()[n.trailing_zeros() as usize];
+                    let take = (left / 2).max(1);
+                    let end = idx.saturating_add(take).min(pairs.len());
+                    for &(a, b) in &pairs[idx..end] {
+                        let (a, b) = (a as usize, b as usize);
+                        re.swap(a, b);
+                        im.swap(a, b);
+                    }
+                    spent = spent.saturating_add((end - idx) * 2);
+                    self.phase = if end == pairs.len() {
+                        FftPhase::Butterfly { len: 2, start: 0, k: 0 }
+                    } else {
+                        FftPhase::BitRev { idx: end }
+                    };
+                }
+                FftPhase::Butterfly { mut len, mut start, mut k } => {
+                    let tw = twiddles();
+                    let stride = TWIDDLE_N / len;
+                    let half = len / 2;
+                    let mut rem = left;
+
+                    while rem > 0 && start < n {
+                        if k == 0 && half <= rem {
+                            // Whole butterfly group at once via slice iterators
+                            // (same inner loop as `fft`).
+                            let groups = (rem / half).min((n - start) / len);
+                            let span = groups * len;
+                            let re_span = &mut re[start..start + span];
+                            let im_span = &mut im[start..start + span];
+                            for (rc, ic) in re_span.chunks_exact_mut(len).zip(im_span.chunks_exact_mut(len)) {
+                                let (r0, r1) = rc.split_at_mut(half);
+                                let (i0, i1) = ic.split_at_mut(half);
+                                for (((ur, ui), (xr, xi)), &(cr, ci)) in r0
+                                    .iter_mut()
+                                    .zip(i0.iter_mut())
+                                    .zip(r1.iter_mut().zip(i1.iter_mut()))
+                                    .zip(tw.iter().step_by(stride))
+                                {
+                                    let (u_re, u_im) = (*ur, *ui);
+                                    let (x_re, x_im) = (*xr, *xi);
+                                    let vr = x_re * cr - x_im * ci;
+                                    let vi = x_re * ci + x_im * cr;
+                                    *ur = u_re + vr;
+                                    *ui = u_im + vi;
+                                    *xr = u_re - vr;
+                                    *xi = u_im - vi;
+                                }
+                            }
+                            let did = groups * half;
+                            spent += did;
+                            rem -= did;
+                            start += span;
+                        } else {
+                            // Partial group for large stages (len > 2*rem).
+                            let count = rem.min(half - k);
+                            let end_k = k + count;
+                            let (r0, r1) = re[start..start + len].split_at_mut(half);
+                            let (i0, i1) = im[start..start + len].split_at_mut(half);
+                            for (((ur, ui), (xr, xi)), &(cr, ci)) in r0[k..end_k]
+                                .iter_mut()
+                                .zip(i0[k..end_k].iter_mut())
+                                .zip(r1[k..end_k].iter_mut().zip(i1[k..end_k].iter_mut()))
+                                .zip(tw[k * stride..].iter().step_by(stride))
+                            {
+                                let (u_re, u_im) = (*ur, *ui);
+                                let (x_re, x_im) = (*xr, *xi);
+                                let vr = x_re * cr - x_im * ci;
+                                let vi = x_re * ci + x_im * cr;
+                                *ur = u_re + vr;
+                                *ui = u_im + vi;
+                                *xr = u_re - vr;
+                                *xi = u_im - vi;
+                            }
+                            spent += count;
+                            rem -= count;
+                            k = end_k;
+                            if k == half {
+                                k = 0;
+                                start += len;
+                            }
+                        }
+                    }
+
+                    if start >= n {
+                        len <<= 1;
+                        if len <= n {
+                            self.phase = FftPhase::Butterfly { len, start: 0, k: 0 };
+                        } else if self.inverse {
+                            self.phase = FftPhase::Scale { i: 0 };
+                        } else {
+                            self.phase = FftPhase::Done;
+                        }
+                    } else {
+                        self.phase = FftPhase::Butterfly { len, start, k };
+                    }
+                }
+                FftPhase::Scale { i } => {
+                    let take = left.saturating_mul(2).max(1);
+                    let end = i.saturating_add(take).min(n);
+                    let inv = 1.0 / n as f32;
+                    for v in &mut re[i..end] {
+                        *v *= inv;
+                    }
+                    spent = spent.saturating_add((end - i).div_ceil(2));
+                    self.phase = if end == n {
+                        FftPhase::Done
+                    } else {
+                        FftPhase::Scale { i: end }
+                    };
+                }
+            }
+        }
+        spent
+    }
+}
+
 /// Magnitude of each bin up to Nyquist, given a completed transform.
 pub fn magnitudes(re: &[f32], im: &[f32]) -> Vec<f32> {
     let half = re.len() / 2 + 1;
@@ -387,6 +622,54 @@ mod tests {
             for idx in 0..n {
                 assert_eq!(re_a[idx].to_bits(), re_b[idx].to_bits(), "re mismatch at n={n} idx={idx}");
                 assert_eq!(im_a[idx].to_bits(), im_b[idx].to_bits(), "im mismatch at n={n} idx={idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn fft_stepper_is_bit_identical_to_fft_and_ifft_for_all_sizes_and_budgets() {
+        prime();
+        for pow in 1..=TWIDDLE_N.trailing_zeros() {
+            let n = 1usize << pow;
+            let mut seed = 0x9e37_79b9u32 ^ n as u32;
+            let mut base_re = Vec::with_capacity(n);
+            let mut base_im = Vec::with_capacity(n);
+            for _ in 0..n {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                base_re.push(((seed >> 8) as f32) / 8_388_608.0 - 1.0);
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                base_im.push(((seed >> 8) as f32) / 8_388_608.0 - 1.0);
+            }
+
+            let mut ref_fwd_re = base_re.clone();
+            let mut ref_fwd_im = base_im.clone();
+            assert!(fft(&mut ref_fwd_re, &mut ref_fwd_im));
+
+            let mut ref_inv_re = base_re.clone();
+            let mut ref_inv_im = base_im.clone();
+            crate::vstream::ifft(&mut ref_inv_re, &mut ref_inv_im);
+
+            for &budget in &[1usize, 17, 257, 4096, usize::MAX] {
+                let mut re = base_re.clone();
+                let mut im = base_im.clone();
+                let mut st = FftStepper::new(n, false);
+                while !st.is_done() {
+                    st.step(&mut re, &mut im, budget);
+                }
+                for idx in 0..n {
+                    assert_eq!(re[idx].to_bits(), ref_fwd_re[idx].to_bits(), "fwd re n={n} b={budget} idx={idx}");
+                    assert_eq!(im[idx].to_bits(), ref_fwd_im[idx].to_bits(), "fwd im n={n} b={budget} idx={idx}");
+                }
+
+                let mut re = base_re.clone();
+                let mut im = base_im.clone();
+                let mut st = FftStepper::new(n, true);
+                while !st.is_done() {
+                    st.step(&mut re, &mut im, budget);
+                }
+                for idx in 0..n {
+                    assert_eq!(re[idx].to_bits(), ref_inv_re[idx].to_bits(), "inv re n={n} b={budget} idx={idx}");
+                }
             }
         }
     }

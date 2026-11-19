@@ -28,7 +28,7 @@
 //! shared correction. Sharing the schedule between them is what keeps the two
 //! from drifting into different engines.
 
-use crate::fft::fft;
+use crate::fft::{fft, FftStepper};
 
 use crate::stream::{RingDirty, StretchParams, Streamer};
 
@@ -97,6 +97,188 @@ pub struct VocoderStream {
     dirty: RingDirty,
     /// Largest bin count written to the per-bin state since the last clear.
     dirty_bins: usize,
+    /// In-flight next analysis/resynthesis frame, stepped across blocks.
+    job: Option<VocoderJob>,
+    /// Voice/layer phase offset (0..8) so polyphonic voices stagger stage transitions.
+    stagger: usize,
+}
+
+/// One vocoder frame being computed incrementally ahead of its commit.
+///
+/// Holds no heap allocations; all buffers live in [`VocoderStream`]. Parameters
+/// are snapshotted when the frame begins so every stage sees one consistent
+/// setting, and the frame is committed into `acc`/`norm` only once `write < need`
+/// so the output ring never wraps over unread frames.
+#[derive(Clone, Copy)]
+struct VocoderJob {
+    channels: usize,
+    n: usize,
+    bins: usize,
+    hs: usize,
+    start: usize,
+    ha: f32,
+    rate: f32,
+    gl: f32,
+    gr: f32,
+    reverse: bool,
+    advance: f64,
+    next_hop: u64,
+    s: crate::vocoder::Settings,
+    stage: VocoderStage,
+    /// Set to `true` after the job's first staggered slice has run.
+    started: bool,
+}
+
+#[derive(Clone, Copy)]
+enum VocoderStage {
+    Window { ch: usize, i: usize },
+    FwdFft { ch: usize, stepper: FftStepper },
+    Polar { ch: usize, k: usize },
+    LinkMid { k: usize },
+    LinkPropInit,
+    LinkPropPeaks { p: usize, bins_done: usize },
+    LinkPropAll { k: usize },
+    LinkPropFinish,
+    LinkCart { ch: usize, k: usize },
+    IndepPropInit { ch: usize },
+    IndepPropPeaks { ch: usize, p: usize, bins_done: usize },
+    IndepPropAll { ch: usize, k: usize },
+    IndepPropFinish { ch: usize },
+    IndepCart { ch: usize, k: usize },
+    InvMirror { ch: usize },
+    InvFft { ch: usize, stepper: FftStepper },
+    Ready,
+}
+
+// Empirically calibrated butterfly-equivalent work units (~1.1 ns/unit on x86_64):
+// - Polar (`sqrt + atan2`): ~10 units/bin
+// - Propagate (`vocoder::wrap` per bin): ~64 units/bin
+// - Cartesian (`cos + sin`): ~7 units/bin
+const POLAR_WEIGHT: usize = 10;
+const CART_WEIGHT: usize = 7;
+const PROP_WEIGHT: usize = 64;
+
+impl VocoderJob {
+    fn is_ready(&self) -> bool {
+        matches!(self.stage, VocoderStage::Ready)
+    }
+
+    fn channel_analysis_work(n: usize, bins: usize) -> usize {
+        n / 2 + FftStepper::total_work(n, false) + bins * POLAR_WEIGHT + bins
+    }
+
+    fn channel_inv_work(n: usize) -> usize {
+        n / 4 + FftStepper::total_work(n, true)
+    }
+
+    fn phase_work(bins: usize, channels: usize, stereo_link: bool) -> usize {
+        if stereo_link && channels > 1 {
+            bins * POLAR_WEIGHT + bins * PROP_WEIGHT + channels * bins * CART_WEIGHT
+        } else {
+            channels * (bins * PROP_WEIGHT + bins * CART_WEIGHT)
+        }
+    }
+
+    fn frame_work(n: usize, channels: usize, stereo_link: bool) -> usize {
+        let bins = n / 2 + 1;
+        channels * Self::channel_analysis_work(n, bins)
+            + Self::phase_work(bins, channels, stereo_link)
+            + channels * Self::channel_inv_work(n)
+    }
+
+    fn remaining_work(&self) -> usize {
+        let n = self.n;
+        let bins = self.bins;
+        let chs = self.channels;
+        let link = self.s.stereo_link && chs > 1;
+        let all_inv = chs * Self::channel_inv_work(n);
+        let all_phase = Self::phase_work(bins, chs, link);
+        let one_an = Self::channel_analysis_work(n, bins);
+        let one_inv = Self::channel_inv_work(n);
+        match self.stage {
+            VocoderStage::Window { ch, i } => {
+                (n - i).div_ceil(2)
+                    + FftStepper::total_work(n, false)
+                    + bins * POLAR_WEIGHT
+                    + bins
+                    + (chs - 1 - ch) * one_an
+                    + all_phase
+                    + all_inv
+            }
+            VocoderStage::FwdFft { ch, stepper } => {
+                stepper.remaining_work()
+                    + bins * POLAR_WEIGHT
+                    + bins
+                    + (chs - 1 - ch) * one_an
+                    + all_phase
+                    + all_inv
+            }
+            VocoderStage::Polar { ch, k } => {
+                (bins - k) * POLAR_WEIGHT
+                    + bins
+                    + (chs - 1 - ch) * one_an
+                    + all_phase
+                    + all_inv
+            }
+            VocoderStage::LinkMid { k } => {
+                (bins - k) * POLAR_WEIGHT
+                    + bins * PROP_WEIGHT
+                    + chs * bins * CART_WEIGHT
+                    + all_inv
+            }
+            VocoderStage::LinkPropInit => {
+                bins * PROP_WEIGHT + chs * bins * CART_WEIGHT + all_inv
+            }
+            VocoderStage::LinkPropPeaks { bins_done, .. } => {
+                bins.saturating_sub(bins_done) * PROP_WEIGHT + chs * bins * CART_WEIGHT + all_inv
+            }
+            VocoderStage::LinkPropAll { k } => {
+                (bins - k) * PROP_WEIGHT + chs * bins * CART_WEIGHT + all_inv
+            }
+            VocoderStage::LinkPropFinish => {
+                bins * 2 + chs * bins * CART_WEIGHT + all_inv
+            }
+            VocoderStage::LinkCart { ch, k } => {
+                (bins - k) * CART_WEIGHT + (chs - 1 - ch) * bins * CART_WEIGHT + all_inv
+            }
+            VocoderStage::IndepPropInit { ch } => {
+                bins * PROP_WEIGHT
+                    + bins * CART_WEIGHT
+                    + (chs - 1 - ch) * (bins * PROP_WEIGHT + bins * CART_WEIGHT)
+                    + all_inv
+            }
+            VocoderStage::IndepPropPeaks { ch, bins_done, .. } => {
+                bins.saturating_sub(bins_done) * PROP_WEIGHT
+                    + bins * CART_WEIGHT
+                    + (chs - 1 - ch) * (bins * PROP_WEIGHT + bins * CART_WEIGHT)
+                    + all_inv
+            }
+            VocoderStage::IndepPropAll { ch, k } => {
+                (bins - k) * PROP_WEIGHT
+                    + bins * CART_WEIGHT
+                    + (chs - 1 - ch) * (bins * PROP_WEIGHT + bins * CART_WEIGHT)
+                    + all_inv
+            }
+            VocoderStage::IndepPropFinish { ch } => {
+                bins * 2
+                    + bins * CART_WEIGHT
+                    + (chs - 1 - ch) * (bins * PROP_WEIGHT + bins * CART_WEIGHT)
+                    + all_inv
+            }
+            VocoderStage::IndepCart { ch, k } => {
+                (bins - k) * CART_WEIGHT
+                    + (chs - 1 - ch) * (bins * PROP_WEIGHT + bins * CART_WEIGHT)
+                    + all_inv
+            }
+            VocoderStage::InvMirror { ch } => {
+                n / 4 + FftStepper::total_work(n, true) + (chs - 1 - ch) * one_inv
+            }
+            VocoderStage::InvFft { ch, stepper } => {
+                stepper.remaining_work() + (chs - 1 - ch) * one_inv
+            }
+            VocoderStage::Ready => 0,
+        }
+    }
 }
 
 impl Streamer for VocoderStream {
@@ -151,7 +333,14 @@ impl VocoderStream {
             ring,
             dirty: RingDirty::default(),
             dirty_bins: 0,
+            job: None,
+            stagger: 0,
         }
+    }
+
+    /// Assign a voice/layer index so polyphonic chords stagger stage transitions.
+    pub fn set_stagger(&mut self, id: usize) {
+        self.stagger = id & 7;
     }
 
     fn ensure_window(&mut self, n: usize, skew: f32) {
@@ -232,6 +421,7 @@ impl VocoderStream {
     /// put where the schedule says and the phase starts afresh, which is
     /// audible as a moment of re-anchoring and nothing worse.
     pub fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams) {
+        self.job = None;
         self.clear();
         self.emitted = out_frame;
         self.write = out_frame;
@@ -254,6 +444,629 @@ impl VocoderStream {
             advance * self.index as f64
         }
         .rem_euclid(span as f64);
+    }
+
+    /// Snapshot the next vocoder frame's schedule and parameters into `self.job`.
+    /// Returns `false` if the stream has reached the end of the source.
+    fn begin_job(&mut self, in_frames: usize, channels: usize, p: &StretchParams) -> bool {
+        let n = crate::stretch::fft_size_for(p.vocoder.window_ms, p.sample_rate).min(MAX_FFT);
+        let sr = p.sample_rate.max(1) as f32;
+        let bins = n / 2 + 1;
+        let hs = crate::stretch::hop_frames(&p.grain, n, sr).max(1);
+        let ratio = p.ratio.clamp(0.01, 100.0);
+        let g = p.grain;
+        let s = crate::vocoder::settings_for(p);
+
+        self.ensure_window(n, g.envelope);
+        self.ensure_floor(n, hs, g.envelope);
+
+        let skew = g.scan.clamp(-4.0, 4.0) as f64;
+        let advance = (hs as f64 / ratio as f64) * skew;
+        let span = in_frames.saturating_sub(n).max(1);
+        let pos_jitter = (g.position_jitter_ms / 1000.0) * sr;
+
+        let jitter = if pos_jitter > 0.0 {
+            (pos_jitter * g.rand_bipolar(self.index, g.salt(5))) as f64
+        } else {
+            0.0
+        };
+        // The jitter, plus this layer's own throw — layers that read the
+        // same instant and are laid down a fixed offset apart are a delay
+        // line, not a cloud.
+        let mut start = (self.read + jitter + g.layer_read as f64).max(0.0).round() as usize;
+        if start + n > in_frames {
+            // At the nominal hop, running out of source is the end of the
+            // job — a stretch shorter than the source reaches the end of
+            // the input before the end of the output, and the rest is
+            // silence rather than a wrap nobody asked for.
+            //
+            // Off it, the read pointer is sweeping at a speed with nothing
+            // to do with the output length, so wrap and keep going.
+            if (skew - 1.0).abs() < 1e-6 && !g.wrap {
+                self.ended = true;
+                return false;
+            }
+            self.read = self.read.rem_euclid(span as f64);
+            start = self.read.round() as usize;
+            if start + n > in_frames {
+                self.ended = true;
+                return false;
+            }
+            // A wrap is a discontinuity; a hop measured across it would be
+            // a large negative number and the phase estimate nonsense.
+            self.prev_start = -1;
+        }
+        let start = start.min(in_frames.saturating_sub(n));
+
+        let ha = if self.prev_start < 0 {
+            hs as f32
+        } else {
+            (start as isize - self.prev_start) as f32
+        };
+        let ha = if ha.abs() < 1e-6 { hs as f32 } else { ha };
+        let x = self.drift.place(self.write, sr, g.drift_rate_hz);
+        let rate = crate::stretch::grain_rate(&g, self.index, x);
+        let (gl, gr) = crate::grain::pan_gains(&g, self.index, channels);
+        let next_hop = crate::stretch::grain_size(&g, self.index, hs).max(1) as u64;
+
+        self.dirty_bins = self.dirty_bins.max(bins);
+        self.job = Some(VocoderJob {
+            channels,
+            n,
+            bins,
+            hs,
+            start,
+            ha,
+            rate,
+            gl,
+            gr,
+            reverse: g.reverse,
+            advance,
+            next_hop,
+            s,
+            stage: VocoderStage::Window { ch: 0, i: 0 },
+            started: false,
+        });
+        true
+    }
+
+    /// Advance the in-flight frame by at most `budget` butterfly-equivalent
+    /// work units, returning how many units were spent.
+    fn step_job(&mut self, input: &[f32], budget: usize) -> usize {
+        let Some(mut job) = self.job else { return 0 };
+        if job.is_ready() {
+            return 0;
+        }
+        job.started = true;
+        let cap = budget.max(1);
+        let mut spent = 0usize;
+        let n = job.n;
+        let bins = job.bins;
+        let channels = job.channels;
+
+        while spent < cap {
+            let left = cap - spent;
+            match job.stage {
+                VocoderStage::Ready => break,
+                VocoderStage::Window { ch, i } => {
+                    let ro = ch * MAX_FFT;
+                    let take = (left.saturating_mul(2)).max(1);
+                    let end = i.saturating_add(take).min(n);
+                    let win = &self.win[..n];
+                    let re = &mut self.re[ro..ro + n];
+                    let im = &mut self.im[ro..ro + n];
+                    if job.reverse {
+                        for idx in i..end {
+                            let j = n - 1 - idx;
+                            re[idx] = input[(job.start + j) * channels + ch] * win[idx];
+                            im[idx] = 0.0;
+                        }
+                    } else {
+                        for idx in i..end {
+                            re[idx] = input[(job.start + idx) * channels + ch] * win[idx];
+                            im[idx] = 0.0;
+                        }
+                    }
+                    spent = spent.saturating_add((end - i).div_ceil(2));
+                    job.stage = if end == n {
+                        VocoderStage::FwdFft { ch, stepper: FftStepper::new(n, false) }
+                    } else {
+                        VocoderStage::Window { ch, i: end }
+                    };
+                }
+                VocoderStage::FwdFft { ch, mut stepper } => {
+                    let ro = ch * MAX_FFT;
+                    spent = spent.saturating_add(stepper.step(
+                        &mut self.re[ro..ro + n],
+                        &mut self.im[ro..ro + n],
+                        left,
+                    ));
+                    job.stage = if stepper.is_done() {
+                        VocoderStage::Polar { ch, k: 0 }
+                    } else {
+                        VocoderStage::FwdFft { ch, stepper }
+                    };
+                }
+                VocoderStage::Polar { ch, k } => {
+                    let ro = ch * MAX_FFT;
+                    let bo = ch * (MAX_FFT / 2 + 1);
+                    let take = (left / POLAR_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    for idx in k..end {
+                        let (r, i) = (self.re[ro + idx], self.im[ro + idx]);
+                        self.mag[bo + idx] = (r * r + i * i).sqrt();
+                        self.phase[bo + idx] = i.atan2(r);
+                    }
+                    spent = spent.saturating_add((end - k) * POLAR_WEIGHT);
+                    if end == bins {
+                        crate::vocoder::shape_magnitudes(
+                            &mut self.mag[bo..bo + bins],
+                            &mut self.held[bo..bo + bins],
+                            &mut self.scratch[..bins],
+                            &job.s,
+                            self.first,
+                        );
+                        spent = spent.saturating_add(bins);
+                        job.stage = if ch + 1 < channels {
+                            VocoderStage::Window { ch: ch + 1, i: 0 }
+                        } else if job.s.stereo_link && channels > 1 {
+                            VocoderStage::LinkMid { k: 0 }
+                        } else {
+                            VocoderStage::IndepPropInit { ch: 0 }
+                        };
+                    } else {
+                        job.stage = VocoderStage::Polar { ch, k: end };
+                    }
+                }
+                VocoderStage::LinkMid { k } => {
+                    let take = (left / POLAR_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    for idx in k..end {
+                        let (mut sr, mut si) = (0.0f32, 0.0f32);
+                        for c in 0..channels {
+                            sr += self.re[c * MAX_FFT + idx];
+                            si += self.im[c * MAX_FFT + idx];
+                        }
+                        self.ref_mag[idx] = (sr * sr + si * si).sqrt();
+                        self.ref_phase[idx] = si.atan2(sr);
+                    }
+                    spent = spent.saturating_add((end - k) * POLAR_WEIGHT);
+                    job.stage = if end == bins {
+                        VocoderStage::LinkPropInit
+                    } else {
+                        VocoderStage::LinkMid { k: end }
+                    };
+                }
+                VocoderStage::LinkPropInit => {
+                    if self.first {
+                        self.link_sum[..bins].copy_from_slice(&self.ref_phase[..bins]);
+                        spent = spent.saturating_add(bins);
+                        job.stage = VocoderStage::LinkPropFinish;
+                    } else if !job.s.phase_lock {
+                        job.stage = VocoderStage::LinkPropAll { k: 0 };
+                    } else {
+                        crate::vocoder::peaks(
+                            &self.ref_mag[..bins],
+                            job.s.peak_width.clamp(1, 32),
+                            &mut self.peak_idx,
+                        );
+                        spent = spent.saturating_add(bins * 2);
+                        job.stage = if self.peak_idx.is_empty() {
+                            VocoderStage::LinkPropAll { k: 0 }
+                        } else {
+                            VocoderStage::LinkPropPeaks { p: 0, bins_done: 0 }
+                        };
+                    }
+                }
+                VocoderStage::LinkPropPeaks { mut p, mut bins_done } => {
+                    let trust = job.s.freq_trust.clamp(0.0, 4.0);
+                    let spread = job.s.phase_spread.clamp(0.0, 4.0);
+                    let width = job.s.lock_width.clamp(0.0, 4.0);
+                    let total_peaks = self.peak_idx.len();
+                    while p < total_peaks && spent < cap {
+                        let touched = crate::vocoder::propagate_peaks_range(
+                            &self.ref_phase[..bins],
+                            &self.prev_ref[..bins],
+                            &mut self.link_sum[..bins],
+                            &self.peak_idx,
+                            p,
+                            p + 1,
+                            n,
+                            job.ha,
+                            job.hs as f32,
+                            trust,
+                            spread,
+                            width,
+                        );
+                        p += 1;
+                        bins_done = bins_done.saturating_add(touched).min(bins);
+                        spent = spent.saturating_add(touched * PROP_WEIGHT);
+                    }
+                    job.stage = if p >= total_peaks {
+                        VocoderStage::LinkPropFinish
+                    } else {
+                        VocoderStage::LinkPropPeaks { p, bins_done }
+                    };
+                }
+                VocoderStage::LinkPropAll { k } => {
+                    let take = (left / PROP_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    crate::vocoder::propagate_all_range(
+                        &self.ref_phase[..bins],
+                        &self.prev_ref[..bins],
+                        &mut self.link_sum[..bins],
+                        k,
+                        end,
+                        n,
+                        job.ha,
+                        job.hs as f32,
+                        &job.s,
+                    );
+                    spent = spent.saturating_add((end - k) * PROP_WEIGHT);
+                    job.stage = if end == bins {
+                        VocoderStage::LinkPropFinish
+                    } else {
+                        VocoderStage::LinkPropAll { k: end }
+                    };
+                }
+                VocoderStage::LinkPropFinish => {
+                    if (job.rate - 1.0).abs() > 1e-6 {
+                        for k in 0..bins {
+                            self.link_sum[k] = wrap(self.link_sum[k] * job.rate);
+                        }
+                    }
+                    for k in 0..bins {
+                        self.corr[k] = wrap(self.link_sum[k] - self.ref_phase[k]);
+                    }
+                    self.prev_ref[..bins].copy_from_slice(&self.ref_phase[..bins]);
+                    spent = spent.saturating_add(bins * 2);
+                    job.stage = VocoderStage::LinkCart { ch: 0, k: 0 };
+                }
+                VocoderStage::LinkCart { ch, k } => {
+                    let bo = ch * (MAX_FFT / 2 + 1);
+                    let ro = ch * MAX_FFT;
+                    let take = (left / CART_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    for idx in k..end {
+                        let p = self.phase[bo + idx] + self.corr[idx];
+                        let m = self.mag[bo + idx];
+                        self.re[ro + idx] = m * p.cos();
+                        self.im[ro + idx] = m * p.sin();
+                    }
+                    spent = spent.saturating_add((end - k) * CART_WEIGHT);
+                    job.stage = if end == bins {
+                        if ch + 1 < channels {
+                            VocoderStage::LinkCart { ch: ch + 1, k: 0 }
+                        } else {
+                            VocoderStage::InvMirror { ch: 0 }
+                        }
+                    } else {
+                        VocoderStage::LinkCart { ch, k: end }
+                    };
+                }
+                VocoderStage::IndepPropInit { ch } => {
+                    let bo = ch * (MAX_FFT / 2 + 1);
+                    if self.first {
+                        self.sum_phase[bo..bo + bins].copy_from_slice(&self.phase[bo..bo + bins]);
+                        spent = spent.saturating_add(bins);
+                        job.stage = VocoderStage::IndepPropFinish { ch };
+                    } else if !job.s.phase_lock {
+                        job.stage = VocoderStage::IndepPropAll { ch, k: 0 };
+                    } else {
+                        crate::vocoder::peaks(
+                            &self.mag[bo..bo + bins],
+                            job.s.peak_width.clamp(1, 32),
+                            &mut self.peak_idx,
+                        );
+                        spent = spent.saturating_add(bins * 2);
+                        job.stage = if self.peak_idx.is_empty() {
+                            VocoderStage::IndepPropAll { ch, k: 0 }
+                        } else {
+                            VocoderStage::IndepPropPeaks { ch, p: 0, bins_done: 0 }
+                        };
+                    }
+                }
+                VocoderStage::IndepPropPeaks { ch, mut p, mut bins_done } => {
+                    let bo = ch * (MAX_FFT / 2 + 1);
+                    let trust = job.s.freq_trust.clamp(0.0, 4.0);
+                    let spread = job.s.phase_spread.clamp(0.0, 4.0);
+                    let width = job.s.lock_width.clamp(0.0, 4.0);
+                    let total_peaks = self.peak_idx.len();
+                    while p < total_peaks && spent < cap {
+                        let touched = crate::vocoder::propagate_peaks_range(
+                            &self.phase[bo..bo + bins],
+                            &self.prev_phase[bo..bo + bins],
+                            &mut self.sum_phase[bo..bo + bins],
+                            &self.peak_idx,
+                            p,
+                            p + 1,
+                            n,
+                            job.ha,
+                            job.hs as f32,
+                            trust,
+                            spread,
+                            width,
+                        );
+                        p += 1;
+                        bins_done = bins_done.saturating_add(touched).min(bins);
+                        spent = spent.saturating_add(touched * PROP_WEIGHT);
+                    }
+                    job.stage = if p >= total_peaks {
+                        VocoderStage::IndepPropFinish { ch }
+                    } else {
+                        VocoderStage::IndepPropPeaks { ch, p, bins_done }
+                    };
+                }
+                VocoderStage::IndepPropAll { ch, k } => {
+                    let bo = ch * (MAX_FFT / 2 + 1);
+                    let take = (left / PROP_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    crate::vocoder::propagate_all_range(
+                        &self.phase[bo..bo + bins],
+                        &self.prev_phase[bo..bo + bins],
+                        &mut self.sum_phase[bo..bo + bins],
+                        k,
+                        end,
+                        n,
+                        job.ha,
+                        job.hs as f32,
+                        &job.s,
+                    );
+                    spent = spent.saturating_add((end - k) * PROP_WEIGHT);
+                    job.stage = if end == bins {
+                        VocoderStage::IndepPropFinish { ch }
+                    } else {
+                        VocoderStage::IndepPropAll { ch, k: end }
+                    };
+                }
+                VocoderStage::IndepPropFinish { ch } => {
+                    let bo = ch * (MAX_FFT / 2 + 1);
+                    if (job.rate - 1.0).abs() > 1e-6 {
+                        for k in 0..bins {
+                            self.sum_phase[bo + k] = wrap(self.sum_phase[bo + k] * job.rate);
+                        }
+                    }
+                    self.prev_phase[bo..bo + bins].copy_from_slice(&self.phase[bo..bo + bins]);
+                    spent = spent.saturating_add(bins * 2);
+                    job.stage = VocoderStage::IndepCart { ch, k: 0 };
+                }
+                VocoderStage::IndepCart { ch, k } => {
+                    let bo = ch * (MAX_FFT / 2 + 1);
+                    let ro = ch * MAX_FFT;
+                    let take = (left / CART_WEIGHT).max(1);
+                    let end = k.saturating_add(take).min(bins);
+                    for idx in k..end {
+                        let m = self.mag[bo + idx];
+                        let p = self.sum_phase[bo + idx];
+                        self.re[ro + idx] = m * p.cos();
+                        self.im[ro + idx] = m * p.sin();
+                    }
+                    spent = spent.saturating_add((end - k) * CART_WEIGHT);
+                    job.stage = if end == bins {
+                        if ch + 1 < channels {
+                            VocoderStage::IndepPropInit { ch: ch + 1 }
+                        } else {
+                            VocoderStage::InvMirror { ch: 0 }
+                        }
+                    } else {
+                        VocoderStage::IndepCart { ch, k: end }
+                    };
+                }
+                VocoderStage::InvMirror { ch } => {
+                    let ro = ch * MAX_FFT;
+                    for k in bins..n {
+                        self.re[ro + k] = self.re[ro + n - k];
+                        self.im[ro + k] = -self.im[ro + n - k];
+                    }
+                    self.im[ro] = 0.0;
+                    if n % 2 == 0 {
+                        self.im[ro + n / 2] = 0.0;
+                    }
+                    spent = spent.saturating_add(n / 4);
+                    job.stage = VocoderStage::InvFft { ch, stepper: FftStepper::new(n, true) };
+                }
+                VocoderStage::InvFft { ch, mut stepper } => {
+                    let ro = ch * MAX_FFT;
+                    spent = spent.saturating_add(stepper.step(
+                        &mut self.re[ro..ro + n],
+                        &mut self.im[ro..ro + n],
+                        left,
+                    ));
+                    job.stage = if stepper.is_done() {
+                        if ch + 1 < channels {
+                            VocoderStage::InvMirror { ch: ch + 1 }
+                        } else {
+                            VocoderStage::Ready
+                        }
+                    } else {
+                        VocoderStage::InvFft { ch, stepper }
+                    };
+                }
+            }
+        }
+        self.job = Some(job);
+        spent
+    }
+
+    /// Overlap-add a finished `VocoderJob` into the output ring and advance
+    /// the frame schedule. Caller ensures `self.write + job.n <= self.emitted + self.ring`.
+    fn commit_job(&mut self) {
+        let Some(job) = self.job.take() else { return };
+        debug_assert!(job.is_ready());
+        let n = job.n;
+        let stride = self.channels;
+        let win = &self.win[..n];
+        for c in 0..job.channels {
+            let ro = c * MAX_FFT;
+            let pan = if c == 0 { job.gl } else { job.gr };
+            let re_c = &self.re[ro..ro + n];
+            let mut done = 0usize;
+            let mut slot = (self.write % self.ring as u64) as usize;
+            while done < n {
+                let run = (n - done).min(self.ring - slot);
+                let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                for ((a, &r), &w) in acc
+                    .chunks_exact_mut(stride)
+                    .zip(&re_c[done..done + run])
+                    .zip(&win[done..done + run])
+                {
+                    a[c] += r * w * pan;
+                }
+                done += run;
+                slot = 0;
+            }
+        }
+        {
+            let mut done = 0usize;
+            let mut slot = (self.write % self.ring as u64) as usize;
+            while done < n {
+                let run = (n - done).min(self.ring - slot);
+                for (dst, &w) in self.norm[slot..slot + run]
+                    .iter_mut()
+                    .zip(&win[done..done + run])
+                {
+                    *dst += w * w;
+                }
+                done += run;
+                slot = 0;
+            }
+        }
+        self.dirty.mark(self.write, self.write + n as u64);
+
+        self.prev_start = job.start as isize;
+        self.first = false;
+        self.read += job.advance;
+        self.write += job.next_hop;
+        self.index += 1;
+    }
+
+    /// Hand out `frames` finished output samples from the ring and clear their slots.
+    fn emit_frames(&mut self, out: &mut [f32], frames: usize, channels: usize) {
+        let need = self.emitted + frames as u64;
+        let stride = self.channels;
+        let floor = self.floor;
+        let mut done = 0usize;
+        let mut slot = (self.emitted % self.ring as u64) as usize;
+        while done < frames {
+            let run = (frames - done).min(self.ring - slot);
+            let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+            let norm = &mut self.norm[slot..slot + run];
+            let dst = &mut out[done * channels..(done + run) * channels];
+            for ((a, nm), o) in acc
+                .chunks_exact_mut(stride)
+                .zip(norm.iter_mut())
+                .zip(dst.chunks_exact_mut(channels))
+            {
+                let d = nm.max(floor);
+                for ch in 0..channels {
+                    let v = a[ch];
+                    o[ch] = if d > 1e-6 { v / d } else { v };
+                }
+                a.fill(0.0);
+                *nm = 0.0;
+            }
+            done += run;
+            slot = 0;
+        }
+        self.dirty.cleared_prefix(self.emitted, need, self.ring);
+        self.emitted = need;
+    }
+
+    /// Estimated remaining work units to push `self.write` up to `target_write`
+    /// output frames (used by [`crate::pstream::PvsolaStream`] to pace rounds).
+    pub(crate) fn remaining_work_for(&self, target_write: usize, channels: usize, p: &StretchParams) -> usize {
+        if self.ended {
+            return 0;
+        }
+        let channels = channels.max(1).min(self.channels);
+        let target = target_write as u64;
+        if self.write >= target {
+            return 0;
+        }
+        let n = crate::stretch::fft_size_for(p.vocoder.window_ms, p.sample_rate).min(MAX_FFT);
+        let sr = p.sample_rate.max(1) as f32;
+        let hs = crate::stretch::hop_frames(&p.grain, n, sr).max(1) as u64;
+        let one_frame = VocoderJob::frame_work(n, channels, p.vocoder.stereo_link);
+        if let Some(job) = self.job {
+            let after_job = self.write + job.next_hop;
+            let extra_frames = if after_job < target {
+                ((target - after_job) as usize).div_ceil(hs as usize)
+            } else {
+                0
+            };
+            job.remaining_work() + extra_frames * one_frame
+        } else {
+            let frames_needed = ((target - self.write) as usize).div_ceil(hs as usize);
+            frames_needed * one_frame
+        }
+    }
+
+    /// Advance by at most `budget` work units and emit as many finished frames
+    /// (up to `out.len() / channels`) as are now ready. Used by PVSOLA to spread
+    /// even the first vocoder frame of a round across callbacks.
+    ///
+    /// Returns the number of output frames written into `out`.
+    pub(crate) fn render_budgeted(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        input: &[f32],
+        p: &StretchParams,
+        budget: usize,
+    ) -> usize {
+        let channels = channels.max(1).min(self.channels);
+        let max_frames = out.len() / channels;
+        if max_frames == 0 {
+            return 0;
+        }
+        if budget == usize::MAX {
+            self.render(out, channels, input, p);
+            return max_frames;
+        }
+        let in_frames = input.len() / channels;
+        if in_frames == 0 {
+            out.fill(0.0);
+            return max_frames;
+        }
+        let n = crate::stretch::fft_size_for(p.vocoder.window_ms, p.sample_rate).min(MAX_FFT);
+        if in_frames < n {
+            self.render(out, channels, input, p);
+            return max_frames;
+        }
+        if let Some(job) = self.job {
+            if job.channels != channels || job.start + job.n > in_frames {
+                self.job = None;
+            }
+        }
+
+        let target = self.emitted + max_frames as u64;
+        let mut spent = 0usize;
+        let cap = budget.max(1);
+        while spent < cap && self.write < target && !self.ended {
+            if self.job.is_none() && !self.begin_job(in_frames, channels, p) {
+                break;
+            }
+            spent = spent.saturating_add(self.step_job(input, cap - spent));
+            if let Some(job) = self.job {
+                if job.is_ready() {
+                    if self.write + job.n as u64 <= self.emitted + self.ring as u64 {
+                        self.commit_job();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let avail = if self.ended {
+            max_frames
+        } else {
+            self.write.saturating_sub(self.emitted).min(max_frames as u64) as usize
+        };
+        if avail > 0 {
+            self.emit_frames(&mut out[..avail * channels], avail, channels);
+        }
+        avail
     }
 
     /// Fill one block. Must not allocate.
@@ -280,294 +1093,43 @@ impl VocoderStream {
             return;
         }
 
-        let sr = p.sample_rate.max(1) as f32;
-        let bins = n / 2 + 1;
-        let hs = crate::stretch::hop_frames(&p.grain, n, sr).max(1);
-        let ratio = p.ratio.clamp(0.01, 100.0);
-        let g = p.grain;
-        let s = &crate::vocoder::settings_for(p);
-
-        self.ensure_window(n, g.envelope);
-        self.ensure_floor(n, hs, g.envelope);
-
-        let skew = g.scan.clamp(-4.0, 4.0) as f64;
-        let advance = (hs as f64 / ratio as f64) * skew;
-        let span = in_frames.saturating_sub(n).max(1);
-        let pos_jitter = (g.position_jitter_ms / 1000.0) * sr;
+        if let Some(job) = self.job {
+            if job.channels != channels || job.start + job.n > in_frames {
+                self.job = None;
+            }
+        }
 
         let need = self.emitted + frames as u64;
         while self.write < need && !self.ended {
-            let jitter = if pos_jitter > 0.0 {
-                (pos_jitter * g.rand_bipolar(self.index, g.salt(5))) as f64
-            } else {
-                0.0
-            };
-            // The jitter, plus this layer's own throw — layers that read the
-            // same instant and are laid down a fixed offset apart are a delay
-            // line, not a cloud.
-            let mut start = (self.read + jitter + g.layer_read as f64).max(0.0).round() as usize;
-            if start + n > in_frames {
-                // At the nominal hop, running out of source is the end of the
-                // job — a stretch shorter than the source reaches the end of
-                // the input before the end of the output, and the rest is
-                // silence rather than a wrap nobody asked for.
-                //
-                // Off it, the read pointer is sweeping at a speed with nothing
-                // to do with the output length, so wrap and keep going.
-                if (skew - 1.0).abs() < 1e-6 && !g.wrap {
-                    self.ended = true;
-                    break;
-                }
-                self.read = self.read.rem_euclid(span as f64);
-                start = self.read.round() as usize;
-                if start + n > in_frames {
-                    self.ended = true;
-                    break;
-                }
-                // A wrap is a discontinuity; a hop measured across it would be
-                // a large negative number and the phase estimate nonsense.
-                self.prev_start = -1;
+            if self.job.is_none() && !self.begin_job(in_frames, channels, p) {
+                break;
             }
-            let start = start.min(in_frames.saturating_sub(n));
-
-            // Analyse every channel.
-            self.dirty_bins = self.dirty_bins.max(bins);
-            for c in 0..channels {
-                let ro = c * MAX_FFT;
-                let bo = c * (MAX_FFT / 2 + 1);
-                for i in 0..n {
-                    let j = if g.reverse { n - 1 - i } else { i };
-                    self.re[ro + i] = input[(start + j) * channels + c] * self.win[i];
-                    self.im[ro + i] = 0.0;
-                }
-                if !fft(&mut self.re[ro..ro + n], &mut self.im[ro..ro + n]) {
-                    return;
-                }
-                for k in 0..bins {
-                    let (r, i) = (self.re[ro + k], self.im[ro + k]);
-                    self.mag[bo + k] = (r * r + i * i).sqrt();
-                    self.phase[bo + k] = i.atan2(r);
-                }
-                crate::vocoder::shape_magnitudes(
-                    &mut self.mag[bo..bo + bins],
-                    &mut self.held[bo..bo + bins],
-                    &mut self.scratch[..bins],
-                    s,
-                    self.first,
-                );
-            }
-
-            let ha = if self.prev_start < 0 {
-                hs as f32
-            } else {
-                (start as isize - self.prev_start) as f32
-            };
-            let ha = if ha.abs() < 1e-6 { hs as f32 } else { ha };
-            let x = self.drift.place(self.write, sr, g.drift_rate_hz);
-            let rate = crate::stretch::grain_rate(&g, self.index, x);
-
-            if s.stereo_link && channels > 1 {
-                self.link(n, bins, channels, ha, hs, rate, s);
-            } else {
-                self.independent(n, bins, channels, ha, hs, rate, s);
-            }
-
-            self.prev_start = start as isize;
-            self.first = false;
-
-            // Resynthesise and overlap-add into the ring.
-            let (gl, gr) = crate::grain::pan_gains(&g, self.index, channels);
-            for c in 0..channels {
-                let ro = c * MAX_FFT;
-                for k in bins..n {
-                    self.re[ro + k] = self.re[ro + n - k];
-                    self.im[ro + k] = -self.im[ro + n - k];
-                }
-                self.im[ro] = 0.0;
-                if n % 2 == 0 {
-                    self.im[ro + n / 2] = 0.0;
-                }
-                ifft(&mut self.re[ro..ro + n], &mut self.im[ro..ro + n]);
-
-                let pan = if c == 0 { gl } else { gr };
-                let re_c = &self.re[ro..ro + n];
-                let win = &self.win[..n];
-                let stride = self.channels;
-                let mut done = 0usize;
-                let mut slot = (self.write % self.ring as u64) as usize;
-                while done < n {
-                    let run = (n - done).min(self.ring - slot);
-                    let acc = &mut self.acc[slot * stride..(slot + run) * stride];
-                    for ((a, &r), &w) in acc
-                        .chunks_exact_mut(stride)
-                        .zip(&re_c[done..done + run])
-                        .zip(&win[done..done + run])
-                    {
-                        a[c] += r * w * pan;
-                    }
-                    done += run;
-                    slot = 0;
-                }
-            }
-            {
-                let win = &self.win[..n];
-                let mut done = 0usize;
-                let mut slot = (self.write % self.ring as u64) as usize;
-                while done < n {
-                    let run = (n - done).min(self.ring - slot);
-                    for (dst, &w) in self.norm[slot..slot + run]
-                        .iter_mut()
-                        .zip(&win[done..done + run])
-                    {
-                        *dst += w * w;
-                    }
-                    done += run;
-                    slot = 0;
-                }
-            }
-            self.dirty.mark(self.write, self.write + n as u64);
-
-            self.read += advance;
-            self.write += crate::stretch::grain_size(&g, self.index, hs).max(1) as u64;
-            self.index += 1;
+            self.step_job(input, usize::MAX);
+            self.commit_job();
         }
 
         // Hand out what is finished, and clear it for reuse.
-        {
-            let stride = self.channels;
-            let floor = self.floor;
-            let mut done = 0usize;
-            let mut slot = (self.emitted % self.ring as u64) as usize;
-            while done < frames {
-                let run = (frames - done).min(self.ring - slot);
-                let acc = &mut self.acc[slot * stride..(slot + run) * stride];
-                let norm = &mut self.norm[slot..slot + run];
-                let dst = &mut out[done * channels..(done + run) * channels];
-                for ((a, nm), o) in acc
-                    .chunks_exact_mut(stride)
-                    .zip(norm.iter_mut())
-                    .zip(dst.chunks_exact_mut(channels))
-                {
-                    let d = nm.max(floor);
-                    for ch in 0..channels {
-                        let v = a[ch];
-                        o[ch] = if d > 1e-6 { v / d } else { v };
+        self.emit_frames(out, frames, channels);
+
+        // Spread the next frame across the blocks between now and when `self.write`
+        // is needed again. Only begin a brand-new job ahead when there is at least
+        // one block of runway (`rem_frames > 0`), so large blocks (`frames >= hop`)
+        // never compute two frames in one callback.
+        if !self.ended && self.write >= self.emitted {
+            let rem_frames = (self.write - self.emitted) as usize;
+            if self.job.is_none() && rem_frames > 0 {
+                let _ = self.begin_job(in_frames, channels, p);
+            }
+            if let Some(job) = self.job {
+                if !job.is_ready() {
+                    let blocks_left = (rem_frames / frames.max(1)) + 1;
+                    let rem_work = job.remaining_work();
+                    let mut budget = rem_work.div_ceil(blocks_left).max(1);
+                    if !job.started && self.stagger > 0 && blocks_left > 1 {
+                        budget = ((budget * (8 - self.stagger)) / 8).max(1);
                     }
-                    a.fill(0.0);
-                    *nm = 0.0;
+                    self.step_job(input, budget);
                 }
-                done += run;
-                slot = 0;
-            }
-        }
-        self.dirty.cleared_prefix(self.emitted, need, self.ring);
-        self.emitted = need;
-    }
-
-    /// Each channel propagates its own phase. The usual choice, and the one
-    /// that lets two channels drift apart — which widens an image and hollows
-    /// anything centred.
-    #[allow(clippy::too_many_arguments)]
-    fn independent(
-        &mut self,
-        n: usize,
-        bins: usize,
-        channels: usize,
-        ha: f32,
-        hs: usize,
-        rate: f32,
-        s: &crate::vocoder::Settings,
-    ) {
-        for c in 0..channels {
-            let bo = c * (MAX_FFT / 2 + 1);
-            let ro = c * MAX_FFT;
-            if self.first {
-                self.sum_phase[bo..bo + bins].copy_from_slice(&self.phase[bo..bo + bins]);
-            } else {
-                crate::vocoder::propagate(
-                    &self.phase[bo..bo + bins],
-                    &self.prev_phase[bo..bo + bins],
-                    &mut self.sum_phase[bo..bo + bins],
-                    &self.mag[bo..bo + bins],
-                    &mut self.peak_idx,
-                    n,
-                    ha,
-                    hs as f32,
-                    s,
-                );
-            }
-            if (rate - 1.0).abs() > 1e-6 {
-                for k in 0..bins {
-                    self.sum_phase[bo + k] = wrap(self.sum_phase[bo + k] * rate);
-                }
-            }
-            self.prev_phase[bo..bo + bins].copy_from_slice(&self.phase[bo..bo + bins]);
-            for k in 0..bins {
-                let m = self.mag[bo + k];
-                let p = self.sum_phase[bo + k];
-                self.re[ro + k] = m * p.cos();
-                self.im[ro + k] = m * p.sin();
-            }
-        }
-    }
-
-    /// One correction, taken from the channel sum and applied to all of them, so
-    /// what each channel was doing relative to the others survives the stretch.
-    #[allow(clippy::too_many_arguments)]
-    fn link(
-        &mut self,
-        n: usize,
-        bins: usize,
-        channels: usize,
-        ha: f32,
-        hs: usize,
-        rate: f32,
-        s: &crate::vocoder::Settings,
-    ) {
-        // The mid signal's spectrum, without a second transform.
-        for k in 0..bins {
-            let (mut sr, mut si) = (0.0f32, 0.0f32);
-            for c in 0..channels {
-                sr += self.re[c * MAX_FFT + k];
-                si += self.im[c * MAX_FFT + k];
-            }
-            self.ref_mag[k] = (sr * sr + si * si).sqrt();
-            self.ref_phase[k] = si.atan2(sr);
-        }
-
-        if self.first {
-            self.link_sum[..bins].copy_from_slice(&self.ref_phase[..bins]);
-        } else {
-            crate::vocoder::propagate(
-                &self.ref_phase[..bins],
-                &self.prev_ref[..bins],
-                &mut self.link_sum[..bins],
-                &self.ref_mag[..bins],
-                &mut self.peak_idx,
-                n,
-                ha,
-                hs as f32,
-                s,
-            );
-        }
-        if (rate - 1.0).abs() > 1e-6 {
-            for k in 0..bins {
-                self.link_sum[k] = wrap(self.link_sum[k] * rate);
-            }
-        }
-        for k in 0..bins {
-            self.corr[k] = wrap(self.link_sum[k] - self.ref_phase[k]);
-        }
-        self.prev_ref[..bins].copy_from_slice(&self.ref_phase[..bins]);
-
-        for c in 0..channels {
-            let bo = c * (MAX_FFT / 2 + 1);
-            let ro = c * MAX_FFT;
-            for k in 0..bins {
-                let p = self.phase[bo + k] + self.corr[k];
-                let m = self.mag[bo + k];
-                self.re[ro + k] = m * p.cos();
-                self.im[ro + k] = m * p.sin();
             }
         }
     }
@@ -722,8 +1284,47 @@ mod tests {
         let s = spec(3.0);
         let a = streamed(&src, 2, &s, 64);
         let b = streamed(&src, 2, &s, 1024);
-        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        assert!(worst < 1e-6, "the block size changed the audio by {worst:.2e}");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "bit mismatch at sample {i}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn spread_frames_and_stagger_are_bit_identical_when_params_hold_still() {
+        let src = chord(0.5, 2);
+        for &(ratio, link) in &[(0.5f32, false), (1.0, false), (2.0, false), (2.0, true)] {
+            let mut s = spec(ratio);
+            s.vocoder.stereo_link = link;
+            let reference = if (ratio - 1.0).abs() < 1e-6 {
+                streamed(&src, 2, &s, 2048)
+            } else {
+                s.process(&src, 2, RATE)
+            };
+            let p = params(&s);
+            let in_frames = src.len() / 2;
+            let want = reference.len() / 2;
+            for stagger in [0usize, 3, 7] {
+                let mut vs = VocoderStream::new(64, 2);
+                vs.set_stagger(stagger);
+                vs.seek(0, in_frames, &p);
+                let mut out = vec![0f32; want * 2];
+                let mut at = 0usize;
+                let mut buf = vec![0f32; 64 * 2];
+                while at < want {
+                    let n = 64.min(want - at);
+                    vs.render(&mut buf[..n * 2], 2, &src, &p);
+                    out[at * 2..(at + n) * 2].copy_from_slice(&buf[..n * 2]);
+                    at += n;
+                }
+                for (i, (a, b)) in reference.iter().zip(&out).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "ratio={ratio} link={link} stagger={stagger} sample {i}: {a} vs {b}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
