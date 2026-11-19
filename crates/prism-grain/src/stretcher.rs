@@ -24,11 +24,7 @@ use crate::stretch::Algorithm;
 use crate::vstream::VocoderStream;
 
 use crate::render::{BlockRenderer, Source};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// Monotonic voice index used to stagger FFT frame schedules across polyphonic voices.
-static NEXT_VOICE_STAGGER: AtomicUsize = AtomicUsize::new(0);
 
 /// Extra engine instances, for layers past the first.
 ///
@@ -59,6 +55,17 @@ impl LayerBank {
         channels: usize,
         sample_rate: u32,
     ) -> LayerBank {
+        Self::build_with_stagger(algorithm, layers, max_block, channels, sample_rate, 0)
+    }
+
+    fn build_with_stagger(
+        algorithm: Algorithm,
+        layers: u32,
+        max_block: usize,
+        channels: usize,
+        sample_rate: u32,
+        base_stagger: usize,
+    ) -> LayerBank {
         let extra = layers.clamp(1, crate::render::MAX_LAYERS as u32) as usize - 1;
         let mut bank = LayerBank {
             algorithm,
@@ -69,7 +76,7 @@ impl LayerBank {
             hybrid: Vec::new(),
         };
         for idx in 0..extra {
-            let stagger = idx + 1;
+            let stagger = base_stagger.wrapping_add(idx + 1);
             match algorithm {
                 Algorithm::Wsola => bank.wsola.push(Pitched::new(
                     WsolaStream::new(max_block, channels, sample_rate),
@@ -98,6 +105,18 @@ impl LayerBank {
             }
         }
         bank
+    }
+
+    fn set_base_stagger(&mut self, base_stagger: usize) {
+        for (idx, v) in self.vocoder.iter_mut().enumerate() {
+            v.inner_mut().set_stagger(base_stagger.wrapping_add(idx + 1));
+        }
+        for (idx, pv) in self.pvsola.iter_mut().enumerate() {
+            pv.set_stagger(base_stagger.wrapping_add(idx + 1));
+        }
+        for (idx, hy) in self.hybrid.iter_mut().enumerate() {
+            hy.set_stagger(base_stagger.wrapping_add(idx + 1));
+        }
     }
 
     fn count(&self) -> usize {
@@ -300,9 +319,22 @@ impl Stretcher {
         channels: usize,
         sample_rate: u32,
     ) -> Self {
+        Self::voice_staggered(algorithm, layers, max_block, channels, sample_rate, 0)
+    }
+
+    /// Like [`Stretcher::voice`], with a deterministic schedule phase derived
+    /// from the voice's slot index in the Poly bank so chords stagger stage
+    /// transitions without any process-global state.
+    pub fn voice_staggered(
+        algorithm: Algorithm,
+        layers: u32,
+        max_block: usize,
+        channels: usize,
+        sample_rate: u32,
+        slot: usize,
+    ) -> Self {
         let wide = max_block.max(1) * channels.max(1);
         let is = |a: Algorithm| algorithm == a;
-        let stagger = NEXT_VOICE_STAGGER.fetch_add(1, Ordering::Relaxed);
         Stretcher {
             grain: BlockRenderer::new(max_block),
             wsola: is(Algorithm::Wsola).then(|| {
@@ -310,17 +342,17 @@ impl Stretcher {
             }),
             vocoder: is(Algorithm::Vocoder).then(|| {
                 let mut v = VocoderStream::new(max_block, channels);
-                v.set_stagger(stagger);
+                v.set_stagger(slot);
                 Pitched::new(v, max_block, channels)
             }),
             pvsola: is(Algorithm::Pvsola).then(|| {
                 let mut pv = PitchedPvsola::new(max_block, channels);
-                pv.set_stagger(stagger);
+                pv.set_stagger(slot);
                 pv
             }),
             hybrid: is(Algorithm::Hybrid).then(|| {
                 let mut hy = PitchedHybrid::new(max_block, channels, sample_rate);
-                hy.set_stagger(stagger);
+                hy.set_stagger(slot);
                 hy
             }),
             soundhack: is(Algorithm::SoundHack)
@@ -337,10 +369,34 @@ impl Stretcher {
             declick: 0,
             stand_in: false,
             feedback: None,
-            bank: Some(LayerBank::build(algorithm, layers, max_block, channels, sample_rate)),
+            bank: Some(LayerBank::build_with_stagger(
+                algorithm,
+                layers,
+                max_block,
+                channels,
+                sample_rate,
+                slot,
+            )),
             layer_at: vec![u64::MAX; crate::render::MAX_LAYERS],
             position: 0,
             map: None,
+        }
+    }
+
+    /// Assign a deterministic schedule phase (for example, a Poly bank slot
+    /// index) to this stretcher and any extra layers it owns. Never allocates.
+    pub fn set_stagger(&mut self, slot: usize) {
+        if let Some(v) = self.vocoder.as_mut() {
+            v.inner_mut().set_stagger(slot);
+        }
+        if let Some(pv) = self.pvsola.as_mut() {
+            pv.set_stagger(slot);
+        }
+        if let Some(hy) = self.hybrid.as_mut() {
+            hy.set_stagger(slot);
+        }
+        if let Some(bank) = self.bank.as_mut() {
+            bank.set_base_stagger(slot);
         }
     }
 
@@ -1053,6 +1109,133 @@ impl Stretcher {
                 0
             }
             _ => self.grain.render(out, channels, src, sp, events),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grain::Grain;
+
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 64;
+
+    fn test_source() -> Source {
+        let frames = SR as usize; // 1 s stereo
+        let mut seed = 7u32;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = ((seed >> 16) as f32 / 32768.0) - 1.0;
+            let s = (i as f32 * 0.02).sin() * 0.4 + noise * 0.05;
+            samples.push(s);
+            samples.push(s * 0.8);
+        }
+        Source { samples, channels: 2 }
+    }
+
+    fn run_moving_pitch_script(
+        alg: Algorithm,
+        src: &Source,
+        parts: &Arc<Parts>,
+        mut stretcher: Stretcher,
+    ) -> Vec<f32> {
+        let mut sp = StreamParams {
+            algorithm: alg,
+            ratio: 2.0,
+            grain: Grain { layers: 3, ..Grain::default() },
+            ..StreamParams::new(src.frames(), SR)
+        };
+        if alg == Algorithm::Hybrid {
+            stretcher.set_parts(Arc::clone(parts));
+        }
+        stretcher.seek(0, &sp);
+
+        let blocks = 80;
+        let mut out = vec![0.0f32; blocks * BLOCK * 2];
+        let mut buf = vec![0.0f32; BLOCK * 2];
+        let mut events = Vec::new();
+        for b in 0..blocks {
+            // Move pitch and ratio continuously mid-hop across blocks.
+            sp.semitones = match b {
+                0..=15 => 0.0,
+                16..=35 => (b - 15) as f32 * 0.35,
+                36..=55 => 7.0 + ((b - 35) as f32 * 0.15).sin() * 2.5,
+                _ => -5.0 + (b - 55) as f32 * 0.1,
+            };
+            sp.ratio = 1.5 + (b as f32 * 0.015);
+            stretcher.render(&mut buf, 2, src, &sp, &mut events);
+            out[b * BLOCK * 2..(b + 1) * BLOCK * 2].copy_from_slice(&buf);
+        }
+        out
+    }
+
+    fn churn_other_voices_and_stretchers(count: usize) {
+        let algs = [Algorithm::Vocoder, Algorithm::Pvsola, Algorithm::Hybrid];
+        for i in 0..count {
+            let alg = algs[i % algs.len()];
+            let v1 = Stretcher::voice(alg, 2, BLOCK, 2, SR);
+            let v2 = Stretcher::voice_staggered(alg, 3, BLOCK, 2, SR, i);
+            let mut s = Stretcher::new(BLOCK, 2, SR);
+            s.set_stagger(i + 1);
+            let bank = LayerBank::build(alg, 3, BLOCK, 2, SR);
+            drop((v1, v2, s, bank));
+        }
+    }
+
+    fn assert_bits_equal(a: &[f32], b: &[f32], label: &str) {
+        assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{label}: sample {i} differs ({x} vs {y})"
+            );
+        }
+    }
+
+    /// Render a moving-pitch script, build and drop several other voices and
+    /// stretchers, then render the exact same script again — both renders must
+    /// match to the bit, in both orders (fresh -> churn -> repeat, and churn
+    /// first -> render -> churn -> repeat).
+    #[test]
+    fn moving_pitch_render_is_deterministic_across_voice_churn_both_orders() {
+        let src = test_source();
+        let parts = Arc::new(Parts::separate(&src.samples, 2, crate::hybrid::HybridParams::default()));
+
+        for alg in [Algorithm::Vocoder, Algorithm::Pvsola, Algorithm::Hybrid] {
+            // Order A: render first, churn 5 voices/stretchers, render again.
+            let a_voice_1 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice(alg, 3, BLOCK, 2, SR));
+            let a_slot3_1 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice_staggered(alg, 3, BLOCK, 2, SR, 3));
+            let mut a_deck_s1 = Stretcher::new(BLOCK, 2, SR);
+            a_deck_s1.set_bank(LayerBank::build(alg, 3, BLOCK, 2, SR));
+            let a_deck_1 = run_moving_pitch_script(alg, &src, &parts, a_deck_s1);
+
+            churn_other_voices_and_stretchers(5);
+
+            let a_voice_2 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice(alg, 3, BLOCK, 2, SR));
+            let a_slot3_2 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice_staggered(alg, 3, BLOCK, 2, SR, 3));
+            let mut a_deck_s2 = Stretcher::new(BLOCK, 2, SR);
+            a_deck_s2.set_bank(LayerBank::build(alg, 3, BLOCK, 2, SR));
+            let a_deck_2 = run_moving_pitch_script(alg, &src, &parts, a_deck_s2);
+
+            assert_bits_equal(&a_voice_1, &a_voice_2, &format!("{alg:?} order-A voice"));
+            assert_bits_equal(&a_slot3_1, &a_slot3_2, &format!("{alg:?} order-A slot-3"));
+            assert_bits_equal(&a_deck_1, &a_deck_2, &format!("{alg:?} order-A deck"));
+
+            // Order B (reversed): churn a different count first, render, churn again, render again.
+            churn_other_voices_and_stretchers(7);
+            let b_slot3_1 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice_staggered(alg, 3, BLOCK, 2, SR, 3));
+            let b_voice_1 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice(alg, 3, BLOCK, 2, SR));
+            churn_other_voices_and_stretchers(3);
+            let b_voice_2 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice(alg, 3, BLOCK, 2, SR));
+            let b_slot3_2 = run_moving_pitch_script(alg, &src, &parts, Stretcher::voice_staggered(alg, 3, BLOCK, 2, SR, 3));
+
+            assert_bits_equal(&a_voice_1, &b_voice_1, &format!("{alg:?} order-A vs order-B voice"));
+            assert_bits_equal(&b_voice_1, &b_voice_2, &format!("{alg:?} order-B voice"));
+            assert_bits_equal(&a_slot3_1, &b_slot3_1, &format!("{alg:?} order-A vs order-B slot-3"));
+            assert_bits_equal(&b_slot3_1, &b_slot3_2, &format!("{alg:?} order-B slot-3"));
         }
     }
 }
