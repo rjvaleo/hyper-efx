@@ -236,3 +236,119 @@ fn brighten_is_a_ramp_in_frequency_up_to_nyquist() {
     let lift = tilt(&mut bright) - tilt(&mut plain);
     assert!((lift - 6.0).abs() < 1.5, "{lift} dB an octave below Nyquist");
 }
+
+#[test]
+fn length_step_glides_without_a_click_and_lands_within_bound() {
+    let imp = burst(1.0, 21);
+    let tone = |n: usize| -> Vec<f32> {
+        (0..n).map(|i| 0.5 * (std::f32::consts::TAU * 220.0 * i as f32 / SR).sin()).collect()
+    };
+    let mut k = convolve(&imp, SR, &[("lengthMs", 100.0)]);
+    let len_idx = k.descriptor().index_of("lengthMs").unwrap();
+
+    // Warm up for 0.5 s and measure the steady signal's largest sample-to-sample step.
+    let total = (SR * 1.5) as usize;
+    let x = tone(total);
+    let mut y = vec![0.0f32; total];
+    let step_at = (SR * 0.5) as usize;
+
+    let mut pos = 0usize;
+    while pos < total {
+        let end = (pos + 64).min(total);
+        if pos == step_at {
+            k.set_param(len_idx, 500.0);
+        }
+        let mut l = x[pos..end].to_vec();
+        let mut r = x[pos..end].to_vec();
+        k.process(&mut l, &mut r);
+        y[pos..end].copy_from_slice(&l);
+        pos = end;
+    }
+
+    let steady_jump = (12_000..step_at)
+        .map(|i| (y[i] - y[i - 1]).abs())
+        .fold(0.0f32, f32::max);
+    let transition_end = step_at + (SR * 0.35) as usize;
+    let max_jump = (step_at..transition_end)
+        .map(|i| (y[i] - y[i - 1]).abs())
+        .fold(0.0f32, f32::max);
+    let margin = 0.05;
+    assert!(
+        max_jump <= steady_jump * 1.5 + margin,
+        "stepped Length clicked: max jump {max_jump:.5} vs steady {steady_jump:.5} (+ {margin})"
+    );
+
+    // After 150 ms (500 ms impulse rebuild ~60 ms + <=10.7 ms block boundary + 15 ms crossfade),
+    // the output must match a steady 500 ms reference convolution.
+    let mut ref_k = convolve(&imp, SR, &[("lengthMs", 500.0)]);
+    let ref_y = mono(&mut ref_k, &x);
+    let check_from = step_at + (SR * 0.65) as usize; // past 150 ms rebuild + 500 ms tail settle
+    let worst_err = (check_from..total)
+        .map(|i| (y[i] - ref_y[i]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst_err < 1e-4,
+        "500 ms Length step did not land on the target impulse: worst err {worst_err}"
+    );
+}
+
+#[test]
+fn four_second_brighten_rebuild_lands_within_stated_bound() {
+    let imp = burst(4.0, 29);
+    let mut k = convolve(&imp, SR, &[("lengthMs", 100.0)]);
+    let len_idx = k.descriptor().index_of("lengthMs").unwrap();
+    let win_idx = k.descriptor().index_of("window").unwrap();
+    let bri_idx = k.descriptor().index_of("brighten").unwrap();
+
+    // Warm up, then step to the worst case: 4 s + Kaiser + Brighten.
+    let mut l = vec![0.1f32; 64];
+    let mut r = vec![-0.1f32; 64];
+    for _ in 0..16 {
+        k.process(&mut l, &mut r);
+    }
+
+    k.set_param(len_idx, 4000.0);
+    k.set_param(win_idx, window("Kaiser"));
+    k.set_param(bri_idx, 1.0);
+
+    // Worst-case 4 s + Brighten + Kaiser build: ~1072 quanta @ 7/512 frames = 78,409 frames (~1.63 s)
+    // + <=512 frames boundary + 720 frames crossfade <= 80,000 frames (~1.67 s).
+    let mut settled_at = None;
+    let mut blocks = 0usize;
+    let mut pcts = Vec::new();
+    let slot_s = 64.0 / SR as f64;
+    let limit = (SR * 2.0) as usize;
+    while blocks * 64 < limit {
+        l.fill(0.1);
+        r.fill(-0.1);
+        let t0 = std::time::Instant::now();
+        k.process(&mut l, &mut r);
+        let dt = t0.elapsed().as_secs_f64();
+        pcts.push(100.0 * dt / slot_s);
+        blocks += 1;
+        // Once the new 4 s brightened bank is active, latency_frames() switches from 512 to 1024.
+        if settled_at.is_none() && k.latency_frames() == 1024 {
+            settled_at = Some(blocks * 64);
+            // Run 16 more blocks (2 partition boundaries) to include active 4 s convolution.
+            for _ in 0..16 {
+                l.fill(0.1);
+                r.fill(-0.1);
+                let t0 = std::time::Instant::now();
+                k.process(&mut l, &mut r);
+                pcts.push(100.0 * t0.elapsed().as_secs_f64() / slot_s);
+            }
+            break;
+        }
+    }
+    let frames = settled_at.expect("4 s + Brighten + Kaiser rebuild did not activate within 2.0 s");
+    let ms = frames as f64 / SR as f64 * 1000.0;
+    pcts.sort_by(f64::total_cmp);
+    let n = pcts.len();
+    let med = pcts[(n - 1) / 2];
+    let p99 = pcts[((n - 1) as f64 * 0.99) as usize];
+    let worst = pcts[n - 1];
+    println!(
+        "4 s + Kaiser + Brighten worst-case landing: {frames} frames ({ms:.1} ms); 64-frame slot med={med:.2}% p99={p99:.2}% worst={worst:.2}%"
+    );
+    assert!(ms < 1800.0, "took too long: {ms:.1} ms");
+}

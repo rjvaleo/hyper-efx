@@ -96,6 +96,38 @@ fn nothing_allocates_after_new() {
         assert_eq!(n, 0, "{} allocated {n} times after new", entry.descriptor.id);
     }
 
+    // Drive convolution specifically through 8-frame moving control sweeps (MGL's
+    // CONTROL_CHUNK) long enough for multiple incremental rebuilds and crossfades
+    // (including Brighten and Ring toggles) to complete with zero allocations.
+    {
+        let mut conv = prism_fx::make("convolution", contract::SAMPLE_RATE).unwrap();
+        let (samples, channels, rate) = contract::test_sound();
+        conv.set_sound(&samples, channels, rate);
+        conv.reset();
+        let len_idx = conv.descriptor().index_of("lengthMs").unwrap();
+        let win_idx = conv.descriptor().index_of("window").unwrap();
+        let ring_idx = conv.descriptor().index_of("ringModulate").unwrap();
+        let bright_idx = conv.descriptor().index_of("brighten").unwrap();
+        let before = ALLOCATIONS.load(Ordering::SeqCst);
+        let mut chunk_l = [0.2f32; 8];
+        let mut chunk_r = [-0.2f32; 8];
+        for step in 0..4_000usize {
+            let phase = (step % 500) as f32 / 500.0;
+            conv.set_param(len_idx, 10.0 + 490.0 * phase);
+            if step == 1_000 {
+                conv.set_param(bright_idx, 1.0);
+                conv.set_param(win_idx, 1.0);
+            } else if step == 2_500 {
+                conv.set_param(ring_idx, 1.0);
+            } else if step == 3_200 {
+                conv.set_param(ring_idx, 0.0);
+            }
+            conv.process(&mut chunk_l, &mut chunk_r);
+        }
+        let n = ALLOCATIONS.load(Ordering::SeqCst) - before;
+        assert_eq!(n, 0, "convolution allocated {n} times during moving-control rebuilds");
+    }
+
     // And the check itself works: a kernel that allocates per frame is caught.
     let mut leaky: Box<Dyn> = Box::new(Leaky::new(contract::SAMPLE_RATE));
     assert!(allocations_while_running(leaky.as_mut(), &mut left, &mut right) > 0);
