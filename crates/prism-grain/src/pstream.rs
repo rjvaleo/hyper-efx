@@ -20,7 +20,7 @@
 //! is still sounding. They swap at each anchor rather than being rebuilt,
 //! because rebuilding one in a callback is an allocation.
 
-use crate::stream::{PitchRing, StretchParams};
+use crate::stream::{PitchRing, RingDirty, StretchParams};
 use crate::pvsola::PvsolaParams;
 use crate::vstream::VocoderStream;
 
@@ -79,6 +79,7 @@ pub struct PvsolaStream {
     acc: Vec<f32>,
     ring: usize,
     channels: usize,
+    dirty: RingDirty,
 
     /// Output frames laid into the ring.
     written: u64,
@@ -110,6 +111,7 @@ impl PvsolaStream {
             acc: vec![0.0; ring * channels],
             ring,
             channels,
+            dirty: RingDirty::default(),
             written: 0,
             emitted: 0,
             read: 0,
@@ -149,7 +151,8 @@ impl PvsolaStream {
 
     pub fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams, pv: &PvsolaParams) {
         let pl = Self::plan(p, pv);
-        self.acc.fill(0.0);
+        let ch = self.channels;
+        self.dirty.clear(self.ring, |a, b| self.acc[a * ch..b * ch].fill(0.0));
         self.emitted = out_frame;
         // Land on a round boundary at or before the target. Anywhere else and
         // the first round would have to be produced partly, which is the one
@@ -230,6 +233,9 @@ impl PvsolaStream {
                 out[f * channels + ch] = self.acc[slot * self.channels + ch];
                 self.acc[slot * self.channels + ch] = 0.0;
             }
+        }
+        if channels == self.channels {
+            self.dirty.cleared_prefix(self.emitted, need, self.ring);
         }
         self.emitted = need;
     }
@@ -324,6 +330,7 @@ impl PvsolaStream {
                     self.acc[slot * self.channels + ch] = self.piece[(at + i) * channels + ch];
                 }
             }
+            self.dirty.mark(self.written, self.written + len as u64);
             self.written += len as u64;
             self.first = false;
         } else {
@@ -354,6 +361,7 @@ impl PvsolaStream {
                         old + self.piece[(off + i) * channels + ch] * w;
                 }
             }
+            self.dirty.mark(join, join + len as u64);
             self.written = join + len as u64;
         }
 
@@ -708,6 +716,26 @@ mod tests {
         let out = streamed(&src, 2, &spec(4.0), 512);
         let (a, b) = (rms(&src), rms(&out[20_000..out.len() - 20_000]));
         assert!((b / a) > 0.5 && (b / a) < 2.0, "level moved by {:.2}x", b / a);
+    }
+
+    #[test]
+    fn repeated_seeks_leave_zero_dirty_slots_in_pvsola() {
+        let src = chord(2.0, 2);
+        let s = spec(1.5);
+        let p = params(&s);
+        let in_frames = src.len() / 2;
+        let mut pv = PvsolaStream::new(512, 2);
+        let mut buf = vec![0.0f32; 128 * 2];
+        // Include mid-round seeks (where written < emitted) and consecutive seeks.
+        for &at in &[0u64, 12_345, 37_000, 3_333, 3_333, 50_111] {
+            pv.seek(at, in_frames, &p, &s.pvsola);
+            assert!(pv.acc.iter().all(|&v| v == 0.0));
+            for _ in 0..6 {
+                pv.render(&mut buf, 2, &src, &p, &s.pvsola);
+            }
+        }
+        pv.seek(0, in_frames, &p, &s.pvsola);
+        assert!(pv.acc.iter().all(|&v| v == 0.0));
     }
 }
 

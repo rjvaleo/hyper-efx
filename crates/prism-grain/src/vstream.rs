@@ -30,7 +30,7 @@
 
 use crate::fft::fft;
 
-use crate::stream::{StretchParams, Streamer};
+use crate::stream::{RingDirty, StretchParams, Streamer};
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 
@@ -94,6 +94,9 @@ pub struct VocoderStream {
     acc: Vec<f32>,
     norm: Vec<f32>,
     ring: usize,
+    dirty: RingDirty,
+    /// Largest bin count written to the per-bin state since the last clear.
+    dirty_bins: usize,
 }
 
 impl Streamer for VocoderStream {
@@ -146,6 +149,8 @@ impl VocoderStream {
             acc: vec![0.0; ring * channels],
             norm: vec![0.0; ring],
             ring,
+            dirty: RingDirty::default(),
+            dirty_bins: 0,
         }
     }
 
@@ -195,13 +200,24 @@ impl VocoderStream {
     }
 
     fn clear(&mut self) {
-        self.acc.fill(0.0);
-        self.norm.fill(0.0);
-        self.prev_phase.fill(0.0);
-        self.sum_phase.fill(0.0);
-        self.held.fill(0.0);
-        self.prev_ref.fill(0.0);
-        self.link_sum.fill(0.0);
+        let ch = self.channels;
+        self.dirty.clear(self.ring, |a, b| {
+            self.acc[a * ch..b * ch].fill(0.0);
+            self.norm[a..b].fill(0.0);
+        });
+        let bins = self.dirty_bins;
+        if bins > 0 {
+            let stride = MAX_FFT / 2 + 1;
+            for c in 0..ch {
+                let bo = c * stride;
+                self.prev_phase[bo..bo + bins].fill(0.0);
+                self.sum_phase[bo..bo + bins].fill(0.0);
+                self.held[bo..bo + bins].fill(0.0);
+            }
+            self.prev_ref[..bins].fill(0.0);
+            self.link_sum[..bins].fill(0.0);
+            self.dirty_bins = 0;
+        }
     }
 
     pub fn position(&self) -> u64 {
@@ -315,6 +331,7 @@ impl VocoderStream {
             let start = start.min(in_frames.saturating_sub(n));
 
             // Analyse every channel.
+            self.dirty_bins = self.dirty_bins.max(bins);
             for c in 0..channels {
                 let ro = c * MAX_FFT;
                 let bo = c * (MAX_FFT / 2 + 1);
@@ -382,6 +399,7 @@ impl VocoderStream {
                 let slot = ((self.write + i as u64) % self.ring as u64) as usize;
                 self.norm[slot] += self.win[i] * self.win[i];
             }
+            self.dirty.mark(self.write, self.write + n as u64);
 
             self.read += advance;
             self.write += crate::stretch::grain_size(&g, self.index, hs).max(1) as u64;
@@ -401,6 +419,7 @@ impl VocoderStream {
             }
             self.norm[slot] = 0.0;
         }
+        self.dirty.cleared_prefix(self.emitted, need, self.ring);
         self.emitted = need;
     }
 
@@ -713,5 +732,44 @@ mod tests {
         let out = streamed(&src, 2, &spec(8.0), 512);
         let (a, b) = (rms(&src), rms(&out[20_000..out.len() - 20_000]));
         assert!((b / a) > 0.5 && (b / a) < 2.0, "level moved by {:.2}x", b / a);
+    }
+
+    #[test]
+    fn repeated_seeks_leave_zero_dirty_slots_in_vocoder() {
+        let src = chord(1.0, 2);
+        let in_frames = src.len() / 2;
+        let mut v = VocoderStream::new(512, 2);
+        let mut buf = vec![0.0f32; 128 * 2];
+        for &(win_ms, link, at) in &[
+            (40.0f32, true, 0u64),
+            (90.0, false, 11_111),
+            (20.0, true, 3_210),
+            (40.0, false, 3_210),
+        ] {
+            let mut s = spec(1.5);
+            s.vocoder.window_ms = win_ms;
+            s.vocoder.stereo_link = link;
+            let p = params(&s);
+            v.seek(at, in_frames, &p);
+            assert!(v.acc.iter().all(|&x| x == 0.0));
+            assert!(v.norm.iter().all(|&x| x == 0.0));
+            assert!(v.prev_phase.iter().all(|&x| x == 0.0));
+            assert!(v.sum_phase.iter().all(|&x| x == 0.0));
+            assert!(v.held.iter().all(|&x| x == 0.0));
+            assert!(v.prev_ref.iter().all(|&x| x == 0.0));
+            assert!(v.link_sum.iter().all(|&x| x == 0.0));
+            for _ in 0..8 {
+                v.render(&mut buf, 2, &src, &p);
+            }
+        }
+        let s = spec(1.5);
+        v.seek(0, in_frames, &params(&s));
+        assert!(v.acc.iter().all(|&x| x == 0.0));
+        assert!(v.norm.iter().all(|&x| x == 0.0));
+        assert!(v.prev_phase.iter().all(|&x| x == 0.0));
+        assert!(v.sum_phase.iter().all(|&x| x == 0.0));
+        assert!(v.held.iter().all(|&x| x == 0.0));
+        assert!(v.prev_ref.iter().all(|&x| x == 0.0));
+        assert!(v.link_sum.iter().all(|&x| x == 0.0));
     }
 }

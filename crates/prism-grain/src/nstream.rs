@@ -18,7 +18,7 @@
 use crate::fft::fft;
 
 use crate::noise::Morph;
-use crate::stream::StretchParams;
+use crate::stream::{RingDirty, StretchParams};
 
 const MAX_FFT: usize = 8192;
 
@@ -37,6 +37,7 @@ pub struct NoiseStream {
     acc: Vec<f32>,
     norm: Vec<f32>,
     ring: usize,
+    dirty: RingDirty,
 
     /// Output frame the next synthesis frame is laid at, and how many have
     /// been handed out.
@@ -69,6 +70,7 @@ impl NoiseStream {
             acc: vec![0.0; ring * channels],
             norm: vec![0.0; ring],
             ring,
+            dirty: RingDirty::default(),
             write: 0,
             emitted: 0,
             index: 0,
@@ -82,8 +84,11 @@ impl NoiseStream {
     pub fn seek(&mut self, out_frame: u64, p: &StretchParams, m: Morph) {
         let n = (m.fft_size.max(64).next_power_of_two()).min(MAX_FFT);
         let hop = (n / 4).max(1);
-        self.acc.fill(0.0);
-        self.norm.fill(0.0);
+        let ch = self.channels;
+        self.dirty.clear(self.ring, |a, b| {
+            self.acc[a * ch..b * ch].fill(0.0);
+            self.norm[a..b].fill(0.0);
+        });
         self.emitted = out_frame;
         // Synthesis frames sit on a grid, so start on the one at or before the
         // target rather than part way through a window.
@@ -236,6 +241,7 @@ impl NoiseStream {
                 let slot = ((self.write + i as u64) % self.ring as u64) as usize;
                 self.norm[slot] += self.win[i] * self.win[i];
             }
+            self.dirty.mark(self.write, self.write + n as u64);
 
             self.write += hop as u64;
             self.index += 1;
@@ -273,6 +279,9 @@ impl NoiseStream {
                 self.acc[slot * self.channels + ch] = 0.0;
             }
             self.norm[slot] = 0.0;
+        }
+        if channels == self.channels {
+            self.dirty.cleared_prefix(self.emitted, need, self.ring);
         }
         self.emitted = need;
     }

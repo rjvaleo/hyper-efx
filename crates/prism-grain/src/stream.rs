@@ -35,6 +35,73 @@ use crate::Grain;
 /// between blocks.
 const MAX_WINDOW_MS: f32 = 2000.0;
 
+/// Half-open frame interval `[lo, hi)` of ring slots that may hold non-zero
+/// data since the last clear.
+///
+/// Every ring begins all zeros. Writes extend `[lo, hi)`; an emit loop that
+/// zeroes consecutive slots from the start of the dirty span without wrap
+/// aliasing advances `lo` via [`Self::cleared_prefix`]. On a seek, [`Self::clear`]
+/// zeroes only `[lo, hi)` (at most two contiguous slices, or the whole ring if
+/// `hi - lo >= ring`) and resets the span to empty.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RingDirty {
+    lo: u64,
+    hi: u64,
+}
+
+impl RingDirty {
+    #[inline]
+    pub(crate) fn mark(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        if self.lo == self.hi {
+            self.lo = start;
+            self.hi = end;
+        } else {
+            self.lo = self.lo.min(start);
+            self.hi = self.hi.max(end);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn cleared_prefix(&mut self, from: u64, to: u64, ring: usize) {
+        if self.lo >= self.hi || from >= to {
+            return;
+        }
+        if from <= self.lo && to > self.lo && self.hi - self.lo <= ring as u64 {
+            self.lo = to.min(self.hi);
+            if self.lo == self.hi {
+                self.lo = 0;
+                self.hi = 0;
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self, ring: usize, mut zero: impl FnMut(usize, usize)) {
+        if self.lo >= self.hi || ring == 0 {
+            self.lo = 0;
+            self.hi = 0;
+            return;
+        }
+        let span = self.hi - self.lo;
+        if span >= ring as u64 {
+            zero(0, ring);
+        } else {
+            let count = span as usize;
+            let start = (self.lo % ring as u64) as usize;
+            let first = count.min(ring - start);
+            zero(start, start + first);
+            if first < count {
+                zero(0, count - first);
+            }
+        }
+        self.lo = 0;
+        self.hi = 0;
+    }
+}
+
 /// Everything a streaming engine needs that is not the audio itself.
 ///
 /// Copied into the callback each block, so it must stay cheap to copy — which
@@ -88,6 +155,7 @@ pub struct WsolaStream {
     /// Frames in the ring.
     ring: usize,
     channels: usize,
+    dirty: RingDirty,
 
     /// The segment expected to follow what was just written; the next window is
     /// chosen to resemble it.
@@ -148,6 +216,7 @@ impl WsolaStream {
             norm: vec![0.0; ring],
             ring,
             channels,
+            dirty: RingDirty::default(),
             expect: vec![0.0; max_win * channels],
             window: Vec::with_capacity(max_win),
             window_for: None,
@@ -237,8 +306,11 @@ impl WsolaStream {
     }
 
     fn clear_ring(&mut self) {
-        self.acc.fill(0.0);
-        self.norm.fill(0.0);
+        let ch = self.channels;
+        self.dirty.clear(self.ring, |a, b| {
+            self.acc[a * ch..b * ch].fill(0.0);
+            self.norm[a..b].fill(0.0);
+        });
     }
 
     /// Rebuild the precomputed window only when its shape actually changed.
@@ -405,6 +477,7 @@ impl Streamer for WsolaStream {
                     }
                     self.norm[slot] += w;
                 }
+                self.dirty.mark(self.write, self.write + len as u64);
             }
 
             // What naturally follows the window just taken.
@@ -443,6 +516,7 @@ impl Streamer for WsolaStream {
             }
             self.norm[slot] = 0.0;
         }
+        self.dirty.cleared_prefix(self.emitted, need, self.ring);
         self.emitted = need;
     }
 }
@@ -500,6 +574,7 @@ pub struct PitchRing {
     buf: Vec<f32>,
     ring: usize,
     channels: usize,
+    dirty: RingDirty,
     /// Stretched frames pushed in so far, counted from the start of the file.
     made: u64,
     /// Where the read position was when the pitch last changed.
@@ -579,6 +654,7 @@ impl PitchRing {
             buf: vec![0.0; ring * channels],
             ring,
             channels,
+            dirty: RingDirty::default(),
             made: 0,
             base: 0.0,
             since: 0,
@@ -839,6 +915,7 @@ impl PitchRing {
                 self.buf[slot * self.channels + ch] = src[i * channels + ch];
             }
         }
+        self.dirty.mark(self.made, self.made + n as u64);
         self.made += n as u64;
     }
 
@@ -943,7 +1020,8 @@ impl PitchRing {
         self.made = at as u64;
         self.origin = at as u64;
         self.emitted = out_frame;
-        self.buf.fill(0.0);
+        let ch = self.channels;
+        self.dirty.clear(self.ring, |a, b| self.buf[a * ch..b * ch].fill(0.0));
         at as u64
     }
 }
@@ -1334,5 +1412,94 @@ mod tests {
         let src = vec![0f32; 20_000];
         let out = streamed(&src, 1, &spec(3.0), 256);
         assert!(out.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn ring_dirty_clears_every_written_slot_across_wrap_and_prefix() {
+        let ring = 16usize;
+        let mut buf = vec![0.0f32; ring];
+        let mut d = RingDirty::default();
+
+        // Write [10, 20) (wraps around 16 -> slots 10..16 and 0..4), emit [10, 14).
+        for f in 10u64..20 {
+            buf[(f % ring as u64) as usize] = f as f32 + 1.0;
+        }
+        d.mark(10, 20);
+        for f in 10u64..14 {
+            buf[(f % ring as u64) as usize] = 0.0;
+        }
+        d.cleared_prefix(10, 14, ring);
+        let mut cleared = 0usize;
+        d.clear(ring, |a, b| {
+            buf[a..b].fill(0.0);
+            cleared += b - a;
+        });
+        assert_eq!(cleared, 6);
+        assert!(buf.iter().all(|&v| v == 0.0));
+
+        // Second clear with no writes touches nothing.
+        cleared = 0;
+        d.clear(ring, |a, b| {
+            buf[a..b].fill(0.0);
+            cleared += b - a;
+        });
+        assert_eq!(cleared, 0);
+
+        // Mid-span emit (from > lo, as in PvsolaStream mid-round seek) must not drop [lo, from).
+        for f in 4u64..12 {
+            buf[(f % ring as u64) as usize] = 7.0;
+        }
+        d.mark(4, 12);
+        for f in 8u64..10 {
+            buf[(f % ring as u64) as usize] = 0.0;
+        }
+        d.cleared_prefix(8, 10, ring);
+        d.clear(ring, |a, b| buf[a..b].fill(0.0));
+        assert!(buf.iter().all(|&v| v == 0.0));
+
+        // Span >= ring clears the entire ring.
+        for f in 0u64..24 {
+            buf[(f % ring as u64) as usize] = 3.0;
+        }
+        d.mark(0, 24);
+        d.cleared_prefix(0, 8, ring);
+        d.clear(ring, |a, b| buf[a..b].fill(0.0));
+        assert!(buf.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn repeated_seeks_leave_zero_dirty_slots_in_wsola_and_pitch_ring() {
+        let n = RATE as usize;
+        let mut src = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f32 / RATE as f32;
+            let v = 0.4 * (std::f32::consts::TAU * 220.0 * t).sin();
+            src.push(v);
+            src.push(v * 0.8);
+        }
+        let s = spec(1.7);
+        let p = params(&s);
+        let in_frames = src.len() / 2;
+        let mut w = WsolaStream::new(512, 2, RATE);
+        let mut buf = vec![0.0f32; 128 * 2];
+        for &at in &[0u64, 12_345, 3_210, 40_000, 12_345] {
+            w.seek(at, in_frames, &p);
+            assert!(w.acc.iter().all(|&v| v == 0.0));
+            assert!(w.norm.iter().all(|&v| v == 0.0));
+            for _ in 0..8 {
+                w.render(&mut buf, 2, &src, &p);
+            }
+        }
+        w.seek(0, in_frames, &p);
+        assert!(w.acc.iter().all(|&v| v == 0.0));
+        assert!(w.norm.iter().all(|&v| v == 0.0));
+
+        let mut pr = PitchRing::new(512, 2);
+        let chunk = vec![0.5f32; 256 * 2];
+        pr.seek(100, 1.5);
+        assert!(pr.buf.iter().all(|&v| v == 0.0));
+        pr.push(&chunk, 256, 2);
+        pr.seek(500, 1.0);
+        assert!(pr.buf.iter().all(|&v| v == 0.0));
     }
 }
