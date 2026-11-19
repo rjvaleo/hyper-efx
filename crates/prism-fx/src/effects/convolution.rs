@@ -59,7 +59,7 @@ const WORK_STRIDE: usize = 64;
 const WINDOW_STEP: usize = 4_096;
 const COPY_STEP: usize = 32_768;
 const MEASURE_STEP: usize = 32_768;
-const BRIGHTEN_FFT_STEP: usize = 32_768;
+const BRIGHTEN_FFT_STEP: usize = 24_576;
 const PART_FFT_STEP: usize = 4;
 
 const WINDOWS: &[&str] = &["Hamming", "Kaiser", "Ramp", "Rectangle", "Sinc", "Triangle", "von Hann"];
@@ -978,7 +978,7 @@ mod tests {
             while inc_k.pending.is_some() || inc_k.build.is_some() {
                 inc_k.step_build();
                 steps += 1;
-                assert!(steps < 5_000, "incremental build did not finish for {p:?}");
+                assert!(steps < 10_000, "incremental build did not finish for {p:?}");
             }
 
             let want = &sync_k.banks[0];

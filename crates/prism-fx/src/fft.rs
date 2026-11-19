@@ -128,8 +128,13 @@ impl FftStepper {
             match self.phase {
                 FftPhase::Done => return true,
                 FftPhase::BitRev { i } => {
+                    // Bit-reversal touches indices in scattered order across the
+                    // whole buffer (cache-miss bound at 512k points), so weight
+                    // each index 4x relative to a sequential butterfly.
+                    const BITREV_WEIGHT: usize = 4;
                     let bits = n.trailing_zeros();
-                    let end = (i + left).min(n);
+                    let count = (left / BITREV_WEIGHT).max(1);
+                    let end = (i + count).min(n);
                     for idx in i..end {
                         let j = idx.reverse_bits() >> (usize::BITS - bits);
                         if j > idx {
@@ -137,7 +142,8 @@ impl FftStepper {
                             im.swap(idx, j);
                         }
                     }
-                    left -= end - i;
+                    let used = (end - i) * BITREV_WEIGHT;
+                    left = left.saturating_sub(used);
                     self.phase = if end == n {
                         FftPhase::Butterfly { len: 2, start: 0, k: 0 }
                     } else {
