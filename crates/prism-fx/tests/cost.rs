@@ -22,6 +22,11 @@ const WARMUP_BLOCKS: usize = 200;
 const BLOCKS: [usize; 3] = [64, 128, 512];
 
 #[cfg(unix)]
+fn cpu_clock_name() -> &'static str {
+    "thread-cpu"
+}
+
+#[cfg(unix)]
 fn cpu_now() -> f64 {
     #[repr(C)]
     struct Timespec {
@@ -42,7 +47,88 @@ fn cpu_now() -> f64 {
     t.tv_sec as f64 + t.tv_nsec as f64 * 1e-9
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod win_clock {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn QueryThreadCycleTime(thread: isize, cycle_time: *mut u64) -> i32;
+    }
+
+    struct Cal {
+        hz: Option<f64>,
+        t0: Instant,
+    }
+
+    fn raw_cycles() -> Option<u64> {
+        let mut cycles = 0u64;
+        // SAFETY: GetCurrentThread returns the pseudo-handle for this thread
+        // and QueryThreadCycleTime writes into `cycles`.
+        let ok = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) };
+        if ok != 0 { Some(cycles) } else { None }
+    }
+
+    fn cal() -> &'static Cal {
+        static CAL: OnceLock<Cal> = OnceLock::new();
+        CAL.get_or_init(|| {
+            let t0 = Instant::now();
+            let mut best = 0.0f64;
+            let mut sink = 0.0f64;
+            let mut any_ok = false;
+            for _ in 0..12 {
+                let s = Instant::now();
+                let Some(c0) = raw_cycles() else { break };
+                any_ok = true;
+                while s.elapsed().as_secs_f64() < 0.015 {
+                    for i in 1..1024u32 {
+                        sink += (i as f64).sqrt();
+                    }
+                }
+                let Some(c1) = raw_cycles() else { break };
+                let dt = s.elapsed().as_secs_f64();
+                if c1 > c0 && dt > 0.0 {
+                    best = best.max((c1 - c0) as f64 / dt);
+                }
+            }
+            std::hint::black_box(sink);
+            let hz = if any_ok && best > 1e6 { Some(best) } else { None };
+            Cal { hz, t0 }
+        })
+    }
+
+    pub fn name() -> &'static str {
+        if cal().hz.is_some() { "thread-cpu" } else { "wall" }
+    }
+
+    pub fn now() -> f64 {
+        let c = cal();
+        if let Some(hz) = c.hz {
+            if let Some(cycles) = raw_cycles() {
+                return cycles as f64 / hz;
+            }
+        }
+        c.t0.elapsed().as_secs_f64()
+    }
+}
+
+#[cfg(windows)]
+fn cpu_clock_name() -> &'static str {
+    win_clock::name()
+}
+
+#[cfg(windows)]
+fn cpu_now() -> f64 {
+    win_clock::now()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cpu_clock_name() -> &'static str {
+    "wall"
+}
+
+#[cfg(not(any(unix, windows)))]
 fn cpu_now() -> f64 {
     use std::sync::OnceLock;
     static T0: OnceLock<std::time::Instant> = OnceLock::new();
@@ -160,7 +246,7 @@ fn measure_case(
         }
         let t0 = cpu_now();
         fx.process(&mut bl, &mut br);
-        let dt = cpu_now() - t0;
+        let dt = (cpu_now() - t0).max(0.0);
         let pct = 100.0 * dt / slot_s;
         if pct > 50.0 {
             over_50 += 1;
@@ -261,7 +347,7 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-fn write_json(path: &PathBuf, machine: &str, cpu: &str, commit: &str, rows: &[Row]) {
+fn write_json(path: &PathBuf, machine: &str, cpu: &str, commit: &str, clock: &str, rows: &[Row]) {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).expect("create BENCH_OUT parent dir");
@@ -272,6 +358,7 @@ fn write_json(path: &PathBuf, machine: &str, cpu: &str, commit: &str, rows: &[Ro
     s.push_str(&format!("  \"machine\": \"{}\",\n", json_escape(machine)));
     s.push_str(&format!("  \"cpu\": \"{}\",\n", json_escape(cpu)));
     s.push_str(&format!("  \"commit\": \"{}\",\n", json_escape(commit)));
+    s.push_str(&format!("  \"clock\": \"{}\",\n", json_escape(clock)));
     s.push_str("  \"rows\": [\n");
     for (i, r) in rows.iter().enumerate() {
         let comma = if i + 1 < rows.len() { "," } else { "" };
@@ -295,6 +382,8 @@ fn write_json(path: &PathBuf, machine: &str, cpu: &str, commit: &str, rows: &[Ro
 #[ignore = "a measurement: run it alone, in a release build"]
 fn effects_worst_block_bench() {
     let t_start = std::time::Instant::now();
+    let clock = cpu_clock_name();
+    let _ = cpu_now();
     let (sig_l, sig_r) = build_signal(TOTAL_FRAMES);
     let (sound_samples, sound_ch, sound_sr) = contract::test_sound();
     let test_sound = ([], sound_samples.as_slice(), sound_ch, sound_sr);
@@ -314,13 +403,13 @@ fn effects_worst_block_bench() {
     let out_path = std::env::var("BENCH_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("target").join("effects-worst-block.json"));
-    write_json(&out_path, &machine, &cpu, &commit, &rows);
+    write_json(&out_path, &machine, &cpu, &commit, clock, &rows);
 
     let mut sorted: Vec<&Row> = rows.iter().collect();
     sorted.sort_by(|a, b| b.worst_pct.total_cmp(&a.worst_pct));
 
     println!(
-        "\nEffects worst-block bench: {} effects, {} rows, elapsed {:.1}s ({machine} / {cpu} / {commit})",
+        "\nEffects worst-block bench: {} effects, {} rows, clock={clock}, elapsed {:.1}s ({machine} / {cpu} / {commit})",
         CATALOG.len(),
         rows.len(),
         t_start.elapsed().as_secs_f64()
