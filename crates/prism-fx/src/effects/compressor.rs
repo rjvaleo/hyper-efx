@@ -18,7 +18,7 @@
 //! constants out once per block; here when a control moves, which is the same
 //! wherever a host moves it between blocks.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamSpec};
 
 const THRESHOLD: usize = 0;
 const RATIO: usize = 1;
@@ -68,21 +68,25 @@ pub struct Compressor {
     attack: f32,
     release: f32,
     makeup: f32,
+    attack_memo: Memo<f32, f32>,
+    release_memo: Memo<f32, f32>,
+    makeup_memo: Memo<f32, f32>,
     /// The smoothed gain reduction in dB, never above zero.
     envelope_db: f32,
 }
 
 impl Compressor {
     /// One-pole coefficient for a time constant.
-    fn coeff(&self, ms: f32) -> f32 {
-        let t = (ms.max(0.01) / 1000.0) * self.sample_rate;
+    fn coeff(ms: f32, sample_rate: f32) -> f32 {
+        let t = (ms.max(0.01) / 1000.0) * sample_rate;
         (-1.0 / t).exp()
     }
 
     fn derive(&mut self) {
-        self.attack = self.coeff(self.values[ATTACK]);
-        self.release = self.coeff(self.values[RELEASE]);
-        self.makeup = 10f32.powf(self.values[MAKEUP] / 20.0);
+        let sr = self.sample_rate;
+        self.attack = self.attack_memo.get(self.values[ATTACK], |ms| Self::coeff(ms, sr));
+        self.release = self.release_memo.get(self.values[RELEASE], |ms| Self::coeff(ms, sr));
+        self.makeup = self.makeup_memo.get(self.values[MAKEUP], |db| 10f32.powf(db / 20.0));
     }
 
     /// The static curve: level in, level out, both in dB.
@@ -115,6 +119,9 @@ impl Kernel for Compressor {
             attack: 0.0,
             release: 0.0,
             makeup: 1.0,
+            attack_memo: Memo::new(),
+            release_memo: Memo::new(),
+            makeup_memo: Memo::new(),
             envelope_db: 0.0,
         };
         k.derive();

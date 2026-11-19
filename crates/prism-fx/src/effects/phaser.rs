@@ -21,7 +21,7 @@
 //! The original read its controls once per block; here a control acts from
 //! the next sample, which is the same wherever a host moves it between blocks.
 
-use crate::{Category, Descriptor, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
+use crate::{Category, Descriptor, Group, Kernel, Memo, PadPair, Panel, ParamKind, ParamSpec};
 use core::f32::consts::PI;
 
 const NOTCHES: usize = 0;
@@ -124,6 +124,7 @@ pub struct Phaser {
     feedback: [f32; 2],
     /// The LFO's place in its cycle, 0–1.
     phase: f64,
+    spread_pows: Memo<f32, [f32; MAX_SECTIONS]>,
 }
 
 impl Kernel for Phaser {
@@ -139,6 +140,7 @@ impl Kernel for Phaser {
             sections: [[Section::default(); MAX_SECTIONS]; 2],
             feedback: [0.0; 2],
             phase: 0.0,
+            spread_pows: Memo::new(),
         }
     }
 
@@ -172,6 +174,7 @@ impl Kernel for Phaser {
         let (depth, rate, sweep, stereo) = (v[DEPTH], v[RATE], v[SWEEP], v[STEREO]);
         let (feedback, wet, dry) = (v[FEEDBACK], v[WET], v[DRY]);
         let nyquist = sr * 0.49;
+        let spread_pows = self.spread_pows.get(spread, |sp| core::array::from_fn(|i| sp.powi(i as i32)));
 
         for (ch, out) in frame.iter_mut().enumerate() {
             let lfo = ((self.phase as f32 + ch as f32 * stereo) * 2.0 * PI).sin();
@@ -179,7 +182,7 @@ impl Kernel for Phaser {
             let x = *out;
             let mut s = x + self.feedback[ch] * feedback;
             for (i, section) in self.sections[ch][..count].iter_mut().enumerate() {
-                let hz = (centre * spread.powi(i as i32) * shift).clamp(20.0, nyquist);
+                let hz = (centre * spread_pows[i] * shift).clamp(20.0, nyquist);
                 section.tune(hz, radius, sr);
                 s = section.step(s);
             }

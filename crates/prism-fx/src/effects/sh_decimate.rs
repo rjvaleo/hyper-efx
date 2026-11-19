@@ -18,7 +18,7 @@
 //! integer conversion wrapped it to −1), and both sides are clipped (the
 //! plug-in clipped only the right).
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
 
 const DEPTH: usize = 0;
 const AVERAGING: usize = 1;
@@ -76,6 +76,8 @@ pub struct ShDecimate {
     values: [f32; 4],
     in_db: Smoothed,
     out_db: Smoothed,
+    gain_in: Memo<f32, f32>,
+    gain_out: Memo<f32, f32>,
     input: [[f32; FRAME]; 2],
     output: [[f32; FRAME]; 2],
     pos: usize,
@@ -113,6 +115,8 @@ impl Kernel for ShDecimate {
             values,
             in_db: Smoothed::new(sample_rate, PARAMS[IN_DB].smooth_ms),
             out_db: Smoothed::new(sample_rate, PARAMS[OUT_DB].smooth_ms),
+            gain_in: Memo::new(),
+            gain_out: Memo::new(),
             input: [[0.0; FRAME]; 2],
             output: [[0.0; FRAME]; 2],
             pos: 0,
@@ -149,8 +153,9 @@ impl Kernel for ShDecimate {
     }
 
     fn tick(&mut self, frame: &mut [f32; 2]) {
-        let gain_in = 10f32.powf(self.in_db.next() * 0.05);
-        let gain_out = 10f32.powf(self.out_db.next() * 0.05);
+        let db = |d: f32| 10f32.powf(d * 0.05);
+        let gain_in = self.gain_in.get(self.in_db.next(), db);
+        let gain_out = self.gain_out.get(self.out_db.next(), db);
         let pos = self.pos;
         for (side, s) in frame.iter_mut().enumerate() {
             self.input[side][pos] = *s;

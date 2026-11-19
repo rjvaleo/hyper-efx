@@ -15,7 +15,7 @@
 //! only change between blocks; here they are worked out when a control moves.
 
 use super::mgl_dattorro_common::{spec, store, whole_rate};
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamKind, ParamSpec};
 use core::f32::consts::PI;
 
 static PARAMS: &[ParamSpec] = &[
@@ -74,6 +74,7 @@ pub struct MglChamberlin {
     p: [f32; 17],
     sr: u32,
     modes: [Mode; 4],
+    f_memo: [Memo<f32, f32>; 4],
     low: [[f32; 2]; 4],
     band: [[f32; 2]; 4],
 }
@@ -81,11 +82,11 @@ pub struct MglChamberlin {
 impl MglChamberlin {
     fn apply(&mut self) {
         let sr = self.sr.max(1) as f32;
-        for (mode, m) in self.modes.iter_mut().enumerate() {
+        for (mode, (m, fm)) in self.modes.iter_mut().zip(self.f_memo.iter_mut()).enumerate() {
             let base = mode * 4;
             let p = &self.p;
             m.on = !(p[base] < 0.5 || p[base + 3] <= 0.0001);
-            m.f = (2.0 * (PI * p[base + 1].min(sr * 0.45) / (2.0 * sr)).sin()).min(0.99);
+            m.f = fm.get(p[base + 1], |hz| (2.0 * (PI * hz.min(sr * 0.45) / (2.0 * sr)).sin()).min(0.99));
             let resonance = ((p[base + 2] - 0.2) / 9.8).clamp(0.0, 1.0);
             m.damp = (2.0 * (1.0 - resonance).max(0.02)).min(2.0 / m.f - m.f * 0.5);
             m.amp = p[base + 3];
@@ -101,6 +102,7 @@ impl Kernel for MglChamberlin {
             ],
             sr: whole_rate(sample_rate),
             modes: [Mode::default(); 4],
+            f_memo: [Memo::new(); 4],
             low: [[0.0; 2]; 4],
             band: [[0.0; 2]; 4],
         };

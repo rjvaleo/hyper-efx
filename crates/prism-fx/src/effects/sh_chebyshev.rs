@@ -11,7 +11,7 @@
 //! even ones offset silence (T2(0) is −1, T4(0) is 1). The gains glide in dB;
 //! the original ramped them in dB across each host block.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec, Smoothed};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamSpec, Smoothed};
 
 const PARTIALS: usize = 6;
 const IN_DB: usize = 6;
@@ -54,6 +54,7 @@ pub static DESCRIPTOR: Descriptor = Descriptor {
 pub struct ShChebyshev {
     values: [f32; 8],
     glides: [Smoothed; 8],
+    gains: [Memo<f32, f32>; 8],
 }
 
 impl Kernel for ShChebyshev {
@@ -63,7 +64,7 @@ impl Kernel for ShChebyshev {
             *v = spec.default;
         }
         let glides = core::array::from_fn(|i| Smoothed::new(sample_rate, PARAMS[i].smooth_ms));
-        let mut k = ShChebyshev { values, glides };
+        let mut k = ShChebyshev { values, glides, gains: [Memo::new(); 8] };
         k.reset();
         k
     }
@@ -92,11 +93,11 @@ impl Kernel for ShChebyshev {
     fn tick(&mut self, frame: &mut [f32; 2]) {
         let db = |d: f32| 10f32.powf(d * 0.05);
         let mut g = [0.0f32; PARTIALS];
-        for (g, glide) in g.iter_mut().zip(&mut self.glides) {
-            *g = db(glide.next());
+        for ((g, glide), memo) in g.iter_mut().zip(&mut self.glides).zip(&mut self.gains) {
+            *g = memo.get(glide.next(), db);
         }
-        let gain_in = db(self.glides[IN_DB].next());
-        let gain_out = db(self.glides[OUT_DB].next());
+        let gain_in = self.gains[IN_DB].get(self.glides[IN_DB].next(), db);
+        let gain_out = self.gains[OUT_DB].get(self.glides[OUT_DB].next(), db);
         let sum: f32 = g.iter().sum();
         let norm = if sum != 0.0 { 1.0 / sum } else { 0.0 };
         for s in frame.iter_mut() {

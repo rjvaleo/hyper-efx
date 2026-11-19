@@ -17,6 +17,7 @@ pub mod contract;
 pub mod effects;
 pub mod fft;
 mod kernel;
+mod memo;
 pub mod par;
 pub mod place;
 pub mod suite;
@@ -24,6 +25,7 @@ mod smooth;
 mod spec;
 
 pub use kernel::{DynKernel, Kernel};
+pub use memo::{Memo, MemoKey};
 pub use smooth::Smoothed;
 pub use spec::{Category, Descriptor, Display, Group, PadPair, Panel, ParamKind, ParamSpec, Role, SoundInput};
 

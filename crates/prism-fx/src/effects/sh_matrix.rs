@@ -13,7 +13,7 @@
 //! sound back. The original steps its mid and side gains at each host block;
 //! here they glide, so the result does not depend on the block size.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
 
 const MID: usize = 0;
 const SIDE: usize = 1;
@@ -58,6 +58,10 @@ pub struct ShMatrix {
     side: Smoothed,
     in_db: Smoothed,
     out_db: Smoothed,
+    mid_gain: Memo<f32, f32>,
+    side_gain: Memo<f32, f32>,
+    gain_in: Memo<f32, f32>,
+    gain_out: Memo<f32, f32>,
 }
 
 impl ShMatrix {
@@ -73,7 +77,17 @@ impl Kernel for ShMatrix {
             *v = spec.default;
         }
         let glide = |i: usize| Smoothed::new(sample_rate, PARAMS[i].smooth_ms);
-        let mut k = ShMatrix { values, mid: glide(MID), side: glide(SIDE), in_db: glide(IN_DB), out_db: glide(OUT_DB) };
+        let mut k = ShMatrix {
+            values,
+            mid: glide(MID),
+            side: glide(SIDE),
+            in_db: glide(IN_DB),
+            out_db: glide(OUT_DB),
+            mid_gain: Memo::new(),
+            side_gain: Memo::new(),
+            gain_in: Memo::new(),
+            gain_out: Memo::new(),
+        };
         k.reset();
         k
     }
@@ -106,8 +120,8 @@ impl Kernel for ShMatrix {
 
     fn tick(&mut self, frame: &mut [f32; 2]) {
         let db = |d: f32| 10f32.powf(d * 0.05);
-        let (mid, side) = (db(self.mid.next()), db(self.side.next()));
-        let (gin, gout) = (db(self.in_db.next()), db(self.out_db.next()));
+        let (mid, side) = (self.mid_gain.get(self.mid.next(), db), self.side_gain.get(self.side.next(), db));
+        let (gin, gout) = (self.gain_in.get(self.in_db.next(), db), self.gain_out.get(self.out_db.next(), db));
         let (a, b) = (frame[0] * gin, frame[1] * gin);
         if self.values[DIRECTION] < 0.5 {
             frame[0] = (a + b) * mid * 0.5 * gout;

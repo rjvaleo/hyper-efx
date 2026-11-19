@@ -34,7 +34,7 @@
 //! tempo. The other controls glide; the original ramped them across each
 //! host block.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
 use core::f64::consts::{PI, TAU};
 
 const DELAY: usize = 0;
@@ -185,6 +185,8 @@ pub struct ShBubbler {
     mix: Smoothed,
     in_db: Smoothed,
     out_db: Smoothed,
+    gain_in: Memo<f32, f32>,
+    gain_out: Memo<f32, f32>,
     /// Time in ms, gliding to its target over 100 ms.
     time: f32,
     time_step: f32,
@@ -383,6 +385,8 @@ impl Kernel for ShBubbler {
             mix: glide(MIX),
             in_db: glide(IN_DB),
             out_db: glide(OUT_DB),
+            gain_in: Memo::new(),
+            gain_out: Memo::new(),
             time: values[DELAY],
             time_step: 0.0,
             lines: [vec![0.0; length], vec![0.0; length]],
@@ -456,8 +460,8 @@ impl Kernel for ShBubbler {
 
     fn tick(&mut self, frame: &mut [f32; 2]) {
         let db = |d: f32| 10f32.powf(d * 0.05);
-        let gain_in = db(self.in_db.next());
-        let gain_out = db(self.out_db.next());
+        let gain_in = self.gain_in.get(self.in_db.next(), db);
+        let gain_out = self.gain_out.get(self.out_db.next(), db);
         let feedback = self.feedback.next();
         let wet = self.mix.next();
         let grain_size = self.grain.next().max(1e-5) as f64;

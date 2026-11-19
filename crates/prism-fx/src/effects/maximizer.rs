@@ -19,7 +19,7 @@
 //! were the channel strip's settings; here, as on MultiGrainLive's module,
 //! they are controls like the amount.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, Panel, ParamKind, ParamSpec};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, Panel, ParamKind, ParamSpec};
 
 const AMOUNT: usize = 0;
 const CEILING: usize = 1;
@@ -83,6 +83,8 @@ pub struct Maximizer {
     slow: f32,
     walk: f32,
     ceiling_lin: f32,
+    amount_memo: Memo<f32, (f32, f32, f32)>,
+    ceiling_memo: Memo<f32, f32>,
     // State.
     envelope_db: f32,
     level_db: f32,
@@ -95,16 +97,17 @@ impl Maximizer {
         let amount = self.values[AMOUNT];
         let a = amount.clamp(0.0, 1.0);
         self.active = amount > 1e-4;
-        self.ratio = 20f32.powf(a).max(1.0);
         self.knee = (9.0 * (1.0 - a) + 1.0).max(0.0);
         self.under_db = 6.0 - 21.0 * a;
         self.fixed_db = -24.0 * a;
         let sr = self.sample_rate;
-        self.atk = coeff(40.0 * (1.0 - a) + 1.0, sr);
-        self.rel = coeff(400.0 * (1.0 - a) + 40.0, sr);
-        self.slow = coeff(250.0, sr);
-        self.walk = coeff(900.0, sr);
-        self.ceiling_lin = 10f32.powf(self.values[CEILING] / 20.0);
+        let (ratio, atk, rel) = self.amount_memo.get(a, |a| {
+            (20f32.powf(a).max(1.0), coeff(40.0 * (1.0 - a) + 1.0, sr), coeff(400.0 * (1.0 - a) + 40.0, sr))
+        });
+        self.ratio = ratio;
+        self.atk = atk;
+        self.rel = rel;
+        self.ceiling_lin = self.ceiling_memo.get(self.values[CEILING], |c| 10f32.powf(c / 20.0));
     }
 
     /// The static curve: level in, level out, both dB.
@@ -128,9 +131,10 @@ impl Kernel for Maximizer {
         for (v, spec) in values.iter_mut().zip(PARAMS) {
             *v = spec.default;
         }
+        let sr = (sample_rate.max(1.0) as u32).max(1) as f32;
         let mut k = Maximizer {
             // MultiGrainLive's rate is a whole number of hertz.
-            sample_rate: (sample_rate.max(1.0) as u32).max(1) as f32,
+            sample_rate: sr,
             values,
             active: false,
             ratio: 1.0,
@@ -139,9 +143,11 @@ impl Kernel for Maximizer {
             fixed_db: 0.0,
             atk: 0.0,
             rel: 0.0,
-            slow: 0.0,
-            walk: 0.0,
+            slow: coeff(250.0, sr),
+            walk: coeff(900.0, sr),
             ceiling_lin: 1.0,
+            amount_memo: Memo::new(),
+            ceiling_memo: Memo::new(),
             envelope_db: 0.0,
             level_db: MIN_DB,
             makeup_db: 0.0,

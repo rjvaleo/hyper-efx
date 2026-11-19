@@ -22,7 +22,7 @@
 //! original stepped them at each host block. Its tempo lock waits for the
 //! rack to have a tempo.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamKind, ParamSpec, Smoothed};
 
 const RATE: usize = 0;
 const FREQ: usize = 1;
@@ -93,6 +93,8 @@ pub struct ShPhasor {
     bandwidth: Smoothed,
     in_db: Smoothed,
     out_db: Smoothed,
+    gain_in: Memo<f32, f32>,
+    gain_out: Memo<f32, f32>,
     chains: [[Section; SECTIONS]; 2],
     /// The last output, which both loops take from the left.
     previous: f32,
@@ -159,6 +161,8 @@ impl Kernel for ShPhasor {
             bandwidth: glide(BANDWIDTH),
             in_db: glide(IN_DB),
             out_db: glide(OUT_DB),
+            gain_in: Memo::new(),
+            gain_out: Memo::new(),
             chains: [[Section::default(); SECTIONS]; 2],
             previous: 0.0,
             phase: 0.0,
@@ -204,8 +208,8 @@ impl Kernel for ShPhasor {
 
     fn tick(&mut self, frame: &mut [f32; 2]) {
         let db = |d: f32| 10f32.powf(d * 0.05);
-        let gain_in = db(self.in_db.next());
-        let gain_out = db(self.out_db.next());
+        let gain_in = self.gain_in.get(self.in_db.next(), db);
+        let gain_out = self.gain_out.get(self.out_db.next(), db);
         let rate = self.rate.next();
         let centre = self.freq.next();
         let depth = self.depth.next();

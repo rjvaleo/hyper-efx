@@ -40,7 +40,7 @@
 //! Coefficients follow their controls every 16 frames, counted from the last
 //! reset, so the output does not depend on the host's block size.
 
-use crate::{Descriptor, Kernel, ParamKind, ParamSpec, Smoothed};
+use crate::{Descriptor, Kernel, Memo, ParamKind, ParamSpec, Smoothed};
 use core::marker::PhantomData;
 
 /// The speed of sound, for turning a size into a time.
@@ -352,19 +352,28 @@ struct Lowpass {
     b2: f64,
     a1: f64,
     a2: f64,
+    coeffs: Memo<f32, [f64; 5]>,
     state: [[f64; 4]; 2],
 }
 
 impl Lowpass {
     fn tune(&mut self, hz: f32, sample_rate: f32) {
-        let k = (core::f64::consts::PI * (hz.min(0.45 * sample_rate) / sample_rate) as f64).tan();
-        let root2 = core::f64::consts::SQRT_2;
-        let a0 = 1.0 / (1.0 + root2 * k + k * k);
-        self.b0 = k * k * a0;
-        self.b1 = 2.0 * self.b0;
-        self.b2 = self.b0;
-        self.a1 = 2.0 * (k * k - 1.0) * a0;
-        self.a2 = (1.0 - root2 * k + k * k) * a0;
+        let [b0, b1, b2, a1, a2] = self.coeffs.get(hz, |hz| {
+            let k = (core::f64::consts::PI * (hz.min(0.45 * sample_rate) / sample_rate) as f64).tan();
+            let root2 = core::f64::consts::SQRT_2;
+            let a0 = 1.0 / (1.0 + root2 * k + k * k);
+            let b0 = k * k * a0;
+            let b1 = 2.0 * b0;
+            let b2 = b0;
+            let a1 = 2.0 * (k * k - 1.0) * a0;
+            let a2 = (1.0 - root2 * k + k * k) * a0;
+            [b0, b1, b2, a1, a2]
+        });
+        self.b0 = b0;
+        self.b1 = b1;
+        self.b2 = b2;
+        self.a1 = a1;
+        self.a2 = a2;
     }
 
     fn run(&mut self, side: usize, x: f32) -> f32 {
@@ -425,6 +434,16 @@ pub struct Lxp<A: Algorithm> {
     out_weights: [f32; 4],
     bass_coef: f32,
     high_coef: f32,
+    // Remembered pure coefficient evaluations keyed by input bits.
+    tap_weights_memo: Memo<f32, [f32; TAPS]>,
+    out_weights_memo: Memo<f32, [f32; 4]>,
+    tank_decay_memo: Memo<(f32, f32, f32), [(f32, f32); LINES]>,
+    bass_coef_memo: Memo<f32, f32>,
+    high_coef_memo: Memo<f32, f32>,
+    echo_gain_memo: [Memo<f32, f32>; 2],
+    reflection_gain_memo: [Memo<f32, f32>; 4],
+    early_gain_memo: Memo<f32, f32>,
+    reverb_gain_memo: Memo<f32, f32>,
     _algorithm: PhantomData<fn() -> A>,
 }
 
@@ -453,38 +472,55 @@ impl<A: Algorithm> Lxp<A> {
 
         // Injection: eight taps across the spread window, weighted by shape.
         let window = s.spread * 2.0 * s.size / SOUND * sr;
-        let beta = 6.0 * (2.0 * s.shape / 64.0 - 1.0);
-        let mut energy = 0.0;
         for k in 0..TAPS {
             let u = k as f32 / (TAPS - 1) as f32;
             self.tap_times[k] = window * u + k as f32 * STAGGER_S * sr;
-            self.tap_weights[k] = (beta * u).exp();
-            energy += self.tap_weights[k] * self.tap_weights[k];
         }
-        let norm = 1.0 / energy.sqrt();
-        self.tap_weights.iter_mut().for_each(|w| *w *= norm);
+        self.tap_weights = self.tap_weights_memo.get(s.shape, |shape| {
+            let beta = 6.0 * (2.0 * shape / 64.0 - 1.0);
+            let mut weights = [0.0f32; TAPS];
+            let mut energy = 0.0;
+            for (k, w) in weights.iter_mut().enumerate() {
+                let u = k as f32 / (TAPS - 1) as f32;
+                *w = (beta * u).exp();
+                energy += *w * *w;
+            }
+            let norm = 1.0 / energy.sqrt();
+            weights.iter_mut().for_each(|w| *w *= norm);
+            weights
+        });
 
         // Output taps tilted by the slope.
-        let mut energy = 0.0;
-        for (j, w) in self.out_weights.iter_mut().enumerate() {
-            *w = 10f32.powf(2.5 * s.tap_slope * (OUT_TAPS[j] - 0.625) / 20.0);
-            energy += *w * *w;
-        }
-        let norm = 1.0 / energy.sqrt();
-        self.out_weights.iter_mut().for_each(|w| *w *= norm);
+        self.out_weights = self.out_weights_memo.get(s.tap_slope, |tap_slope| {
+            let mut weights = [0.0f32; 4];
+            let mut energy = 0.0;
+            for (j, w) in weights.iter_mut().enumerate() {
+                *w = 10f32.powf(2.5 * tap_slope * (OUT_TAPS[j] - 0.625) / 20.0);
+                energy += *w * *w;
+            }
+            let norm = 1.0 / energy.sqrt();
+            weights.iter_mut().for_each(|w| *w *= norm);
+            weights
+        });
 
         // The decay: each line's loop, all-passes included, falls 60 dB in
         // the reverb time, and in bassRt times it below the split.
-        for i in 0..LINES {
-            let base = self.base(s, i);
-            let loop_length = base * (1.0 + LOOP_AP[..v.loop_allpasses].iter().sum::<f32>());
-            let t = &mut self.tank[i];
-            t.mid_gain = 10f32.powf(-3.0 * loop_length / (s.reverb_time * sr));
-            t.bass_gain = 10f32.powf(-3.0 * loop_length / (s.reverb_time * s.bass_rt * sr));
+        let decays = self.tank_decay_memo.get((s.size, s.reverb_time, s.bass_rt), |(size, rt, bass_rt)| {
+            core::array::from_fn(|i| {
+                let base = size / SOUND * v.lines[i] * sr;
+                let loop_length = base * (1.0 + LOOP_AP[..v.loop_allpasses].iter().sum::<f32>());
+                let mid = 10f32.powf(-3.0 * loop_length / (rt * sr));
+                let bass = 10f32.powf(-3.0 * loop_length / (rt * bass_rt * sr));
+                (mid, bass)
+            })
+        });
+        for (t, &(mid, bass)) in self.tank.iter_mut().zip(&decays) {
+            t.mid_gain = mid;
+            t.bass_gain = bass;
         }
         let pole = |hz: f32| 1.0 - (-core::f32::consts::TAU * hz.min(0.49 * sr) / sr).exp();
-        self.bass_coef = pole(s.bass_xov);
-        self.high_coef = pole(s.rt_hi_cut);
+        self.bass_coef = self.bass_coef_memo.get(s.bass_xov, pole);
+        self.high_coef = self.high_coef_memo.get(s.rt_hi_cut, pole);
         self.rolloff.tune(s.rolloff, sr);
     }
 
@@ -624,6 +660,15 @@ impl<A: Algorithm> Kernel for Lxp<A> {
             out_weights: [0.0; 4],
             bass_coef: 0.0,
             high_coef: 0.0,
+            tap_weights_memo: Memo::new(),
+            out_weights_memo: Memo::new(),
+            tank_decay_memo: Memo::new(),
+            bass_coef_memo: Memo::new(),
+            high_coef_memo: Memo::new(),
+            echo_gain_memo: [Memo::new(); 2],
+            reflection_gain_memo: [Memo::new(); 4],
+            early_gain_memo: Memo::new(),
+            reverb_gain_memo: Memo::new(),
             _algorithm: PhantomData,
         };
         k.reset();
@@ -689,7 +734,8 @@ impl<A: Algorithm> Kernel for Lxp<A> {
                 let e = self.echo[side].linear(d - 1.0);
                 let e = self.echo_ap[side].run(e, ECHO_AP_S[side] * sr, VOICE_DIFFUSION);
                 let sign = if s.echo_invert[side] >= 0.5 { -1.0 } else { 1.0 };
-                let feedback = (gain(s.echo_db[side]) * s.echo_feedback_master).min(MOST_FEEDBACK);
+                let echo_gain = self.echo_gain_memo[side].get(s.echo_db[side], gain);
+                let feedback = (echo_gain * s.echo_feedback_master).min(MOST_FEEDBACK);
                 input[side] = dry[side] + sign * feedback * e;
                 early[side] += e;
             }
@@ -706,11 +752,12 @@ impl<A: Algorithm> Kernel for Lxp<A> {
             let d = s.reflection_ms[i] * s.reflection_master * 0.001 * sr;
             let r = self.source[from].linear(d);
             let r = self.reflection_ap[i].run(r, REFLECTION_AP_S[i] * sr, VOICE_DIFFUSION);
-            early[to] += gain(s.reflection_db[i]) * r;
+            early[to] += self.reflection_gain_memo[i].get(s.reflection_db[i], gain) * r;
         }
 
         let tail = self.tank(&s, input);
-        let (early_gain, reverb_gain) = (gain(s.early_db), gain(s.reverb_db));
+        let early_gain = self.early_gain_memo.get(s.early_db, gain);
+        let reverb_gain = self.reverb_gain_memo.get(s.reverb_db, gain);
         for side in 0..2 {
             let wet = self.rolloff.run(side, early_gain * early[side] + reverb_gain * tail[side]);
             frame[side] = dry[side] * (1.0 - s.mix) + wet * s.mix;

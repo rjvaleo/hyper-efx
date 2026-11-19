@@ -14,7 +14,7 @@
 //! At its defaults it is transparent, and the low cut at its lowest setting
 //! is off rather than merely low.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec, Smoothed};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamSpec, Smoothed};
 
 const PAN: usize = 0;
 const GAIN: usize = 1;
@@ -113,6 +113,8 @@ pub struct StereoMatrix {
     rotate: Smoothed,
     mono_below: Smoothed,
     low_cut: HighPass,
+    gain: Memo<f32, f32>,
+    rot: Memo<f32, (f32, f32)>,
 }
 
 impl StereoMatrix {
@@ -146,6 +148,8 @@ impl Kernel for StereoMatrix {
             rotate: glide(ROTATE),
             mono_below: glide(MONO_BELOW),
             low_cut: HighPass::default(),
+            gain: Memo::new(),
+            rot: Memo::new(),
         };
         k.land();
         k
@@ -173,10 +177,10 @@ impl Kernel for StereoMatrix {
 
     fn tick(&mut self, frame: &mut [f32; 2]) {
         let pan = self.pan.next();
-        let gain = 10f32.powf(self.gain_db.next() / 20.0);
+        let gain = self.gain.get(self.gain_db.next(), |db| 10f32.powf(db / 20.0));
         let mid_gain = self.mid.next();
         let side_gain = self.side.next();
-        let (sin, cos) = self.rotate.next().to_radians().sin_cos();
+        let (sin, cos) = self.rot.get(self.rotate.next(), |deg| deg.to_radians().sin_cos());
         let mono_below = self.mono_below.next();
 
         let mut mid = 0.5 * (frame[0] + frame[1]);

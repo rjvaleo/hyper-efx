@@ -14,7 +14,7 @@
 //! have a tempo. The controls glide; the original ramped them across each
 //! host block.
 
-use crate::{Category, Descriptor, Display, Group, Kernel, PadPair, Panel, ParamSpec, Smoothed};
+use crate::{Category, Descriptor, Display, Group, Kernel, Memo, PadPair, Panel, ParamSpec, Smoothed};
 
 const FLIP: usize = 0;
 const OVERLAP: usize = 1;
@@ -60,6 +60,8 @@ pub struct ShFlipper {
     overlap: Smoothed,
     in_db: Smoothed,
     out_db: Smoothed,
+    gain_in: Memo<f32, f32>,
+    gain_out: Memo<f32, f32>,
     lines: [Vec<f32>; 2],
     mask: usize,
     write: usize,
@@ -93,6 +95,8 @@ impl Kernel for ShFlipper {
             overlap: glide(OVERLAP),
             in_db: glide(IN_DB),
             out_db: glide(OUT_DB),
+            gain_in: Memo::new(),
+            gain_out: Memo::new(),
             lines: [vec![0.0; length], vec![0.0; length]],
             mask: length - 1,
             write: 0,
@@ -141,8 +145,8 @@ impl Kernel for ShFlipper {
 
     fn tick(&mut self, frame: &mut [f32; 2]) {
         let db = |d: f32| 10f32.powf(d * 0.05);
-        let gain_in = db(self.in_db.next());
-        let gain_out = db(self.out_db.next());
+        let gain_in = self.gain_in.get(self.in_db.next(), db);
+        let gain_out = self.gain_out.get(self.out_db.next(), db);
         let segment = self.flip.next() * self.sample_rate;
         let fade = (self.overlap.next() * segment).max(1.0);
 
