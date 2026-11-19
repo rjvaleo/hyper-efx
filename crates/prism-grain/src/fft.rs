@@ -20,7 +20,53 @@ pub fn fft(re: &mut [f32], im: &mut [f32]) -> bool {
         return true;
     }
 
-    // Bit-reversal permutation.
+    if n <= TWIDDLE_N {
+        // Bit-reversal permutation from the per-size swap table.
+        for &(i, j) in &bitrev_tables()[n.trailing_zeros() as usize] {
+            let (i, j) = (i as usize, j as usize);
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+
+        // Butterflies, doubling the block length each pass.
+        let tw = twiddles();
+        let mut len = 2usize;
+        while len <= n {
+            // One table serves every size: the twiddle for stage `len` at index
+            // `k` is `exp(-2*pi*i*k/len)`, which is the entry `k * (N/len)` of a
+            // table built for `N`. Both are powers of two, so the stride is
+            // exact and the value is *identical* to computing it from the index
+            // — this is a table of the same numbers, not an approximation of
+            // them. Checked: bit-for-bit equal output at 1024 through 8192.
+            let stride = TWIDDLE_N / len;
+            let half = len / 2;
+            for (rc, ic) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+                let (r0, r1) = rc.split_at_mut(half);
+                let (i0, i1) = ic.split_at_mut(half);
+                for (((ur, ui), (xr, xi)), &(cr, ci)) in r0
+                    .iter_mut()
+                    .zip(i0.iter_mut())
+                    .zip(r1.iter_mut().zip(i1.iter_mut()))
+                    .zip(tw.iter().step_by(stride))
+                {
+                    let (u_re, u_im) = (*ur, *ui);
+                    let (x_re, x_im) = (*xr, *xi);
+                    let vr = x_re * cr - x_im * ci;
+                    let vi = x_re * ci + x_im * cr;
+                    *ur = u_re + vr;
+                    *ui = u_im + vi;
+                    *xr = u_re - vr;
+                    *xi = u_im - vi;
+                }
+            }
+            len <<= 1;
+        }
+        return true;
+    }
+
+    // Bigger than the table: correct, just slower. Nothing in the program asks
+    // for a transform this long — the vocoder's own maximum is 8192 — so this
+    // is here to stay right rather than to be fast.
     let mut j = 0usize;
     for i in 1..n {
         let mut bit = n >> 1;
@@ -34,63 +80,32 @@ pub fn fft(re: &mut [f32], im: &mut [f32]) -> bool {
             im.swap(i, j);
         }
     }
-
-    // Butterflies, doubling the block length each pass.
-    if n <= TWIDDLE_N {
-        let tw = twiddles();
-        let mut len = 2usize;
-        while len <= n {
-            // One table serves every size: the twiddle for stage `len` at index
-            // `k` is `exp(-2*pi*i*k/len)`, which is the entry `k * (N/len)` of a
-            // table built for `N`. Both are powers of two, so the stride is
-            // exact and the value is *identical* to computing it from the index
-            // — this is a table of the same numbers, not an approximation of
-            // them. Checked: bit-for-bit equal output at 1024 through 8192.
-            let stride = TWIDDLE_N / len;
-            let half = len / 2;
-            let mut i = 0;
-            while i < n {
-                for k in 0..half {
-                    let (cr, ci) = tw[k * stride];
-                    let (ur, ui) = (re[i + k], im[i + k]);
-                    let (xr, xi) = (re[i + k + half], im[i + k + half]);
-                    let vr = xr * cr - xi * ci;
-                    let vi = xr * ci + xi * cr;
-                    re[i + k] = ur + vr;
-                    im[i + k] = ui + vi;
-                    re[i + k + half] = ur - vr;
-                    im[i + k + half] = ui - vi;
-                }
-                i += len;
-            }
-            len <<= 1;
-        }
-        return true;
-    }
-
-    // Bigger than the table: correct, just slower. Nothing in the program asks
-    // for a transform this long — the vocoder's own maximum is 8192 — so this
-    // is here to stay right rather than to be fast.
     let mut len = 2usize;
     while len <= n {
         let ang = -2.0 * PI / len as f32;
-        let mut i = 0;
-        while i < n {
+        let half = len / 2;
+        for (rc, ic) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+            let (r0, r1) = rc.split_at_mut(half);
+            let (i0, i1) = ic.split_at_mut(half);
             // Recomputing the twiddle by repeated multiplication accumulates
             // error over long transforms, so derive each from its index.
-            for k in 0..len / 2 {
+            for (k, ((ur, ui), (xr, xi))) in r0
+                .iter_mut()
+                .zip(i0.iter_mut())
+                .zip(r1.iter_mut().zip(i1.iter_mut()))
+                .enumerate()
+            {
                 let a = ang * k as f32;
                 let (cr, ci) = (a.cos(), a.sin());
-                let (ur, ui) = (re[i + k], im[i + k]);
-                let (xr, xi) = (re[i + k + len / 2], im[i + k + len / 2]);
-                let vr = xr * cr - xi * ci;
-                let vi = xr * ci + xi * cr;
-                re[i + k] = ur + vr;
-                im[i + k] = ui + vi;
-                re[i + k + len / 2] = ur - vr;
-                im[i + k + len / 2] = ui - vi;
+                let (u_re, u_im) = (*ur, *ui);
+                let (x_re, x_im) = (*xr, *xi);
+                let vr = x_re * cr - x_im * ci;
+                let vi = x_re * ci + x_im * cr;
+                *ur = u_re + vr;
+                *ui = u_im + vi;
+                *xr = u_re - vr;
+                *xi = u_im - vi;
             }
-            i += len;
         }
         len <<= 1;
     }
@@ -101,6 +116,35 @@ pub fn fft(re: &mut [f32], im: &mut [f32]) -> bool {
 pub const TWIDDLE_N: usize = 8192;
 
 static TWIDDLES: std::sync::OnceLock<Vec<(f32, f32)>> = std::sync::OnceLock::new();
+static BITREV: std::sync::OnceLock<Vec<Vec<(u16, u16)>>> = std::sync::OnceLock::new();
+
+/// Swap pairs `(i, j)` with `i < j` for bit-reversal of each power-of-two size
+/// from `1` up to `TWIDDLE_N`, built once (~32 KB across all 13 sizes).
+fn bitrev_tables() -> &'static [Vec<(u16, u16)>] {
+    BITREV.get_or_init(|| {
+        let max_pow = TWIDDLE_N.trailing_zeros() as usize;
+        let mut tables = Vec::with_capacity(max_pow + 1);
+        tables.push(Vec::new()); // 2^0 = 1
+        for pow in 1..=max_pow {
+            let n = 1usize << pow;
+            let mut pairs = Vec::new();
+            let mut j = 0usize;
+            for i in 1..n {
+                let mut bit = n >> 1;
+                while j & bit != 0 {
+                    j ^= bit;
+                    bit >>= 1;
+                }
+                j |= bit;
+                if i < j {
+                    pairs.push((i as u16, j as u16));
+                }
+            }
+            tables.push(pairs);
+        }
+        tables
+    })
+}
 
 /// `exp(-2*pi*i*j/N)` for `j` in `0..N/2`, built once.
 ///
@@ -122,13 +166,14 @@ fn twiddles() -> &'static [(f32, f32)] {
     })
 }
 
-/// Build the table now, off whatever thread you like.
+/// Build the tables now, off whatever thread you like.
 ///
-/// It is built on first use, and first use may well be inside the audio
-/// callback — a one-off 32 KB allocation there is exactly the kind of thing
-/// that costs one block. The engine calls this while it is starting up.
+/// They are built on first use, and first use may well be inside the audio
+/// callback — one-off allocations there are exactly the kind of thing that
+/// costs one block. The engine calls this while it is starting up.
 pub fn prime() {
     let _ = twiddles();
+    let _ = bitrev_tables();
 }
 
 /// Magnitude of each bin up to Nyquist, given a completed transform.
@@ -281,5 +326,68 @@ mod tests {
             win_far < raw_far * 0.2,
             "windowing should suppress distant leakage: {win_far} vs {raw_far}"
         );
+    }
+
+    #[test]
+    fn tabled_bitrev_and_slice_butterflies_are_bit_identical_for_all_sizes() {
+        prime();
+        let tw = twiddles();
+        for pow in 1..=TWIDDLE_N.trailing_zeros() {
+            let n = 1usize << pow;
+            let mut seed = 0x1234_5678u32 ^ n as u32;
+            let mut re_a = Vec::with_capacity(n);
+            let mut im_a = Vec::with_capacity(n);
+            for _ in 0..n {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                re_a.push(((seed >> 8) as f32) / 8_388_608.0 - 1.0);
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                im_a.push(((seed >> 8) as f32) / 8_388_608.0 - 1.0);
+            }
+            let mut re_b = re_a.clone();
+            let mut im_b = im_a.clone();
+
+            assert!(fft(&mut re_a, &mut im_a));
+
+            // Direct reference: on-the-fly bit-reversal + indexed butterflies.
+            let mut j = 0usize;
+            for i in 1..n {
+                let mut bit = n >> 1;
+                while j & bit != 0 {
+                    j ^= bit;
+                    bit >>= 1;
+                }
+                j |= bit;
+                if i < j {
+                    re_b.swap(i, j);
+                    im_b.swap(i, j);
+                }
+            }
+            let mut len = 2usize;
+            while len <= n {
+                let stride = TWIDDLE_N / len;
+                let half = len / 2;
+                let mut i = 0;
+                while i < n {
+                    for k in 0..half {
+                        let (cr, ci) = tw[k * stride];
+                        let (ur, ui) = (re_b[i + k], im_b[i + k]);
+                        let (xr, xi) = (re_b[i + k + half], im_b[i + k + half]);
+                        let vr = xr * cr - xi * ci;
+                        let vi = xr * ci + xi * cr;
+                        re_b[i + k] = ur + vr;
+                        im_b[i + k] = ui + vi;
+                        re_b[i + k + half] = ur - vr;
+                        im_b[i + k + half] = ui - vi;
+                    }
+                    i += len;
+                }
+                len <<= 1;
+            }
+
+            for idx in 0..n {
+                assert_eq!(re_a[idx].to_bits(), re_b[idx].to_bits(), "re mismatch at n={n} idx={idx}");
+                assert_eq!(im_a[idx].to_bits(), im_b[idx].to_bits(), "im mismatch at n={n} idx={idx}");
+            }
+        }
     }
 }

@@ -232,14 +232,40 @@ impl NoiseStream {
                 }
                 crate::vstream::ifft(&mut self.re[..n], &mut self.im[..n]);
 
-                for i in 0..n {
-                    let slot = ((self.write + i as u64) % self.ring as u64) as usize;
-                    self.acc[slot * self.channels + ch] += self.re[i] * self.win[i];
+                let re = &self.re[..n];
+                let win = &self.win[..n];
+                let stride = self.channels;
+                let mut done = 0usize;
+                let mut slot = (self.write % self.ring as u64) as usize;
+                while done < n {
+                    let run = (n - done).min(self.ring - slot);
+                    let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                    for ((a, &r), &w) in acc
+                        .chunks_exact_mut(stride)
+                        .zip(&re[done..done + run])
+                        .zip(&win[done..done + run])
+                    {
+                        a[ch] += r * w;
+                    }
+                    done += run;
+                    slot = 0;
                 }
             }
-            for i in 0..n {
-                let slot = ((self.write + i as u64) % self.ring as u64) as usize;
-                self.norm[slot] += self.win[i] * self.win[i];
+            {
+                let win = &self.win[..n];
+                let mut done = 0usize;
+                let mut slot = (self.write % self.ring as u64) as usize;
+                while done < n {
+                    let run = (n - done).min(self.ring - slot);
+                    for (dst, &w) in self.norm[slot..slot + run]
+                        .iter_mut()
+                        .zip(&win[done..done + run])
+                    {
+                        *dst += w * w;
+                    }
+                    done += run;
+                    slot = 0;
+                }
             }
             self.dirty.mark(self.write, self.write + n as u64);
 
@@ -256,29 +282,38 @@ impl NoiseStream {
         }
         let floor = (full / (n as f32 / hop as f32).max(1.0)) * 0.05;
 
-        for f in 0..frames {
-            let frame = self.emitted + f as u64;
-            let slot = (frame % self.ring as u64) as usize;
-            let d = self.norm[slot].max(floor);
+        let stride = self.channels;
+        let mut done = 0usize;
+        let mut slot = (self.emitted % self.ring as u64) as usize;
+        while done < frames {
+            let run = (frames - done).min(self.ring - slot);
+            for k in 0..run {
+                let f = done + k;
+                let frame = self.emitted + f as u64;
+                let s = slot + k;
+                let d = self.norm[s].max(floor);
 
-            // Put the level back where the source's was. Random phases sum
-            // incoherently, so the synthesised level is short by an amount that
-            // depends on the overlap and the spectrum — measured rather than
-            // derived, a hop at a time, ramped so nothing steps.
-            if frame >= self.gain_at {
-                self.gain_from = self.gain_to;
-                self.gain_to = self.local_gain(input, channels, frame, ratio, hop, d, scan);
-                self.gain_at = frame + hop as u64;
-            }
-            let along = ((frame + hop as u64 - self.gain_at) as f32) / hop as f32;
-            let g = self.gain_from + (self.gain_to - self.gain_from) * along.clamp(0.0, 1.0);
+                // Put the level back where the source's was. Random phases sum
+                // incoherently, so the synthesised level is short by an amount that
+                // depends on the overlap and the spectrum — measured rather than
+                // derived, a hop at a time, ramped so nothing steps.
+                if frame >= self.gain_at {
+                    self.gain_from = self.gain_to;
+                    self.gain_to = self.local_gain(input, channels, frame, ratio, hop, d, scan);
+                    self.gain_at = frame + hop as u64;
+                }
+                let along = ((frame + hop as u64 - self.gain_at) as f32) / hop as f32;
+                let g = self.gain_from + (self.gain_to - self.gain_from) * along.clamp(0.0, 1.0);
 
-            for ch in 0..channels {
-                let v = self.acc[slot * self.channels + ch];
-                out[f * channels + ch] = if d > 1e-6 { v / d * g } else { 0.0 };
-                self.acc[slot * self.channels + ch] = 0.0;
+                for ch in 0..channels {
+                    let v = self.acc[s * stride + ch];
+                    out[f * channels + ch] = if d > 1e-6 { v / d * g } else { 0.0 };
+                    self.acc[s * stride + ch] = 0.0;
+                }
+                self.norm[s] = 0.0;
             }
-            self.norm[slot] = 0.0;
+            done += run;
+            slot = 0;
         }
         if channels == self.channels {
             self.dirty.cleared_prefix(self.emitted, need, self.ring);
@@ -313,13 +348,22 @@ impl NoiseStream {
         let want = (want / ((hi - src).max(1) * channels) as f32).sqrt();
 
         let mut have = 0f32;
-        for i in 0..hop {
-            let slot = ((frame + i as u64) % self.ring as u64) as usize;
-            let n = self.norm[slot].max(d);
-            for ch in 0..channels {
-                let v = self.acc[slot * self.channels + ch] / n.max(1e-6);
-                have += v * v;
+        let stride = self.channels;
+        let mut done = 0usize;
+        let mut slot = (frame % self.ring as u64) as usize;
+        while done < hop {
+            let run = (hop - done).min(self.ring - slot);
+            let acc = &self.acc[slot * stride..(slot + run) * stride];
+            let norm = &self.norm[slot..slot + run];
+            for (a, &nm) in acc.chunks_exact(stride).zip(norm) {
+                let n = nm.max(d).max(1e-6);
+                for &v in &a[..channels] {
+                    let x = v / n;
+                    have += x * x;
+                }
             }
+            done += run;
+            slot = 0;
         }
         let have = (have / (hop * channels) as f32).sqrt();
         // Never more than twelve decibels of it — beyond that it is amplifying

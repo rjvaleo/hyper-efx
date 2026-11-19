@@ -226,17 +226,7 @@ fn resample(input: &[f32], want: usize) -> Vec<f32> {
 }
 
 fn ifft(re: &mut [f32], im: &mut [f32]) {
-    for v in im.iter_mut() {
-        *v = -*v;
-    }
-    fft(re, im);
-    let n = re.len() as f32;
-    for v in re.iter_mut() {
-        *v /= n;
-    }
-    for v in im.iter_mut() {
-        *v = -*v / n;
-    }
+    crate::vstream::ifft(re, im);
 }
 
 #[cfg(test)]

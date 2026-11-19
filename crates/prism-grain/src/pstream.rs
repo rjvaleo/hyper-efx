@@ -227,12 +227,27 @@ impl PvsolaStream {
             self.splice(channels, in_frames, &pl);
         }
 
-        for f in 0..frames {
-            let slot = ((self.emitted + f as u64) % self.ring as u64) as usize;
-            for ch in 0..channels {
-                out[f * channels + ch] = self.acc[slot * self.channels + ch];
-                self.acc[slot * self.channels + ch] = 0.0;
+        let stride = self.channels;
+        let mut done = 0usize;
+        let mut slot = (self.emitted % self.ring as u64) as usize;
+        while done < frames {
+            let run = (frames - done).min(self.ring - slot);
+            let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+            let dst = &mut out[done * channels..(done + run) * channels];
+            if channels == stride {
+                dst.copy_from_slice(acc);
+                acc.fill(0.0);
+            } else {
+                for (a, o) in acc
+                    .chunks_exact_mut(stride)
+                    .zip(dst.chunks_exact_mut(channels))
+                {
+                    o.copy_from_slice(&a[..channels]);
+                    a[..channels].fill(0.0);
+                }
             }
+            done += run;
+            slot = 0;
         }
         if channels == self.channels {
             self.dirty.cleared_prefix(self.emitted, need, self.ring);
@@ -324,11 +339,25 @@ impl PvsolaStream {
 
         if self.first {
             let len = (want - at).min(pl.out_span);
-            for i in 0..len {
-                let slot = ((self.written + i as u64) % self.ring as u64) as usize;
-                for ch in 0..channels {
-                    self.acc[slot * self.channels + ch] = self.piece[(at + i) * channels + ch];
+            let stride = self.channels;
+            let mut done = 0usize;
+            let mut slot = (self.written % self.ring as u64) as usize;
+            while done < len {
+                let run = (len - done).min(self.ring - slot);
+                let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                let src = &self.piece[(at + done) * channels..(at + done + run) * channels];
+                if channels == stride {
+                    acc.copy_from_slice(src);
+                } else {
+                    for (a, s) in acc
+                        .chunks_exact_mut(stride)
+                        .zip(src.chunks_exact(channels))
+                    {
+                        a[..channels].copy_from_slice(s);
+                    }
                 }
+                done += run;
+                slot = 0;
             }
             self.dirty.mark(self.written, self.written + len as u64);
             self.written += len as u64;
@@ -341,25 +370,34 @@ impl PvsolaStream {
             let join = self.written.saturating_sub(pl.blend as u64);
             let off = self.best_offset(channels, join, pl.blend.max(1), at, pl.search);
             let len = (want - off).min(pl.out_span + pl.blend);
-            for i in 0..len {
-                // Linear, not equal power. Equal power is right for two signals
-                // that are unrelated, and the search has just spent its whole
-                // effort making these two agree.
-                let w = if pl.blend > 0 && i < pl.blend {
-                    (i as f32 + 0.5) / pl.blend as f32
-                } else {
-                    1.0
-                };
-                let slot = ((join + i as u64) % self.ring as u64) as usize;
-                for ch in 0..channels {
-                    let old = if i < pl.blend {
-                        self.acc[slot * self.channels + ch] * (1.0 - w)
+            let stride = self.channels;
+            let mut done = 0usize;
+            let mut slot = (join % self.ring as u64) as usize;
+            while done < len {
+                let run = (len - done).min(self.ring - slot);
+                let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                let src = &self.piece[(off + done) * channels..(off + done + run) * channels];
+                for (k, (a, s)) in acc
+                    .chunks_exact_mut(stride)
+                    .zip(src.chunks_exact(channels))
+                    .enumerate()
+                {
+                    let i = done + k;
+                    // Linear, not equal power. Equal power is right for two signals
+                    // that are unrelated, and the search has just spent its whole
+                    // effort making these two agree.
+                    let w = if pl.blend > 0 && i < pl.blend {
+                        (i as f32 + 0.5) / pl.blend as f32
                     } else {
-                        0.0
+                        1.0
                     };
-                    self.acc[slot * self.channels + ch] =
-                        old + self.piece[(off + i) * channels + ch] * w;
+                    for ch in 0..channels {
+                        let old = if i < pl.blend { a[ch] * (1.0 - w) } else { 0.0 };
+                        a[ch] = old + s[ch] * w;
+                    }
                 }
+                done += run;
+                slot = 0;
             }
             self.dirty.mark(join, join + len as u64);
             self.written = join + len as u64;
@@ -416,13 +454,26 @@ impl PvsolaStream {
         let mut want = std::mem::take(&mut self.mono_want);
         let mut mono = std::mem::take(&mut self.mono_piece);
         let fits = span <= want.len() && hi + span <= mono.len();
-        for (i, slot) in want.iter_mut().enumerate().take(if fits { span } else { 0 }) {
-            let from = ((join + i as u64) % self.ring as u64) as usize;
-            let mut acc = 0.0;
-            for ch in 0..channels {
-                acc += self.acc[from * self.channels + ch];
+        if fits {
+            let stride = self.channels;
+            let mut done = 0usize;
+            let mut slot = (join % self.ring as u64) as usize;
+            while done < span {
+                let run = (span - done).min(self.ring - slot);
+                let acc = &self.acc[slot * stride..(slot + run) * stride];
+                for (dst, a) in want[done..done + run]
+                    .iter_mut()
+                    .zip(acc.chunks_exact(stride))
+                {
+                    let mut sum = 0.0;
+                    for &v in &a[..channels] {
+                        sum += v;
+                    }
+                    *dst = sum / channels as f32;
+                }
+                done += run;
+                slot = 0;
             }
-            *slot = acc / channels as f32;
         }
         for f in if fits { lo..hi + span } else { 0..0 } {
             let mut acc = 0.0;

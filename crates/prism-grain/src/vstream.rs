@@ -390,14 +390,40 @@ impl VocoderStream {
                 ifft(&mut self.re[ro..ro + n], &mut self.im[ro..ro + n]);
 
                 let pan = if c == 0 { gl } else { gr };
-                for i in 0..n {
-                    let slot = ((self.write + i as u64) % self.ring as u64) as usize;
-                    self.acc[slot * self.channels + c] += self.re[ro + i] * self.win[i] * pan;
+                let re_c = &self.re[ro..ro + n];
+                let win = &self.win[..n];
+                let stride = self.channels;
+                let mut done = 0usize;
+                let mut slot = (self.write % self.ring as u64) as usize;
+                while done < n {
+                    let run = (n - done).min(self.ring - slot);
+                    let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                    for ((a, &r), &w) in acc
+                        .chunks_exact_mut(stride)
+                        .zip(&re_c[done..done + run])
+                        .zip(&win[done..done + run])
+                    {
+                        a[c] += r * w * pan;
+                    }
+                    done += run;
+                    slot = 0;
                 }
             }
-            for i in 0..n {
-                let slot = ((self.write + i as u64) % self.ring as u64) as usize;
-                self.norm[slot] += self.win[i] * self.win[i];
+            {
+                let win = &self.win[..n];
+                let mut done = 0usize;
+                let mut slot = (self.write % self.ring as u64) as usize;
+                while done < n {
+                    let run = (n - done).min(self.ring - slot);
+                    for (dst, &w) in self.norm[slot..slot + run]
+                        .iter_mut()
+                        .zip(&win[done..done + run])
+                    {
+                        *dst += w * w;
+                    }
+                    done += run;
+                    slot = 0;
+                }
             }
             self.dirty.mark(self.write, self.write + n as u64);
 
@@ -407,17 +433,32 @@ impl VocoderStream {
         }
 
         // Hand out what is finished, and clear it for reuse.
-        for f in 0..frames {
-            let slot = ((self.emitted + f as u64) % self.ring as u64) as usize;
-            let d = self.norm[slot].max(self.floor);
-            for ch in 0..channels {
-                let v = self.acc[slot * self.channels + ch];
-                out[f * channels + ch] = if d > 1e-6 { v / d } else { v };
+        {
+            let stride = self.channels;
+            let floor = self.floor;
+            let mut done = 0usize;
+            let mut slot = (self.emitted % self.ring as u64) as usize;
+            while done < frames {
+                let run = (frames - done).min(self.ring - slot);
+                let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                let norm = &mut self.norm[slot..slot + run];
+                let dst = &mut out[done * channels..(done + run) * channels];
+                for ((a, nm), o) in acc
+                    .chunks_exact_mut(stride)
+                    .zip(norm.iter_mut())
+                    .zip(dst.chunks_exact_mut(channels))
+                {
+                    let d = nm.max(floor);
+                    for ch in 0..channels {
+                        let v = a[ch];
+                        o[ch] = if d > 1e-6 { v / d } else { v };
+                    }
+                    a.fill(0.0);
+                    *nm = 0.0;
+                }
+                done += run;
+                slot = 0;
             }
-            for ch in 0..self.channels {
-                self.acc[slot * self.channels + ch] = 0.0;
-            }
-            self.norm[slot] = 0.0;
         }
         self.dirty.cleared_prefix(self.emitted, need, self.ring);
         self.emitted = need;
@@ -544,17 +585,29 @@ fn wrap(p: f32) -> f32 {
     x
 }
 
+/// Real-output inverse transform by conjugation.
+///
+/// Every caller (`vstream::render`, `nstream::render`, `decompose`, `noise`,
+/// and `vocoder` tests) reconstructs a Hermitian-symmetric real signal, reads
+/// only `re`, and overwrites `im` before reusing it — so the final `im` pass
+/// is skipped. For power-of-two lengths, multiplying by `1.0 / n` is IEEE-754
+/// bit-identical to dividing by `n`.
 pub(crate) fn ifft(re: &mut [f32], im: &mut [f32]) {
     for v in im.iter_mut() {
         *v = -*v;
     }
     fft(re, im);
-    let n = re.len() as f32;
-    for v in re.iter_mut() {
-        *v /= n;
-    }
-    for v in im.iter_mut() {
-        *v = -*v / n;
+    let len = re.len();
+    if len.is_power_of_two() {
+        let inv = 1.0 / len as f32;
+        for v in re.iter_mut() {
+            *v *= inv;
+        }
+    } else if len > 0 {
+        let n = len as f32;
+        for v in re.iter_mut() {
+            *v /= n;
+        }
     }
 }
 

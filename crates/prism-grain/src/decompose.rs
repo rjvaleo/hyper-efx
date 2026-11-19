@@ -222,19 +222,9 @@ pub fn separate_mono(input: &[f32], s: Split) -> Parts {
     }
 }
 
-/// Inverse transform by conjugation, as in the vocoder.
+/// Inverse transform by conjugation, as in the vocoder (only `re` is read).
 fn ifft(re: &mut [f32], im: &mut [f32]) {
-    for v in im.iter_mut() {
-        *v = -*v;
-    }
-    fft(re, im);
-    let n = re.len() as f32;
-    for v in re.iter_mut() {
-        *v /= n;
-    }
-    for v in im.iter_mut() {
-        *v = -*v / n;
-    }
+    crate::vstream::ifft(re, im);
 }
 
 #[cfg(test)]

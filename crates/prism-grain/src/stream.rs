@@ -452,30 +452,43 @@ impl Streamer for WsolaStream {
                 // written past the end of the buffer.
                 self.overflows += 1;
             } else {
-                for i in 0..len {
-                    let w = if steady {
-                        self.window[i]
-                    } else {
-                        crate::stretch::shape_at(i, len, p.wsola.shape, g.envelope)
-                    };
-                    let frame = self.write + i as u64;
-                    let slot = (frame % self.ring as u64) as usize;
-                    let step = if g.reverse {
-                        span - (i as f32) * rate
-                    } else {
-                        (i as f32) * rate
-                    };
-                    let src = take as f32 + step;
-                    if src >= (in_frames - 1) as f32 || src < 0.0 {
-                        continue;
+                let stride = self.channels;
+                let mut done = 0usize;
+                let mut slot = (self.write % self.ring as u64) as usize;
+                while done < len {
+                    let run = (len - done).min(self.ring - slot);
+                    let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                    let norm = &mut self.norm[slot..slot + run];
+                    for (k, (a, nm)) in acc
+                        .chunks_exact_mut(stride)
+                        .zip(norm.iter_mut())
+                        .enumerate()
+                    {
+                        let i = done + k;
+                        let w = if steady {
+                            self.window[i]
+                        } else {
+                            crate::stretch::shape_at(i, len, p.wsola.shape, g.envelope)
+                        };
+                        let step = if g.reverse {
+                            span - (i as f32) * rate
+                        } else {
+                            (i as f32) * rate
+                        };
+                        let src = take as f32 + step;
+                        if src >= (in_frames - 1) as f32 || src < 0.0 {
+                            continue;
+                        }
+                        for ch in 0..channels {
+                            let pan = if ch == 0 { gl } else { gr };
+                            a[ch] += crate::stretch::read_at(
+                                input, channels, ch, src, in_frames,
+                            ) * w * pan;
+                        }
+                        *nm += w;
                     }
-                    for ch in 0..channels {
-                        let pan = if ch == 0 { gl } else { gr };
-                        self.acc[slot * self.channels + ch] += crate::stretch::read_at(
-                            input, channels, ch, src, in_frames,
-                        ) * w * pan;
-                    }
-                    self.norm[slot] += w;
+                    done += run;
+                    slot = 0;
                 }
                 self.dirty.mark(self.write, self.write + len as u64);
             }
@@ -503,18 +516,31 @@ impl Streamer for WsolaStream {
 
         // Hand out the finished frames and clear them for reuse. Nothing can
         // contribute to a frame the write pointer has already passed.
-        for f in 0..frames {
-            let frame = self.emitted + f as u64;
-            let slot = (frame % self.ring as u64) as usize;
-            let n = self.norm[slot];
-            for ch in 0..channels {
-                let v = self.acc[slot * self.channels + ch];
-                out[f * channels + ch] = if n > 1e-6 { v / n } else { v };
+        {
+            let stride = self.channels;
+            let mut done = 0usize;
+            let mut slot = (self.emitted % self.ring as u64) as usize;
+            while done < frames {
+                let run = (frames - done).min(self.ring - slot);
+                let acc = &mut self.acc[slot * stride..(slot + run) * stride];
+                let norm = &mut self.norm[slot..slot + run];
+                let dst = &mut out[done * channels..(done + run) * channels];
+                for ((a, nm), o) in acc
+                    .chunks_exact_mut(stride)
+                    .zip(norm.iter_mut())
+                    .zip(dst.chunks_exact_mut(channels))
+                {
+                    let n = *nm;
+                    for ch in 0..channels {
+                        let v = a[ch];
+                        o[ch] = if n > 1e-6 { v / n } else { v };
+                    }
+                    a.fill(0.0);
+                    *nm = 0.0;
+                }
+                done += run;
+                slot = 0;
             }
-            for ch in 0..self.channels {
-                self.acc[slot * self.channels + ch] = 0.0;
-            }
-            self.norm[slot] = 0.0;
         }
         self.dirty.cleared_prefix(self.emitted, need, self.ring);
         self.emitted = need;
@@ -909,11 +935,22 @@ impl PitchRing {
     /// Take `n` freshly stretched frames from `src`.
     pub fn push(&mut self, src: &[f32], n: usize, channels: usize) {
         let channels = channels.max(1).min(self.channels);
-        for i in 0..n {
-            let slot = ((self.made + i as u64) % self.ring as u64) as usize;
-            for ch in 0..channels {
-                self.buf[slot * self.channels + ch] = src[i * channels + ch];
+        let stride = self.channels;
+        let mut done = 0usize;
+        let mut slot = (self.made % self.ring as u64) as usize;
+        while done < n {
+            let run = (n - done).min(self.ring - slot);
+            let dst = &mut self.buf[slot * stride..(slot + run) * stride];
+            let s = &src[done * channels..(done + run) * channels];
+            if channels == stride {
+                dst.copy_from_slice(s);
+            } else {
+                for (d, src_f) in dst.chunks_exact_mut(stride).zip(s.chunks_exact(channels)) {
+                    d[..channels].copy_from_slice(src_f);
+                }
             }
+            done += run;
+            slot = 0;
         }
         self.dirty.mark(self.made, self.made + n as u64);
         self.made += n as u64;
@@ -932,6 +969,13 @@ impl PitchRing {
         let k = 1.0 - (-1.0f32 / GLIDE_FRAMES).exp();
         let mut walking = self.base;
         let mut glided = false;
+        let ring = self.ring;
+        let stride = self.channels;
+        let origin = self.origin as i64;
+        // Track the ring slot of `i` incrementally instead of dividing by `ring`
+        // on every tap and channel.
+        let mut tracked_i = origin;
+        let mut tracked_slot = (self.origin % ring as u64) as usize;
         for f in 0..frames {
             let at = if self.gliding() {
                 // Travelling: the position has to be accumulated, because the
@@ -959,17 +1003,74 @@ impl PitchRing {
             };
             let i = at.floor() as i64;
             let t = (at - i as f64) as f32;
-            let mut tap = |k: i64, ch: usize| -> f32 {
-                let idx = (i + k).max(self.origin as i64) as u64;
-                let slot = (idx % self.ring as u64) as usize;
-                self.buf[slot * self.channels + ch]
-            };
-            for ch in 0..channels {
-                let (m1, p0, p1, p2) = (tap(-1, ch), tap(0, ch), tap(1, ch), tap(2, ch));
-                // The same four-point Hermite the offline renderer uses. It
-                // was linear here once, which is why a pitched stream and a
-                // pitched export were audibly the same and numerically not.
-                out[f * channels + ch] = crate::stretch::hermite(m1, p0, p1, p2, t);
+            let out_f = &mut out[f * channels..(f + 1) * channels];
+            if i > origin {
+                let base_idx = i - 1;
+                if base_idx >= tracked_i {
+                    let adv = (base_idx - tracked_i) as usize;
+                    let mut s = tracked_slot + adv;
+                    if s >= ring {
+                        s -= ring;
+                        if s >= ring {
+                            s %= ring;
+                        }
+                    }
+                    tracked_i = base_idx;
+                    tracked_slot = s;
+                } else {
+                    tracked_i = base_idx;
+                    tracked_slot = (base_idx as u64 % ring as u64) as usize;
+                }
+                let s_m1 = tracked_slot;
+                if s_m1 + 3 < ring {
+                    // Contiguous four-frame span in the ring: no wrap, no modulo.
+                    let span = &self.buf[s_m1 * stride..(s_m1 + 4) * stride];
+                    for ch in 0..channels {
+                        let m1 = span[ch];
+                        let p0 = span[stride + ch];
+                        let p1 = span[2 * stride + ch];
+                        let p2 = span[3 * stride + ch];
+                        out_f[ch] = crate::stretch::hermite(m1, p0, p1, p2, t);
+                    }
+                } else {
+                    let s0 = if s_m1 + 1 < ring { s_m1 + 1 } else { 0 };
+                    let s1 = if s0 + 1 < ring { s0 + 1 } else { 0 };
+                    let s2 = if s1 + 1 < ring { s1 + 1 } else { 0 };
+                    let (b_m1, b0, b1, b2) = (
+                        s_m1 * stride,
+                        s0 * stride,
+                        s1 * stride,
+                        s2 * stride,
+                    );
+                    for ch in 0..channels {
+                        out_f[ch] = crate::stretch::hermite(
+                            self.buf[b_m1 + ch],
+                            self.buf[b0 + ch],
+                            self.buf[b1 + ch],
+                            self.buf[b2 + ch],
+                            t,
+                        );
+                    }
+                }
+            } else {
+                // First frame after a seek: `i - 1` clamps to `origin`.
+                let slot_of = |k: i64| -> usize {
+                    let idx = (i + k).max(origin) as u64;
+                    (idx % ring as u64) as usize * stride
+                };
+                let (b_m1, b0, b1, b2) = (slot_of(-1), slot_of(0), slot_of(1), slot_of(2));
+                for ch in 0..channels {
+                    // The same four-point Hermite the offline renderer uses. It
+                    // was linear here once, which is why a pitched stream and a
+                    // pitched export were audibly the same and numerically not.
+                    out_f[ch] = crate::stretch::hermite(
+                        self.buf[b_m1 + ch],
+                        self.buf[b0 + ch],
+                        self.buf[b1 + ch],
+                        self.buf[b2 + ch],
+                        t,
+                    );
+                }
             }
         }
         // A glide leaves the read somewhere the closed form does not describe,
