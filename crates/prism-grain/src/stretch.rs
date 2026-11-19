@@ -989,27 +989,34 @@ pub(crate) fn best_offset(
         return centre.min(hi);
     }
 
-    let mut best = centre.min(hi);
+    sweep(input, channels, lo, hi, centre.min(hi), expect, len, params, sums).0
+}
+
+/// The sweep over the places, with the two sums of each place's score worked out by
+/// `sums`, so the tests can run the same search with the one-chain sums it
+/// used before. Returns the place and its score.
+#[allow(clippy::too_many_arguments)]
+fn sweep<S: Fn(&[f32], &[f32], usize) -> (f32, f32)>(
+    input: &[f32],
+    channels: usize,
+    lo: usize,
+    hi: usize,
+    first: usize,
+    expect: &[f32],
+    len: usize,
+    params: WsolaParams,
+    sums: S,
+) -> (usize, f32) {
+    let mut best = first;
     let mut best_score = f32::NEG_INFINITY;
     // Four frames by default: the correlation surface is smooth enough that a
     // finer sweep costs time without changing the choice. Coarser, and the
     // choice lands on a grid you can hear.
     let step = params.stride.clamp(1, 256) as usize;
     let mut p = lo;
-    // Every other frame of what is wanted, cut once. The loop below is the
-    // same sums in the same order as indexing each sample was; only the
-    // working out of where each sample is, and the checks on it, are gone.
     let expect = &expect[..len * channels];
     while p <= hi {
-        let mut dot = 0f32;
-        let mut energy = 0f32;
-        let here = &input[p * channels..(p + len) * channels];
-        for (a, b) in here.chunks_exact(channels).zip(expect.chunks_exact(channels)).step_by(2) {
-            for (a, b) in a.iter().zip(b) {
-                dot += a * b;
-                energy += a * a;
-            }
-        }
+        let (dot, energy) = sums(&input[p * channels..(p + len) * channels], expect, channels);
         // Normalising stops the search simply picking the loudest moment, which
         // is exactly why not normalising is one of the choices.
         let score = match params.splice {
@@ -1024,7 +1031,52 @@ pub(crate) fn best_offset(
         }
         p += step;
     }
-    best
+    (best, best_score)
+}
+
+/// A place's two sums: what is here against what is wanted, and what is
+/// here against itself, over every other frame.
+///
+/// Added in eight chains, not one. The n-th sample taken (frames in order,
+/// channels within a frame) goes on chain n % 8, and the chains are added in
+/// pairs at the end. One chain makes every addition wait for the last; eight
+/// let the processor do eight at once. It is plain arithmetic in a fixed
+/// order, so every machine gets the same answer, but it is not the one-chain
+/// answer to the last bit, so between two places that score nearly the same
+/// the choice can go the other way.
+fn sums(here: &[f32], expect: &[f32], channels: usize) -> (f32, f32) {
+    let mut dot = [0f32; 8];
+    let mut energy = [0f32; 8];
+    // Blocks of sixteen samples, each of which fills the eight chains once:
+    // sixteen frames of one channel (every other one taken), or eight frames
+    // of two (both channels of every other one).
+    let take: [usize; 8] = match channels {
+        1 => [0, 2, 4, 6, 8, 10, 12, 14],
+        _ => [0, 1, 4, 5, 8, 9, 12, 13],
+    };
+    let whole = if channels <= 2 { here.len().min(expect.len()) / 16 } else { 0 };
+    for (a, b) in here.chunks_exact(16).zip(expect.chunks_exact(16)).take(whole) {
+        let a: &[f32; 16] = a.try_into().unwrap();
+        let b: &[f32; 16] = b.try_into().unwrap();
+        for k in 0..8 {
+            dot[k] += a[take[k]] * b[take[k]];
+            energy[k] += a[take[k]] * a[take[k]];
+        }
+    }
+    // The rest carries on round the chains from the first, the blocks having
+    // filled each once: what is left of a short window, or a window of more
+    // than two channels.
+    let from = whole * 16;
+    let mut k = 0;
+    for (a, b) in here[from..].chunks_exact(channels).zip(expect[from..].chunks_exact(channels)).step_by(2) {
+        for (a, b) in a.iter().zip(b) {
+            dot[k] += a * b;
+            energy[k] += a * a;
+            k = (k + 1) & 7;
+        }
+    }
+    let add = |c: [f32; 8]| ((c[0] + c[1]) + (c[2] + c[3])) + ((c[4] + c[5]) + (c[6] + c[7]));
+    (add(dot), add(energy))
 }
 
 /// Resample by `factor` (frequency multiplier) to `want` frames, with cubic
@@ -1276,6 +1328,127 @@ mod search_tests {
             }
             _ => (0.0, room * wanted.sqrt()),
         }
+    }
+
+    /// The sums as they were added up until 18 November 2026: one chain each.
+    fn one_chain(here: &[f32], expect: &[f32], channels: usize) -> (f32, f32) {
+        let (mut dot, mut energy) = (0f32, 0f32);
+        for (a, b) in here.chunks_exact(channels).zip(expect.chunks_exact(channels)).step_by(2) {
+            for (a, b) in a.iter().zip(b) {
+                dot += a * b;
+                energy += a * a;
+            }
+        }
+        (dot, energy)
+    }
+
+    /// The rule written plainly: the n-th sample taken goes on chain n % 8.
+    fn by_the_rule(here: &[f32], expect: &[f32], channels: usize) -> (f32, f32) {
+        let (mut dot, mut energy) = ([0f32; 8], [0f32; 8]);
+        let mut n = 0;
+        for f in (0..here.len() / channels).step_by(2) {
+            for c in 0..channels {
+                let (a, b) = (here[f * channels + c], expect[f * channels + c]);
+                dot[n % 8] += a * b;
+                energy[n % 8] += a * a;
+                n += 1;
+            }
+        }
+        let add = |c: [f32; 8]| ((c[0] + c[1]) + (c[2] + c[3])) + ((c[4] + c[5]) + (c[6] + c[7]));
+        (add(dot), add(energy))
+    }
+
+    #[test]
+    fn the_quick_sums_are_the_rule_to_the_last_bit() {
+        for channels in [1usize, 2, 3] {
+            let input = sound(3_000, channels, 11);
+            let expect = sound(3_000, channels, 12);
+            for len in (0..80).chain([239, 240, 241, 960, 961]) {
+                let (here, want) = (&input[..len * channels], &expect[..len * channels]);
+                let (dot, energy) = sums(here, want, channels);
+                let (rule_dot, rule_energy) = by_the_rule(here, want, channels);
+                assert_eq!(dot.to_bits(), rule_dot.to_bits(), "dot, {channels} ch, {len} frames");
+                assert_eq!(energy.to_bits(), rule_energy.to_bits(), "energy, {channels} ch, {len} frames");
+            }
+        }
+    }
+
+    /// On a real recording, how often the eight-chain search picks another
+    /// place than the one-chain search, walking it as WSOLA does: what is
+    /// wanted is what followed the last place picked. Not a test: a
+    /// measurement, run by hand with `WSOLA_TRIAL_SONG` naming a 48 kHz file
+    /// of 32-bit floats (WAV, one or two channels).
+    #[test]
+    #[ignore]
+    fn how_often_real_music_picks_differently() {
+        let Ok(path) = std::env::var("WSOLA_TRIAL_SONG") else { return };
+        let (channels, input) = wav_f32(&path);
+        let frames = input.len() / channels;
+        let (len, reach, sr) = (960usize, 480usize, 48_000f64);
+        println!("{path}: {channels} ch, {:.1} s", frames as f64 / sr);
+        for ratio in [0.5f64, 1.0, 2.0] {
+            for splice in [Splice::Similar, Splice::Loudest] {
+                let params = WsolaParams { splice, ..Default::default() };
+                let (mut tried, mut differ, mut worst_gap, mut far) = (0usize, 0usize, 0f64, 0usize);
+                let mut pos = 0usize;
+                let mut k = 0usize;
+                loop {
+                    let centre = ((k as f64) * len as f64 / ratio) as usize;
+                    let tail = pos + len;
+                    if centre + reach + len + 2 >= frames || tail + len >= frames {
+                        break;
+                    }
+                    let expect = &input[tail * channels..(tail + len) * channels];
+                    let lo = centre.saturating_sub(reach);
+                    let room = frames - (len + 1);
+                    let hi = (centre + reach).min(room);
+                    let (old, _) = sweep(&input, channels, lo, hi, centre.min(hi), expect, len, params, one_chain);
+                    let (new, _) = sweep(&input, channels, lo, hi, centre.min(hi), expect, len, params, sums);
+                    tried += 1;
+                    if old != new {
+                        differ += 1;
+                        far = far.max(old.abs_diff(new));
+                        // How much worse the new pick is, in 64-bit sums, as a
+                        // share of the old pick's score.
+                        let (s_old, _) = exact(&input, channels, old, expect, len, splice);
+                        let (s_new, _) = exact(&input, channels, new, expect, len, splice);
+                        if s_old.abs() > 0.0 {
+                            worst_gap = worst_gap.max((s_old - s_new) / s_old.abs());
+                        }
+                    }
+                    // The walk follows the old search, so both are asked the
+                    // same question every time.
+                    pos = old;
+                    k += 1;
+                }
+                println!(
+                    "  ratio {ratio}, {splice:?}: {differ} of {tried} splices differ ({:.3}%), \
+                     at most {far} frames apart, the new pick at worst {:.2e} of a score below the old",
+                    100.0 * differ as f64 / tried.max(1) as f64,
+                    worst_gap
+                );
+            }
+        }
+    }
+
+    /// A WAV file of 32-bit floats: its channel count and its samples.
+    fn wav_f32(path: &str) -> (usize, Vec<f32>) {
+        let bytes = std::fs::read(path).expect("the file");
+        let (mut at, mut channels, mut data) = (12usize, 0usize, None);
+        while at + 8 <= bytes.len() {
+            let id = &bytes[at..at + 4];
+            let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let body = &bytes[at + 8..(at + 8 + size).min(bytes.len())];
+            if id == b"fmt " {
+                assert_eq!(u16::from_le_bytes([body[0], body[1]]), 3, "32-bit floats");
+                channels = u16::from_le_bytes([body[2], body[3]]) as usize;
+                assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 48_000);
+            } else if id == b"data" {
+                data = Some(body.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect());
+            }
+            at += 8 + size + (size & 1);
+        }
+        (channels, data.expect("a data chunk"))
     }
 
     #[test]
