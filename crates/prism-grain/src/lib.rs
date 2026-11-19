@@ -63,4 +63,4 @@ pub fn tick(p: Progress, n: u64) -> bool {
 }
 
 #[cfg(test)]
-mod task045;
+mod ahead_search_tests;

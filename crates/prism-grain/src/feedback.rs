@@ -161,7 +161,7 @@ impl Feedback {
                     }
                 }
             }
-            let gains=self.phase.map(|phase|(std::f32::consts::PI*phase).sin().powi(2));
+            let gains = self.phase.map(|phase| (std::f32::consts::PI * phase).sin().powi(2));
             for ch in 0..lc {
                 let mut ret = 0.0;
                 for k in 0..2 {

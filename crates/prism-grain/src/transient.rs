@@ -267,13 +267,15 @@ pub struct TimeMap {
 }
 
 impl Clone for TimeMap {
-    fn clone(&self)->Self {Self::from_anchors(self.anchors.clone())}
+    fn clone(&self) -> Self {
+        Self::from_anchors(self.anchors.clone())
+    }
 }
 impl TimeMap {
     /// A constant stretch — the two-anchor case.
     pub fn linear(in_frames: usize, ratio: f32) -> Self {
         let n = in_frames as f64;
-        TimeMap { anchors: vec![(0.0, 0.0), (n, n * ratio as f64)], last:0.into() }
+        TimeMap { anchors: vec![(0.0, 0.0), (n, n * ratio as f64)], last: 0.into() }
     }
 
     /// A stretch that leaves each transient alone.
@@ -332,7 +334,7 @@ impl TimeMap {
                 return TimeMap::linear(in_frames, ratio);
             }
         }
-        TimeMap { anchors, last:0.into() }
+        TimeMap { anchors, last: 0.into() }
     }
 
     /// The output frame the map runs out at.
@@ -349,17 +351,24 @@ impl TimeMap {
         if out >= a[a.len() - 1].1 {
             return a[a.len() - 1].0;
         }
-        if a.len()<2 {return a[0].0;}
+        if a.len() < 2 {
+            return a[0].0;
+        }
         // A shared map may be read by several voices. The relaxed atomic is
         // only a hint: validate its lower bound, so seeks and other readers
         // cannot change which interval (including ties) is selected.
-        let hint=self.last.load(std::sync::atomic::Ordering::Relaxed).min(a.len()-2);
-        let start=if out>a[hint].1 {hint} else {0};
-        for (index,w) in a.windows(2).enumerate().skip(start) {
+        let hint = self
+            .last
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(a.len() - 2);
+        let start = if out > a[hint].1 { hint } else { 0 };
+        for (index, w) in a.windows(2).enumerate().skip(start) {
             let (i0, o0) = w[0];
             let (i1, o1) = w[1];
             if out <= o1 {
-                if index!=hint {self.last.store(index,std::sync::atomic::Ordering::Relaxed);}
+                if index != hint {
+                    self.last.store(index, std::sync::atomic::Ordering::Relaxed);
+                }
                 let t = (out - o0) / (o1 - o0);
                 return i0 + t * (i1 - i0);
             }
@@ -392,7 +401,7 @@ impl TimeMap {
 
     /// A map from the pairs `anchors` gave out, unchanged.
     pub fn from_anchors(anchors: Vec<(f64, f64)>) -> Self {
-        TimeMap { anchors, last:0.into() }
+        TimeMap { anchors, last: 0.into() }
     }
 }
 
