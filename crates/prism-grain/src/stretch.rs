@@ -1217,3 +1217,124 @@ mod algorithm_tests {
         }
     }
 }
+
+/// What the splice search promises, whatever order it adds in: the place it
+/// picks scores as well as any, to within the rounding of a 32-bit sum.
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    /// A sound with pitch, noise and a rise and fall, made with plain
+    /// arithmetic so it is the same on every machine.
+    fn sound(frames: usize, channels: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+        let mut low = 0f32;
+        let mut out = Vec::with_capacity(frames * channels);
+        for f in 0..frames {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (state >> 8) as f32 / 8_388_608.0 - 1.0;
+            low += 0.08 * (noise - low);
+            let tri = |period: usize| {
+                let x = (f % period) as f32 / period as f32;
+                4.0 * (x - 0.5).abs() - 1.0
+            };
+            let swell = 0.25 + 0.75 * tri(4_001).abs();
+            for c in 0..channels {
+                let side = if c == 0 { tri(109) } else { tri(113) };
+                out.push(swell * (0.5 * side + 0.25 * tri(37) + 1.5 * low) + 0.02 * noise);
+            }
+        }
+        out
+    }
+
+    fn places(frames: usize, centre: usize, search: usize, len: usize, stride: usize) -> Vec<usize> {
+        let lo = centre.saturating_sub(search);
+        let hi = (centre + search).min(frames - (len + 1));
+        (lo..=hi).step_by(stride).collect()
+    }
+
+    /// The score of one place, added in 64 bits, with what a 32-bit sum of
+    /// the same products could be out by.
+    fn exact(input: &[f32], channels: usize, p: usize, expect: &[f32], len: usize, splice: Splice) -> (f64, f64) {
+        let (mut dot, mut energy, mut wanted, mut size) = (0f64, 0f64, 0f64, 0f64);
+        for f in (0..len).step_by(2) {
+            for c in 0..channels {
+                let a = input[(p + f) * channels + c] as f64;
+                let b = expect[f * channels + c] as f64;
+                dot += a * b;
+                energy += a * a;
+                wanted += b * b;
+                size += (a * b).abs();
+            }
+        }
+        let room = 1e-4;
+        match splice {
+            Splice::Loudest => (dot, room * size),
+            _ if energy > 1e-9 => {
+                let score = dot / energy.sqrt();
+                (if splice == Splice::Different { -score } else { score }, room * wanted.sqrt())
+            }
+            _ => (0.0, room * wanted.sqrt()),
+        }
+    }
+
+    #[test]
+    fn the_place_it_picks_scores_as_well_as_any() {
+        let frames = 6_000;
+        for channels in [1usize, 2] {
+            let input = sound(frames, channels, 7 + channels as u32);
+            for len in [1usize, 2, 3, 15, 16, 17, 31, 33, 240, 960] {
+                for stride in [1u32, 3, 4] {
+                    for splice in [Splice::Similar, Splice::Different, Splice::Loudest] {
+                        for (centre, from) in [(2_000usize, 2_950usize), (700, 100), (4_600, 3_333)] {
+                            let search = 480;
+                            let expect = &input[from * channels..(from + len) * channels];
+                            let params = WsolaParams { splice, stride, ..Default::default() };
+                            let picked = best_offset(&input, channels, centre, search, expect, len, params);
+                            let all = places(frames, centre, search, len, stride as usize);
+                            assert!(all.contains(&picked), "{picked} is not a place it was asked to try");
+                            let (score, room) = exact(&input, channels, picked, expect, len, splice);
+                            let best = all
+                                .iter()
+                                .map(|&p| exact(&input, channels, p, expect, len, splice).0)
+                                .fold(f64::NEG_INFINITY, f64::max);
+                            assert!(
+                                score >= best - room,
+                                "{channels} ch, len {len}, stride {stride}, {splice:?}, centre {centre}: \
+                                 picked {picked} scoring {score}, the best scores {best}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_of_what_is_wanted_is_found_where_it_is() {
+        let frames = 6_000;
+        for channels in [1usize, 2] {
+            let input = sound(frames, channels, 3);
+            for len in [17usize, 240, 960] {
+                for at in [1_640usize, 2_000, 2_372] {
+                    let expect = input[at * channels..(at + len) * channels].to_vec();
+                    let params = WsolaParams::default();
+                    assert_eq!(best_offset(&input, channels, 2_000, 480, &expect, len, params), at);
+                    let upside_down: Vec<f32> = expect.iter().map(|v| -v).collect();
+                    let params = WsolaParams { splice: Splice::Different, ..Default::default() };
+                    assert_eq!(best_offset(&input, channels, 2_000, 480, &upside_down, len, params), at);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_silence_it_takes_the_first_place_it_tries() {
+        let input = vec![0f32; 6_000 * 2];
+        let expect = sound(960, 2, 5);
+        for splice in [Splice::Similar, Splice::Different, Splice::Loudest] {
+            let params = WsolaParams { splice, ..Default::default() };
+            assert_eq!(best_offset(&input, 2, 2_000, 480, &expect, 960, params), 1_520, "{splice:?}");
+        }
+    }
+}
