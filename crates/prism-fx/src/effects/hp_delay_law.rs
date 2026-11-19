@@ -102,10 +102,28 @@ impl Line {
 #[cfg(test)]
 pub(crate) mod golden {
     use crate::Kernel;
+    use std::path::PathBuf;
+
+    /// Every `(seconds, sample_rate)` pair requested by the Hyperprism unit tests.
+    pub(crate) const FIXTURES: &[(f32, f32)] = &[
+        (3.0, 44_100.0),
+        (3.0, 48_000.0),
+        (4.0, 44_100.0),
+        (4.0, 48_000.0),
+    ];
+
+    pub(crate) fn fixture_name(seconds: f32, sample_rate: f32) -> String {
+        let sr = sample_rate as u32;
+        let frames = (seconds * sample_rate) as usize;
+        format!("hp-golden-{sr}-{frames}.f32")
+    }
 
     /// `seconds` of two sines (220 Hz left, 331 Hz right) under fixed-seed
     /// noise, with a quiet stretch in the middle for dynamics to act on.
-    pub(crate) fn input(seconds: f32, sample_rate: f32) -> Vec<[f32; 2]> {
+    ///
+    /// Kept only for the MacBook fixture recorder so every machine feeds the
+    /// golden hashes the exact same sample bits.
+    pub(crate) fn input_computed(seconds: f32, sample_rate: f32) -> Vec<[f32; 2]> {
         let n = (seconds * sample_rate) as usize;
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut noise = move || {
@@ -122,6 +140,34 @@ pub(crate) mod golden {
                 let r = level * (core::f32::consts::TAU * 331.0 * t).sin() + 0.1 * noise();
                 [l, r]
             })
+            .collect()
+    }
+
+    /// Loads the recorded MacBook stereo input for `(seconds, sample_rate)`
+    /// from `tests/fixtures/hp-golden-<sr>-<frames>.f32` (interleaved
+    /// little-endian `f32`).
+    pub(crate) fn input(seconds: f32, sample_rate: f32) -> Vec<[f32; 2]> {
+        let frames = (seconds * sample_rate) as usize;
+        let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", &fixture_name(seconds, sample_rate)]
+            .iter()
+            .collect();
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "missing fixture {}: {e} (record on the MacBook with: cargo test --release -p prism-fx record_recorded_inputs -- --ignored)",
+                path.display()
+            )
+        });
+        let expected_bytes = frames * 2 * core::mem::size_of::<f32>();
+        assert_eq!(
+            bytes.len(),
+            expected_bytes,
+            "fixture {} has {} bytes, expected {expected_bytes}",
+            path.display(),
+            bytes.len(),
+        );
+        bytes
+            .chunks_exact(8)
+            .map(|frame| [f32::from_le_bytes(frame[..4].try_into().unwrap()), f32::from_le_bytes(frame[4..].try_into().unwrap())])
             .collect()
     }
 
@@ -169,8 +215,54 @@ pub(crate) mod golden {
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/echo_scenarios.rs"]
+mod echo_scenarios;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn write_interleaved(path: &std::path::Path, frames: impl IntoIterator<Item = [f32; 2]>, expected_frames: usize) -> usize {
+        let mut bytes = Vec::with_capacity(expected_frames * 8);
+        for [l, r] in frames {
+            bytes.extend_from_slice(&l.to_le_bytes());
+            bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        assert_eq!(bytes.len(), expected_frames * 8);
+        std::fs::write(path, &bytes).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        bytes.len()
+    }
+
+    #[test]
+    #[ignore = "records the Mac's inputs: run on the MacBook only"]
+    fn record_recorded_inputs() {
+        let out_dir = match std::env::var_os("FIXTURE_OUT") {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures"].iter().collect(),
+        };
+        std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("failed to create {}: {e}", out_dir.display()));
+
+        for &(seconds, sample_rate) in golden::FIXTURES {
+            let name = golden::fixture_name(seconds, sample_rate);
+            let frames = golden::input_computed(seconds, sample_rate);
+            let count = frames.len();
+            let path = out_dir.join(&name);
+            let bytes = write_interleaved(&path, frames, count);
+            println!("wrote {} ({count} frames, {bytes} bytes)", path.display());
+        }
+
+        for (sample_rate, count) in echo_scenarios::fixture_specs() {
+            let name = echo_scenarios::fixture_name(sample_rate, count);
+            let path = out_dir.join(&name);
+            let iter = (0..count).map(|n| {
+                let (l, r) = echo_scenarios::input_computed(n, sample_rate);
+                [l, r]
+            });
+            let bytes = write_interleaved(&path, iter, count);
+            println!("wrote {} ({count} frames, {bytes} bytes)", path.display());
+        }
+    }
 
     #[test]
     fn the_speed_law_at_its_marks() {
