@@ -193,6 +193,13 @@ struct Row {
     over_100: usize,
 }
 
+#[derive(Clone, Copy)]
+enum SweepMode {
+    Steady,
+    PerBlock,
+    Every8,
+}
+
 fn measure_case(
     id: &str,
     mode: &str,
@@ -200,7 +207,7 @@ fn measure_case(
     sig_l: &[f32],
     sig_r: &[f32],
     test_sound: &([f32; 0], &[f32], usize, f32),
-    moving: bool,
+    sweep_mode: SweepMode,
 ) -> Row {
     let _ = test_sound.0;
     let mut fx = prism_fx::make(id, SR).expect("catalog entry must build");
@@ -208,7 +215,10 @@ fn measure_case(
     if desc.sound.is_some() {
         fx.set_sound(test_sound.1, test_sound.2, test_sound.3);
     }
-    let sweep = if moving { first_continuous_param(desc) } else { None };
+    let sweep = match sweep_mode {
+        SweepMode::Steady => None,
+        SweepMode::PerBlock | SweepMode::Every8 => first_continuous_param(desc),
+    };
 
     let mut bl = vec![0.0f32; block];
     let mut br = vec![0.0f32; block];
@@ -218,16 +228,32 @@ fn measure_case(
     // Warm-up: skip the first 200 blocks.
     let mut pos = 0usize;
     for b in 0..WARMUP_BLOCKS {
-        if let Some((idx, min, max, log)) = sweep {
-            let sec = (b * block) as f64 / SR as f64;
-            fx.set_param(idx, sweep_value(min, max, log, sec));
-        }
         for i in 0..block {
             let s = (pos + i) % sig_l.len();
             bl[i] = sig_l[s];
             br[i] = sig_r[s];
         }
-        fx.process(&mut bl, &mut br);
+        match (sweep_mode, sweep) {
+            (SweepMode::Every8, Some((idx, min, max, log))) => {
+                let base_frame = b * block;
+                let mut off = 0;
+                while off < block {
+                    let end = (off + 8).min(block);
+                    let sec = (base_frame + off) as f64 / SR as f64;
+                    fx.set_param(idx, sweep_value(min, max, log, sec));
+                    fx.process(&mut bl[off..end], &mut br[off..end]);
+                    off = end;
+                }
+            }
+            (_, Some((idx, min, max, log))) => {
+                let sec = (b * block) as f64 / SR as f64;
+                fx.set_param(idx, sweep_value(min, max, log, sec));
+                fx.process(&mut bl, &mut br);
+            }
+            (_, None) => {
+                fx.process(&mut bl, &mut br);
+            }
+        }
         pos = (pos + block) % sig_l.len();
     }
 
@@ -235,18 +261,38 @@ fn measure_case(
     let mut over_50 = 0usize;
     let mut over_100 = 0usize;
     for b in 0..total_blocks {
-        if let Some((idx, min, max, log)) = sweep {
-            let sec = ((WARMUP_BLOCKS + b) * block) as f64 / SR as f64;
-            fx.set_param(idx, sweep_value(min, max, log, sec));
-        }
         for i in 0..block {
             let s = (pos + i) % sig_l.len();
             bl[i] = sig_l[s];
             br[i] = sig_r[s];
         }
-        let t0 = cpu_now();
-        fx.process(&mut bl, &mut br);
-        let dt = (cpu_now() - t0).max(0.0);
+        let dt = match (sweep_mode, sweep) {
+            (SweepMode::Every8, Some((idx, min, max, log))) => {
+                let base_frame = (WARMUP_BLOCKS + b) * block;
+                let t0 = cpu_now();
+                let mut off = 0;
+                while off < block {
+                    let end = (off + 8).min(block);
+                    let sec = (base_frame + off) as f64 / SR as f64;
+                    fx.set_param(idx, sweep_value(min, max, log, sec));
+                    fx.process(&mut bl[off..end], &mut br[off..end]);
+                    off = end;
+                }
+                (cpu_now() - t0).max(0.0)
+            }
+            (_, Some((idx, min, max, log))) => {
+                let sec = ((WARMUP_BLOCKS + b) * block) as f64 / SR as f64;
+                fx.set_param(idx, sweep_value(min, max, log, sec));
+                let t0 = cpu_now();
+                fx.process(&mut bl, &mut br);
+                (cpu_now() - t0).max(0.0)
+            }
+            (_, None) => {
+                let t0 = cpu_now();
+                fx.process(&mut bl, &mut br);
+                (cpu_now() - t0).max(0.0)
+            }
+        };
         let pct = 100.0 * dt / slot_s;
         if pct > 50.0 {
             over_50 += 1;
@@ -388,12 +434,21 @@ fn effects_worst_block_bench() {
     let (sound_samples, sound_ch, sound_sr) = contract::test_sound();
     let test_sound = ([], sound_samples.as_slice(), sound_ch, sound_sr);
 
-    let mut rows = Vec::with_capacity(CATALOG.len() * BLOCKS.len() * 2);
+    let filter = std::env::var("BENCH_FILTER").ok();
+    let mut rows = Vec::with_capacity(CATALOG.len() * BLOCKS.len() * 2 + 3);
     for entry in CATALOG {
         let id = entry.descriptor.id;
+        if let Some(ref f) = filter {
+            if id != f.as_str() {
+                continue;
+            }
+        }
         for &block in &BLOCKS {
-            rows.push(measure_case(id, "steady", block, &sig_l, &sig_r, &test_sound, false));
-            rows.push(measure_case(id, "moving", block, &sig_l, &sig_r, &test_sound, true));
+            rows.push(measure_case(id, "steady", block, &sig_l, &sig_r, &test_sound, SweepMode::Steady));
+            rows.push(measure_case(id, "moving", block, &sig_l, &sig_r, &test_sound, SweepMode::PerBlock));
+            if id == "convolution" {
+                rows.push(measure_case(id, "moving-8", block, &sig_l, &sig_r, &test_sound, SweepMode::Every8));
+            }
         }
     }
 

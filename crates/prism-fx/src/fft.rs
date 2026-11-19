@@ -83,6 +83,128 @@ impl Fft {
     }
 }
 
+/// Incremental driver for [`Fft::forward`] and [`Fft::inverse`].
+///
+/// Executes the exact same bit-reversal swaps, butterfly operations (in the
+/// same `(len, start, k)` order), and inverse scaling as `Fft::run`, bounded
+/// by a caller-supplied operation budget per call so large transforms can be
+/// spread across audio blocks bit-identically.
+#[derive(Clone, Copy, Debug)]
+pub struct FftStepper {
+    n: usize,
+    inverse: bool,
+    phase: FftPhase,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FftPhase {
+    BitRev { i: usize },
+    Butterfly { len: usize, start: usize, k: usize },
+    Scale { i: usize },
+    Done,
+}
+
+impl FftStepper {
+    pub fn new(n: usize, inverse: bool) -> Self {
+        let phase = if n < 2 {
+            FftPhase::Done
+        } else {
+            FftPhase::BitRev { i: 0 }
+        };
+        FftStepper { n, inverse, phase }
+    }
+
+    pub fn is_done(&self) -> bool {
+        matches!(self.phase, FftPhase::Done)
+    }
+
+    /// Advance by at most `budget` unit operations (bit-reversal indices,
+    /// butterflies, or inverse-scale samples). Returns `true` when finished.
+    pub fn step(&mut self, fft: &Fft, re: &mut [f32], im: &mut [f32], budget: usize) -> bool {
+        let n = self.n;
+        debug_assert!(n.is_power_of_two() && n <= fft.max && re.len() == n && im.len() == n);
+        let mut left = budget.max(1);
+        while left > 0 {
+            match self.phase {
+                FftPhase::Done => return true,
+                FftPhase::BitRev { i } => {
+                    let bits = n.trailing_zeros();
+                    let end = (i + left).min(n);
+                    for idx in i..end {
+                        let j = idx.reverse_bits() >> (usize::BITS - bits);
+                        if j > idx {
+                            re.swap(idx, j);
+                            im.swap(idx, j);
+                        }
+                    }
+                    left -= end - i;
+                    self.phase = if end == n {
+                        FftPhase::Butterfly { len: 2, start: 0, k: 0 }
+                    } else {
+                        FftPhase::BitRev { i: end }
+                    };
+                }
+                FftPhase::Butterfly { mut len, mut start, mut k } => {
+                    let flip = if self.inverse { -1.0 } else { 1.0 };
+                    while left > 0 && len <= n {
+                        let stride = fft.max / len;
+                        let half = len / 2;
+                        while left > 0 && start < n {
+                            let end_k = (k + left).min(half);
+                            let did = end_k - k;
+                            for kk in k..end_k {
+                                let (wr, wi) = (fft.cos[kk * stride], flip * fft.sin[kk * stride]);
+                                let (a, b) = (start + kk, start + kk + half);
+                                let tr = re[b] * wr - im[b] * wi;
+                                let ti = re[b] * wi + im[b] * wr;
+                                re[b] = re[a] - tr;
+                                im[b] = im[a] - ti;
+                                re[a] += tr;
+                                im[a] += ti;
+                            }
+                            left -= did;
+                            k = end_k;
+                            if k == half {
+                                k = 0;
+                                start += len;
+                            }
+                        }
+                        if start >= n {
+                            len *= 2;
+                            start = 0;
+                            k = 0;
+                        }
+                    }
+                    self.phase = if len > n {
+                        if self.inverse {
+                            FftPhase::Scale { i: 0 }
+                        } else {
+                            FftPhase::Done
+                        }
+                    } else {
+                        FftPhase::Butterfly { len, start, k }
+                    };
+                }
+                FftPhase::Scale { i } => {
+                    let scale = 1.0 / n as f32;
+                    let end = (i + left).min(n);
+                    for idx in i..end {
+                        re[idx] *= scale;
+                        im[idx] *= scale;
+                    }
+                    left -= end - i;
+                    self.phase = if end == n {
+                        FftPhase::Done
+                    } else {
+                        FftPhase::Scale { i: end }
+                    };
+                }
+            }
+        }
+        self.is_done()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +240,32 @@ mod tests {
             fft.inverse(&mut r, &mut i);
             for k in 0..n {
                 assert!((r[k] - re[k]).abs() < 1e-5 && (i[k] - im[k]).abs() < 1e-5, "n {n}, round trip at {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn stepper_matches_whole_forward_and_inverse_bit_for_bit() {
+        let fft = Fft::new(1024);
+        for n in [2, 8, 64, 1024] {
+            let re0: Vec<f32> = (0..n).map(|i| ((i * 7919) % 13) as f32 / 13.0 - 0.5).collect();
+            let im0: Vec<f32> = (0..n).map(|i| ((i * 104_729) % 11) as f32 / 11.0 - 0.5).collect();
+            for &inverse in &[false, true] {
+                let (mut rw, mut iw) = (re0.clone(), im0.clone());
+                if inverse {
+                    fft.inverse(&mut rw, &mut iw);
+                } else {
+                    fft.forward(&mut rw, &mut iw);
+                }
+                for &budget in &[1, 7, 31, 137] {
+                    let (mut rs, mut is) = (re0.clone(), im0.clone());
+                    let mut st = FftStepper::new(n, inverse);
+                    while !st.step(&fft, &mut rs, &mut is, budget) {}
+                    for k in 0..n {
+                        assert_eq!(rs[k].to_bits(), rw[k].to_bits(), "re n={n} inv={inverse} b={budget} k={k}");
+                        assert_eq!(is[k].to_bits(), iw[k].to_bits(), "im n={n} inv={inverse} b={budget} k={k}");
+                    }
+                }
             }
         }
     }
