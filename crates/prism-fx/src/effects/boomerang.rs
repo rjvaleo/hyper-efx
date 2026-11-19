@@ -102,7 +102,7 @@ impl Kernel for Boomerang {
         self.ring[self.write * 2 + 1] = frame[1];
 
         let d = (self.read as usize).min(throw.saturating_sub(1));
-        let at = (self.write + self.frames - d) % self.frames;
+        let at = if self.write >= d { self.write - d } else { self.write + self.frames - d };
         let edge = (throw / 16).max(32);
         let near = d.min(throw.saturating_sub(d));
         let fade = (near as f32 / edge as f32).clamp(0.0, 1.0);
@@ -111,7 +111,8 @@ impl Kernel for Boomerang {
             *s = *s * (1.0 - mix) + v * mix;
         }
 
-        self.write = (self.write + 1) % self.frames;
+        let next = self.write + 1;
+        self.write = if next == self.frames { 0 } else { next };
         self.read += 2.0;
         if self.read >= throw as f32 {
             self.read = 0.0;

@@ -457,7 +457,7 @@ impl Kernel for AmbientFdn {
         if self.pos == 0 {
             self.block();
         }
-        self.pos = (self.pos + 1) % BLOCK;
+        self.pos = (self.pos + 1) & (BLOCK - 1);
 
         // 1. Input gain, onto the dry path too.
         self.g_in.now += self.g_in.step;
@@ -469,9 +469,11 @@ impl Kernel for AmbientFdn {
         for (s, x) in [in_l, in_r].into_iter().enumerate() {
             let r = &mut self.pre[s];
             r.buf[r.idx] = x;
-            let read = (r.idx + r.len - self.pre_d[s]) % r.len;
+            let d = self.pre_d[s];
+            let read = if r.idx >= d { r.idx - d } else { r.idx + r.len - d };
             p[s] = PRE_SCALE * r.buf[read];
-            r.idx = (r.idx + 1) % r.len;
+            let next = r.idx + 1;
+            r.idx = if next == r.len { 0 } else { next };
         }
         let inj = [p[0], p[0], -p[0], -p[0], p[1], p[1], -p[1], -p[1]];
 
@@ -485,7 +487,8 @@ impl Kernel for AmbientFdn {
             let z = ap.buf[ap.idx];
             let v = u - c * z;
             ap.buf[ap.idx] = v;
-            ap.idx = (ap.idx + 1) % ap.len;
+            let next = ap.idx + 1;
+            ap.idx = if next == ap.len { 0 } else { next };
             a[k] = c * v + z;
         }
 
@@ -505,11 +508,16 @@ impl Kernel for AmbientFdn {
         let mut e = [0.0f32; 2];
         for (s, x) in [0.5 * in_l + 0.3 * in_r, 0.5 * in_r + 0.3 * in_l].into_iter().enumerate() {
             let r = &mut self.er[s];
-            r.idx = (r.idx + 1) % r.len;
+            let next = r.idx + 1;
+            r.idx = if next == r.len { 0 } else { next };
             r.buf[r.idx] = x;
             let mut sum = 0.0f32;
+            let idx = r.idx;
+            let len = r.len;
             for i in 0..18 {
-                sum += G[i] * r.buf[(r.idx + r.len - self.taps[s][i]) % r.len];
+                let tap = self.taps[s][i];
+                let at = if idx >= tap { idx - tap } else { idx + len - tap };
+                sum += G[i] * r.buf[at];
             }
             e[s] = sum;
         }
@@ -536,7 +544,8 @@ impl Kernel for AmbientFdn {
             self.lp2[k] = ((x + self.lp1[k] * self.sh[k]) - self.lp2[k]) * self.cd[k] + self.lp2[k];
             let d = &mut self.delay[k];
             d.buf[d.idx] = self.lp2[k] * self.g[k];
-            d.idx = (d.idx + 1) % d.len;
+            let next = d.idx + 1;
+            d.idx = if next == d.len { 0 } else { next };
         }
 
         // 10–11. The two bells on the wet, then the dry added.

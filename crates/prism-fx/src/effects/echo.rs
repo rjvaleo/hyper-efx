@@ -68,17 +68,22 @@ impl Line {
     }
 
     /// The line `delay` samples back, linearly interpolated.
+    #[inline]
     fn tap(&self, delay: f32) -> f32 {
         let n = self.buffer.len();
-        let p = (self.write as f32 - delay).rem_euclid(n as f32);
+        let p = super::mgl_dattorro_common::wrap_f32(self.write as f32 - delay, n as f32);
         let i = p.floor() as usize;
         let f = p - i as f32;
-        self.buffer[i % n] + (self.buffer[(i + 1) % n] - self.buffer[i % n]) * f
+        let a = if i < n { i } else { 0 };
+        let b = if a + 1 < n { a + 1 } else { 0 };
+        self.buffer[a] + (self.buffer[b] - self.buffer[a]) * f
     }
 
+    #[inline]
     fn push(&mut self, x: f32) {
         self.buffer[self.write] = x;
-        self.write = (self.write + 1) % self.buffer.len();
+        let next = self.write + 1;
+        self.write = if next == self.buffer.len() { 0 } else { next };
     }
 
     fn clear(&mut self) {

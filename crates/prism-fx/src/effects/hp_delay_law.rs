@@ -81,13 +81,16 @@ impl Line {
     #[inline]
     pub(crate) fn at(&self, age: usize) -> [f32; 2] {
         let len = self.frames.len();
-        self.frames[(self.write + len - age % len) % len]
+        let age = if age < len { age } else { age % len };
+        let p = if self.write >= age { self.write - age } else { self.write + len - age };
+        self.frames[p]
     }
 
     #[inline]
     pub(crate) fn push(&mut self, frame: [f32; 2]) {
         self.frames[self.write] = frame;
-        self.write = (self.write + 1) % self.frames.len();
+        let next = self.write + 1;
+        self.write = if next == self.frames.len() { 0 } else { next };
     }
 
     /// The longest age that reads a frame of its own.

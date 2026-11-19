@@ -69,13 +69,16 @@ pub struct MultiDelay {
 
 impl MultiDelay {
     /// The line `delay` samples back, linearly interpolated.
+    #[inline]
     fn tap(&self, delay: f32) -> f32 {
         let n = self.line.len();
-        let p = (self.write as f32 - delay).rem_euclid(n as f32);
+        let p = super::mgl_dattorro_common::wrap_f32(self.write as f32 - delay, n as f32);
         let i = p.floor() as usize;
         let f = p - i as f32;
-        let a = self.line[i % n];
-        a + (self.line[(i + 1) % n] - a) * f
+        let a = if i < n { i } else { 0 };
+        let b = if a + 1 < n { a + 1 } else { 0 };
+        let sa = self.line[a];
+        sa + (self.line[b] - sa) * f
     }
 
     fn glides(&mut self) -> [&mut Smoothed; 6] {
@@ -148,7 +151,8 @@ impl Kernel for MultiDelay {
         let t2 = self.tap(d2);
         let mid = 0.5 * (frame[0] + frame[1]);
         self.line[self.write] = mid + feedback * 0.5 * (t1 + t2);
-        self.write = (self.write + 1) % self.line.len();
+        let next = self.write + 1;
+        self.write = if next == self.line.len() { 0 } else { next };
 
         // Tap 1 leans left and tap 2 right; each keeps its level as it moves.
         let near = 0.5 * (1.0 + spread);

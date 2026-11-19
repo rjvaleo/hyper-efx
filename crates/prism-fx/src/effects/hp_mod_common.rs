@@ -234,19 +234,23 @@ impl Line {
     }
 
     /// The frame `back` frames before the write head, on one side.
+    #[inline]
     pub fn back(&self, side: usize, back: usize) -> f32 {
         let n = self.frames.len();
-        self.frames[(self.write + n - back % n) % n][side]
+        let back = if back < n { back } else { back % n };
+        let p = if self.write >= back { self.write - back } else { self.write + n - back };
+        self.frames[p][side]
     }
 
     /// The modulated read: `d` frames back, between the frame `int(d)` back
     /// and the one before it. Delay 0 is the frame just written.
+    #[inline]
     pub fn read(&self, side: usize, d: f64) -> f32 {
         let n = self.frames.len();
         let d = if d.is_finite() { d.clamp(0.0, (n - 2) as f64) } else { 0.0 };
         let k = d as usize;
         let f = (d as f32) - k as f32;
-        let p = (self.write + n - k) % n;
+        let p = if self.write >= k { self.write - k } else { self.write + n - k };
         let older = if p == 0 { n - 1 } else { p - 1 };
         let here = self.frames[p][side];
         here + f * (self.frames[older][side] - here)

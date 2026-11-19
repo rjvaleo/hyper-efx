@@ -246,14 +246,20 @@ impl Kernel for HpDoppler {
             self.countdown = self.reload;
         }
         let len = self.line.len();
-        let at = |age: usize| self.line[(self.write + len - age % len) % len];
+        let write = self.write;
+        let at = |age: usize| {
+            let age = if age < len { age } else { age % len };
+            let p = if write >= age { write - age } else { write + len - age };
+            self.line[p]
+        };
         let (now, before) = (at(self.age), at(self.age + 1));
         let v = self.fraction.mul_add(before - now, now);
         let input = (0.5 * (frame[0] + frame[1]) as f64) as f32;
         frame[0] = v * self.left;
         frame[1] = v * self.right;
-        self.line[self.write] = input;
-        self.write = (self.write + 1) % len;
+        self.line[write] = input;
+        let next = write + 1;
+        self.write = if next == len { 0 } else { next };
         self.delay += self.rate;
         self.read_at();
     }

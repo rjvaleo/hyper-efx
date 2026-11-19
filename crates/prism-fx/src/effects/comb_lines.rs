@@ -29,14 +29,17 @@ impl Line {
     #[inline]
     pub fn read(&self, back: usize) -> f32 {
         let len = self.buf.len();
-        self.buf[(self.at + len - back) % len]
+        let back = if back < len { back } else { back % len };
+        let at = if self.at >= back { self.at - back } else { self.at + len - back };
+        self.buf[at]
     }
 
     /// Write at the head and move it on.
     #[inline]
     pub fn write(&mut self, x: f32) {
         self.buf[self.at] = x;
-        self.at = (self.at + 1) % self.buf.len();
+        let next = self.at + 1;
+        self.at = if next == self.buf.len() { 0 } else { next };
     }
 
     /// A plain delay: read `back`, then write `x`.

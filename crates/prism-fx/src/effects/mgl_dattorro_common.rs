@@ -22,6 +22,34 @@ pub(crate) fn whole_rate(sample_rate: f32) -> u32 {
     }
 }
 
+/// Exact bit-identical replacement for `x.rem_euclid(nf)` (`nf > 0`) without
+/// calling `fmodf` in the normal `(-nf, nf)` range.
+#[inline(always)]
+pub(crate) fn wrap_f32(x: f32, nf: f32) -> f32 {
+    if x >= 0.0 && x < nf {
+        x
+    } else if x > -nf && x < 0.0 {
+        x + nf
+    } else {
+        x.rem_euclid(nf)
+    }
+}
+
+/// Exact bit-identical replacement for `x.rem_euclid(m)` (`m > 0`) without
+/// calling `fmod` in `(-m, 2m)`. By Sterbenz's lemma `x - m` is exact on `[m, 2m)`.
+#[inline(always)]
+fn wrap_f64(x: f64, m: f64) -> f64 {
+    if x >= 0.0 && x < m {
+        x
+    } else if x >= m && x < 2.0 * m {
+        x - m
+    } else if x > -m && x < 0.0 {
+        x + m
+    } else {
+        x.rem_euclid(m)
+    }
+}
+
 /// The original's delay line: written at `w`, which also holds the oldest
 /// sample, and read `delay` samples behind it with linear interpolation.
 pub(crate) struct Delay {
@@ -37,16 +65,19 @@ impl Delay {
     #[inline]
     pub fn tap(&self, delay: f32) -> f32 {
         let n = self.b.len();
-        let p = (self.w as f32 - delay).rem_euclid(n as f32);
+        let p = wrap_f32(self.w as f32 - delay, n as f32);
         let i = p.floor() as usize;
         let f = p - i as f32;
-        self.b[i % n] + (self.b[(i + 1) % n] - self.b[i % n]) * f
+        let a = if i < n { i } else { 0 };
+        let b = if a + 1 < n { a + 1 } else { 0 };
+        self.b[a] + (self.b[b] - self.b[a]) * f
     }
 
     #[inline]
     pub fn push(&mut self, x: f32) {
         self.b[self.w] = x;
-        self.w = (self.w + 1) % self.b.len();
+        let next = self.w + 1;
+        self.w = if next == self.b.len() { 0 } else { next };
     }
 
     #[inline]
@@ -87,7 +118,7 @@ pub(crate) const TAU_WIDE: f64 = TAU as f64;
 /// One step of an LFO phase kept in f64, as the originals advance theirs.
 #[inline]
 pub(crate) fn advance(phase: f64, hz: f32, sr: u32) -> f64 {
-    (phase + TAU_WIDE * hz as f64 / sr as f64).rem_euclid(TAU_WIDE)
+    wrap_f64(phase + TAU_WIDE * hz as f64 / sr as f64, TAU_WIDE)
 }
 
 // ---- the three musical filters (Part 1, sections 2-3) ---------------------------
@@ -229,12 +260,13 @@ impl ModDelay {
 
     fn read(&mut self, ch: usize, delay: f32) -> f32 {
         let frames = self.frames;
-        let pos = self.write as f32 - delay;
-        let pos = pos.rem_euclid(frames as f32);
+        let pos = wrap_f32(self.write as f32 - delay, frames as f32);
         let i = pos.floor() as usize;
         let frac = pos - i as f32;
-        let x0 = self.buf[ch][i % frames];
-        let x1 = self.buf[ch][(i + 1) % frames];
+        let a = if i < frames { i } else { 0 };
+        let b = if a + 1 < frames { a + 1 } else { 0 };
+        let x0 = self.buf[ch][a];
+        let x1 = self.buf[ch][b];
         if self.p[7] < 0.5 {
             x0 + (x1 - x0) * frac
         } else {
@@ -258,7 +290,8 @@ impl ModDelay {
             self.buf[ch][self.write] = x + wet * self.p[3];
             *out = x * self.p[5] + wet * self.p[4];
         }
-        self.write = (self.write + 1) % self.frames;
+        let next = self.write + 1;
+        self.write = if next == self.frames { 0 } else { next };
         self.phase = advance(self.phase, self.p[2], self.sr);
     }
 
@@ -322,7 +355,7 @@ impl PitchCore {
             let wb = 1.0 - wa;
             out[ch] = a * wa + b * wb;
         }
-        self.phase = (self.phase + (1.0 - ratio) as f64 / win as f64).rem_euclid(1.0);
+        self.phase = wrap_f64(self.phase + (1.0 - ratio) as f64 / win as f64, 1.0);
     }
 
     pub fn clear(&mut self) {
@@ -354,4 +387,89 @@ pub(crate) const fn spec(key: &'static str, label: &'static str, min: f32, max: 
 /// How long a biquad with this bandwidth rings, to 60 dB down.
 pub(crate) fn ring_seconds(bandwidth_hz: f32) -> f32 {
     (6.91 / (PI * bandwidth_hz.max(0.1))).min(30.0)
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_f32_and_f64_match_rem_euclid_bit_for_bit() {
+        for &nf in &[2.0f32, 3.0, 127.0, 1024.0, 48_003.0, 96_004.0] {
+            let mut xs = vec![
+                -2.5 * nf,
+                -nf - 1.0,
+                f32::from_bits((-nf).to_bits() + 1),
+                -nf,
+                f32::from_bits((-nf).to_bits() - 1),
+                -nf * 0.5,
+                -1.0,
+                -1e-6,
+                -1e-20,
+                -f32::MIN_POSITIVE,
+                -0.0,
+                0.0,
+                f32::MIN_POSITIVE,
+                1e-20,
+                1e-6,
+                0.5,
+                nf * 0.5,
+                f32::from_bits(nf.to_bits() - 1),
+                nf,
+                f32::from_bits(nf.to_bits() + 1),
+                2.5 * nf,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ];
+            for k in -200..=200 {
+                xs.push(k as f32 * 0.37);
+            }
+            for x in xs {
+                let got = wrap_f32(x, nf);
+                let want = x.rem_euclid(nf);
+                if want.is_nan() {
+                    assert!(got.is_nan(), "x={x} nf={nf}");
+                } else {
+                    assert_eq!(got.to_bits(), want.to_bits(), "x={x} nf={nf}: got={got} want={want}");
+                }
+            }
+        }
+
+        for &m in &[1.0f64, TAU_WIDE] {
+            let mut xs = vec![
+                -2.5 * m,
+                -m,
+                f64::from_bits((-m).to_bits() - 1),
+                -0.5 * m,
+                -1e-16,
+                -f64::MIN_POSITIVE,
+                -0.0,
+                0.0,
+                f64::MIN_POSITIVE,
+                1e-16,
+                0.5 * m,
+                f64::from_bits(m.to_bits() - 1),
+                m,
+                f64::from_bits(m.to_bits() + 1),
+                1.5 * m,
+                f64::from_bits((2.0 * m).to_bits() - 1),
+                2.0 * m,
+                3.5 * m,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            for k in -100..=300 {
+                xs.push(k as f64 * 0.031 * m);
+            }
+            for x in xs {
+                let got = wrap_f64(x, m);
+                let want = x.rem_euclid(m);
+                if want.is_nan() {
+                    assert!(got.is_nan(), "x={x} m={m}");
+                } else {
+                    assert_eq!(got.to_bits(), want.to_bits(), "x={x} m={m}: got={got} want={want}");
+                }
+            }
+        }
+    }
 }
