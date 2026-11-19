@@ -152,6 +152,14 @@ impl BlockRenderer {
         }
     }
 
+    /// Reserve for a larger reader request before playback. Keep the current
+    /// length and all render state, so this changes capacity only.
+    pub fn reserve_block(&mut self, frames: usize) {
+        if self.norm.capacity() < frames {
+            self.norm.reserve(frames.saturating_sub(self.norm.len()));
+        }
+    }
+
     pub fn position(&self) -> u64 {
         self.position
     }

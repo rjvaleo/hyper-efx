@@ -270,6 +270,12 @@ impl Stretcher {
         }
     }
 
+    /// Prepare the grain normalisation buffer for a varispeed reader without
+    /// changing any engine's window, ring geometry or render state.
+    pub fn reserve_grain_block(&mut self, frames: usize) {
+        self.grain.reserve_block(frames);
+    }
+
     /// One note's worth of engine: `algorithm` alone, its layers, and a cloud.
     ///
     /// The Grain page's Poly runs one of these per held key, each at its own
