@@ -11,7 +11,7 @@
 //! and 61. A hash covers the raw bits of every output sample, so "the same"
 //! means bit-identical, not close.
 
-use crate::contract::{test_sound, SAMPLE_RATE};
+use crate::contract::test_sound;
 use crate::DynKernel;
 
 /// Frames rendered per scenario: a third of a second at 48 kHz, enough for
