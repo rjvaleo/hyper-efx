@@ -61,3 +61,6 @@ pub fn tick(p: Progress, n: u64) -> bool {
         None => true,
     }
 }
+
+#[cfg(test)]
+mod task045;

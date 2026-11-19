@@ -161,10 +161,11 @@ impl Feedback {
                     }
                 }
             }
+            let gains=self.phase.map(|phase|(std::f32::consts::PI*phase).sin().powi(2));
             for ch in 0..lc {
                 let mut ret = 0.0;
                 for k in 0..2 {
-                    let gain = (std::f32::consts::PI * self.phase[k]).sin().powi(2);
+                    let gain = gains[k];
                     ret += gain * self.tap(ch, self.delay[k][ch]);
                     self.delay[k][ch] += drift;
                 }

@@ -959,6 +959,7 @@ fn wsola(
 
 /// Search ±`search` frames around `centre` for the segment best matching
 /// `expect`, by normalised cross-correlation.
+#[cfg(test)]
 pub(crate) fn best_offset(
     input: &[f32],
     channels: usize,
@@ -992,9 +993,37 @@ pub(crate) fn best_offset(
     sweep(input, channels, lo, hi, centre.min(hi), expect, len, params, sums).0
 }
 
+/// A candidate sweep paused only between complete scores. The score arithmetic,
+/// candidate order and strict comparison are identical to `sweep`.
+pub(crate) struct OffsetSearch {
+    next: usize, hi: usize, step: usize, best: usize, score: f32,
+}
+impl OffsetSearch {
+    pub(crate) fn new(input_len: usize, channels: usize, centre: usize, radius: usize, len: usize, params: WsolaParams) -> Self {
+        let room = (input_len / channels).saturating_sub(len + 1);
+        let lo = centre.saturating_sub(radius);
+        let hi = (centre + radius).min(room);
+        let (best, done) = if radius == 0 {(centre,true)} else if room == 0 {(centre.min(room),true)} else {(centre.min(hi),hi<=lo)};
+        Self {next:if done {hi+1} else {lo},hi,step:params.stride.clamp(1,256) as usize,best,score:f32::NEG_INFINITY}
+    }
+    pub(crate) fn remaining(&self) -> usize {if self.next>self.hi {0} else {(self.hi-self.next)/self.step+1}}
+    pub(crate) fn advance(&mut self,input:&[f32],channels:usize,expect:&[f32],len:usize,params:WsolaParams,count:usize) {
+        for _ in 0..count.min(self.remaining()) {
+            let p=self.next;
+            let (dot,energy)=sums(&input[p*channels..(p+len)*channels],&expect[..len*channels],channels);
+            let score=match params.splice {Splice::Loudest=>dot,_ if energy>1e-9=>dot/energy.sqrt(),_=>0.0};
+            let score=if params.splice==Splice::Different {-score} else {score};
+            if score>self.score {self.score=score;self.best=p;}
+            self.next+=self.step;
+        }
+    }
+    pub(crate) fn result(&self)->usize {self.best}
+}
+
 /// The sweep over the places, with the two sums of each place's score worked out by
 /// `sums`, so the tests can run the same search with the one-chain sums it
 /// used before. Returns the place and its score.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn sweep<S: Fn(&[f32], &[f32], usize) -> (f32, f32)>(
     input: &[f32],
@@ -1128,16 +1157,22 @@ pub fn hermite(m1: f32, p0: f32, p1: f32, p2: f32, t: f32) -> f32 {
 /// One value of that window, for when the length is not the same twice running
 /// and there is no table to build.
 #[inline]
+#[cfg(test)]
 pub(crate) fn shape_at(i: usize, n: usize, shape: WinShape, skew: f32) -> f32 {
-    if n <= 1 {
-        return 1.0;
-    }
+    shape_with_power(i,n,shape,window_power(skew))
+}
+pub(crate) fn window_power(skew:f32)->Option<f32> {
+    if (skew-0.5).abs()<1e-4 {None} else {Some(4f32.powf(skew*2.0-1.0))}
+}
+#[inline]
+pub(crate) fn shape_with_power(i:usize,n:usize,shape:WinShape,power:Option<f32>)->f32 {
+    if n<=1 {return 1.0;}
     // The envelope control moves where the window peaks, by warping the
     // position before the shape rather than by swapping in another shape — so
     // it stays smooth at both ends whatever it is set to, and composes with
     // the choice of shape instead of competing with it.
     let t = i as f32 / (n - 1) as f32;
-    let t = if (skew - 0.5).abs() < 1e-4 { t } else { t.powf(4f32.powf(skew * 2.0 - 1.0)) };
+    let t = if let Some(power)=power {t.powf(power)} else {t};
     match shape {
         WinShape::Hann => 0.5 - 0.5 * (2.0 * std::f32::consts::PI * t).cos(),
         WinShape::Rect => 1.0,

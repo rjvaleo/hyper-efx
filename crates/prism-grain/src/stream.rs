@@ -194,9 +194,17 @@ pub struct WsolaStream {
     map_octave: f64,
     /// Keeps the read continuous when the ratio moves. See `anchor.rs`.
     anchor: crate::anchor::Anchor,
+    search_job: Option<PendingSearch>,
+    #[cfg(test)]
+    immediate_search: bool,
     /// Dropped because the ring could not hold the window. Surfaced rather than
     /// silently degrading, exactly as the voice pool's overflow is.
     pub overflows: u64,
+}
+
+struct PendingSearch {
+    key: (usize,usize,usize,usize,usize,usize, WsolaParams),
+    sweep: crate::stretch::OffsetSearch,
 }
 
 impl WsolaStream {
@@ -230,6 +238,9 @@ impl WsolaStream {
             map_scale: 1.0,
             map_octave: 1.0,
             anchor: crate::anchor::Anchor::default(),
+            search_job: None,
+            #[cfg(test)]
+            immediate_search: false,
             overflows: 0,
         }
     }
@@ -305,6 +316,16 @@ impl WsolaStream {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn search_at_deadline(&mut self) {self.immediate_search=true;}
+
+    fn prepare_search(&mut self,input:&[f32],channels:usize,search:usize,hop:usize,params:WsolaParams) {
+        let key=(input.as_ptr() as usize,input.len(),channels,self.read,search,hop,params);
+        if self.search_job.as_ref().is_none_or(|job|job.key!=key) {
+            self.search_job=Some(PendingSearch {key,sweep:crate::stretch::OffsetSearch::new(input.len(),channels,self.read,search,hop,params)});
+        }
+    }
+
     fn clear_ring(&mut self) {
         let ch = self.channels;
         self.dirty.clear(self.ring, |a, b| {
@@ -320,8 +341,9 @@ impl WsolaStream {
             return;
         }
         self.window.clear();
+        let power=crate::stretch::window_power(skew);
         for i in 0..len {
-            self.window.push(crate::stretch::shape_at(i, len, shape, skew));
+            self.window.push(crate::stretch::shape_with_power(i, len, shape, power));
         }
         self.window_for = Some(key);
     }
@@ -338,6 +360,7 @@ impl Streamer for WsolaStream {
 
     fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams) {
         self.clear_ring();
+        self.search_job=None;
         self.emitted = out_frame;
         self.write = out_frame;
         self.first = true;
@@ -423,15 +446,11 @@ impl Streamer for WsolaStream {
                 self.first = false;
                 self.read
             } else {
-                crate::stretch::best_offset(
-                    input,
-                    channels,
-                    self.read,
-                    search,
-                    &self.expect[..hop_out * channels],
-                    hop_out,
-                    p.wsola,
-                )
+                // A changed search key restarts it; finish at this deadline.
+                self.prepare_search(input,channels,search,hop_out,p.wsola);
+                let job=self.search_job.as_mut().unwrap();
+                job.sweep.advance(input,channels,&self.expect,hop_out,p.wsola,usize::MAX);
+                job.sweep.result()
             };
 
             let len = crate::stretch::grain_size(g, self.index, win);
@@ -445,6 +464,7 @@ impl Streamer for WsolaStream {
             let rate = crate::stretch::grain_rate(g, self.index, x);
             let (gl, gr) = crate::grain::pan_gains(g, self.index, channels);
             let span = (len as f32) * rate;
+            let power=crate::stretch::window_power(g.envelope);
 
             if len >= self.ring {
                 // Wider than the ring can hold. Only reachable if a device asks
@@ -468,7 +488,7 @@ impl Streamer for WsolaStream {
                         let w = if steady {
                             self.window[i]
                         } else {
-                            crate::stretch::shape_at(i, len, p.wsola.shape, g.envelope)
+                            crate::stretch::shape_with_power(i, len, p.wsola.shape, power)
                         };
                         let step = if g.reverse {
                             span - (i as f32) * rate
@@ -503,6 +523,7 @@ impl Streamer for WsolaStream {
                 }
             }
 
+            self.search_job=None;
             self.write += hop_out as u64;
             self.index += 1;
             let nominal = self.nominal(self.write as f64, ratio, in_frames, scan);
@@ -512,6 +533,21 @@ impl Streamer for WsolaStream {
                 nominal * scan
             };
             self.read = crate::stretch::place(swept + g.layer_read, in_frames, g.wrap);
+        }
+
+        // Source files are immutable between calls. Search the next join over
+        // the remaining hop, with complete candidates in their original order.
+        // Replacing a source or changing search controls invalidates the job.
+        #[cfg(test)]
+        let ahead=!self.immediate_search;
+        #[cfg(not(test))]
+        let ahead=true;
+        if ahead {
+            self.prepare_search(input,channels,search,hop_out,p.wsola);
+            let calls=((self.write.saturating_sub(self.emitted) as usize).div_ceil(frames)).max(1);
+            let job=self.search_job.as_mut().unwrap();
+            let count=job.sweep.remaining().div_ceil(calls);
+        job.sweep.advance(input,channels,&self.expect,hop_out,p.wsola,count);
         }
 
         // Hand out the finished frames and clear them for reuse. Nothing can
