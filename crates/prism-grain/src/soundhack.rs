@@ -167,22 +167,84 @@ pub const DEFAULT_CONFIG: Config =
 
 // ---------------------------------------------------------------- the FFT
 
-/// `InitFFTTable`: per stage s, with m = 2^(s+1), sin(2π/m) and −2·sin²(π/m).
+use std::sync::OnceLock;
+
+/// Precomputed stage twiddle tables shared across all `FftTables` /
+/// `SoundHackStream` instances so polyphonic voices hit one L1-resident copy.
+struct StageTwiddles {
+    stages: usize,
+    /// Stage `s` occupies `[half - 1 .. 2 * half - 1]` where `half = 1 << s`.
+    fwd: Vec<(f32, f32)>,
+    inv: Vec<(f32, f32)>,
+}
+
+/// Covers up to `nc = 4096` complex points (8192-point real FFT). Because
+/// stages are laid out monotonically from `s = 0`, the default 1024-point
+/// SoundHack FFT (`nc = 512`, stages `0..9`) touches only the first 511 pairs
+/// (~4 KB per direction).
+const SHARED_STAGES: usize = 12;
+
+fn shared_twiddles(sin: &[f32; 31], cos1: &[f32; 31]) -> &'static StageTwiddles {
+    static TABLE: OnceLock<StageTwiddles> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let total = (1usize << SHARED_STAGES) - 1;
+        let mut fwd = Vec::with_capacity(total);
+        let mut inv = Vec::with_capacity(total);
+        for s in 0..SHARED_STAGES {
+            let half = 1usize << s;
+            let wpr = cos1[s];
+            for (dir_fwd, buf) in [(true, &mut fwd), (false, &mut inv)] {
+                let wpi = if dir_fwd { sin[s] } else { -sin[s] };
+                let (mut wr, mut wi) = (1.0f32, 0.0f32);
+                for _ in 0..half {
+                    buf.push((wr, wi));
+                    let next = (wpr * wr - wpi * wi) + wr;
+                    wi = wi + (wpr * wi + wr * wpi);
+                    wr = next;
+                }
+            }
+        }
+        StageTwiddles { stages: SHARED_STAGES, fwd, inv }
+    })
+}
+
+/// `InitFFTTable`: per stage s, with m = 2^(s+1), sin(2π/m) and −2·sin²(π/m),
+/// plus a reference to the shared precomputed `(wr, wi)` table built by the
+/// exact same recurrence so `fft` runs contiguous butterflies with one L1-hot
+/// table across all voices.
 pub struct FftTables {
     sin: [f32; 31],
     cos1: [f32; 31],
+    /// Number of stages (`s = 0..stages`) eligible for the precomputed path.
+    stages: usize,
+    twiddles: &'static StageTwiddles,
 }
 
 impl FftTables {
+    /// Precompute tables covering transforms up to `nc = 4096` complex points
+    /// (8192-point real FFT); larger transforms fall back to the recurrence.
     pub fn new() -> Self {
-        let mut t = FftTables { sin: [0.0; 31], cos1: [0.0; 31] };
+        Self::for_nc(4096)
+    }
+
+    /// Build tables for an `nc`-point complex FFT (a `2·nc`-point real FFT),
+    /// eagerly initializing the shared twiddle table off the audio thread.
+    pub(crate) fn for_nc(nc: usize) -> Self {
+        let mut sin = [0.0f32; 31];
+        let mut cos1 = [0.0f32; 31];
         for s in 0..31 {
             let m = (2u64 << s) as f32;
-            t.sin[s] = (TWO_PI / m).sin();
+            sin[s] = (TWO_PI / m).sin();
             let x = ((PI / m) as f64).sin();
-            t.cos1[s] = ((x * -2.0) * x) as f32;
+            cos1[s] = ((x * -2.0) * x) as f32;
         }
-        t
+        let twiddles = shared_twiddles(&sin, &cos1);
+        let stages = if nc > 1 {
+            (nc.next_power_of_two().trailing_zeros() as usize).min(twiddles.stages)
+        } else {
+            0
+        };
+        FftTables { sin, cos1, stages, twiddles }
     }
 }
 
@@ -215,29 +277,90 @@ fn fft(x: &mut [f32], nc: usize, forward: bool, t: &FftTables) {
         }
     }
     if n > 2 {
+        let twiddles = if forward { &t.twiddles.fwd } else { &t.twiddles.inv };
         let (mut mmax, mut s) = (2usize, 0usize);
         while n > mmax {
             let istep = 2 * mmax;
-            let wpi = if forward { t.sin[s] } else { -t.sin[s] };
-            let wpr = t.cos1[s];
-            let (mut wr, mut wi) = (1.0f32, 0.0f32);
-            let mut m = 0;
-            while m < mmax {
-                let mut i = m;
-                while i < n {
-                    let j = i + mmax;
-                    let tempr = wr * x[j] - wi * x[j + 1];
-                    let tempi = wr * x[j + 1] + wi * x[j];
-                    x[j] = x[i] - tempr;
-                    x[j + 1] = x[i + 1] - tempi;
-                    x[i] = tempr + x[i];
-                    x[i + 1] = tempi + x[i + 1];
-                    i += istep;
+            if s < t.stages && n % istep == 0 {
+                // Within a stage every butterfly touches a disjoint pair
+                // `(i, i + mmax)`. Visiting block-by-block with the precomputed
+                // `(wr, wi)` runs the identical floating-point ops per element
+                // in contiguous memory order.
+                let half = mmax >> 1;
+                let w = &twiddles[half - 1..half - 1 + half];
+                if half == 1 {
+                    let (wr, wi) = w[0];
+                    for chunk in x[..n].chunks_exact_mut(4) {
+                        let tempr = wr * chunk[2] - wi * chunk[3];
+                        let tempi = wr * chunk[3] + wi * chunk[2];
+                        let lr = chunk[0];
+                        let li = chunk[1];
+                        chunk[2] = lr - tempr;
+                        chunk[3] = li - tempi;
+                        chunk[0] = tempr + lr;
+                        chunk[1] = tempi + li;
+                    }
+                } else if half == 2 {
+                    let (wr0, wi0) = w[0];
+                    let (wr1, wi1) = w[1];
+                    for chunk in x[..n].chunks_exact_mut(8) {
+                        let tempr0 = wr0 * chunk[4] - wi0 * chunk[5];
+                        let tempi0 = wr0 * chunk[5] + wi0 * chunk[4];
+                        let lr0 = chunk[0];
+                        let li0 = chunk[1];
+                        chunk[4] = lr0 - tempr0;
+                        chunk[5] = li0 - tempi0;
+                        chunk[0] = tempr0 + lr0;
+                        chunk[1] = tempi0 + li0;
+
+                        let tempr1 = wr1 * chunk[6] - wi1 * chunk[7];
+                        let tempi1 = wr1 * chunk[7] + wi1 * chunk[6];
+                        let lr1 = chunk[2];
+                        let li1 = chunk[3];
+                        chunk[6] = lr1 - tempr1;
+                        chunk[7] = li1 - tempi1;
+                        chunk[2] = tempr1 + lr1;
+                        chunk[3] = tempi1 + li1;
+                    }
+                } else {
+                    for chunk in x[..n].chunks_exact_mut(istep) {
+                        let (lo, hi) = chunk.split_at_mut(mmax);
+                        for ((l, h), &(wr, wi)) in
+                            lo.chunks_exact_mut(2).zip(hi.chunks_exact_mut(2)).zip(w)
+                        {
+                            let tempr = wr * h[0] - wi * h[1];
+                            let tempi = wr * h[1] + wi * h[0];
+                            let lr = l[0];
+                            let li = l[1];
+                            h[0] = lr - tempr;
+                            h[1] = li - tempi;
+                            l[0] = tempr + lr;
+                            l[1] = tempi + li;
+                        }
+                    }
                 }
-                let next = (wpr * wr - wpi * wi) + wr;
-                wi = wi + (wpr * wi + wr * wpi);
-                wr = next;
-                m += 2;
+            } else {
+                let wpi = if forward { t.sin[s] } else { -t.sin[s] };
+                let wpr = t.cos1[s];
+                let (mut wr, mut wi) = (1.0f32, 0.0f32);
+                let mut m = 0;
+                while m < mmax {
+                    let mut i = m;
+                    while i < n {
+                        let j = i + mmax;
+                        let tempr = wr * x[j] - wi * x[j + 1];
+                        let tempi = wr * x[j + 1] + wi * x[j];
+                        x[j] = x[i] - tempr;
+                        x[j + 1] = x[i + 1] - tempi;
+                        x[i] = tempr + x[i];
+                        x[i + 1] = tempi + x[i + 1];
+                        i += istep;
+                    }
+                    let next = (wpr * wr - wpi * wi) + wr;
+                    wi = wi + (wpr * wi + wr * wpi);
+                    wr = next;
+                    m += 2;
+                }
             }
             mmax = istep;
             s += 1;
@@ -540,8 +663,76 @@ fn overlap_add(x: &[f32], ws: &[f32], y: &mut [f32], time: i64, n: usize, nw: us
     }
 }
 
+/// Fused `CartToPolar` + `SimpleSpectralGate`: compute amplitudes first, apply
+/// the gate, and evaluate `atan2` only for bins the gate keeps.
+///
+/// Bit-identical to `cart_to_polar` followed by `gate` when handed directly to
+/// `phase_interpolate`: for every bin that `gate` zeros (`spec[2 * k] == 0.0`),
+/// `phase_interpolate` immediately writes `spec[2 * k + 1] = last_synth[k]` and
+/// continues without reading `spec[2 * k + 1]`, and `polar_to_cart` ignores the
+/// phase of any zero-amplitude bin as well.
+fn cart_to_polar_gated(
+    x: &[f32],
+    spec: &mut [f32],
+    n2: usize,
+    under_max: f64,
+    min_amp: f64,
+) {
+    let mut peak = 0.0f32;
+    let amp0 = hypot_sh(x[0] as f64, 0.0) as f32;
+    spec[0] = amp0;
+    if amp0 > peak {
+        peak = amp0;
+    }
+    for k in 1..n2 {
+        let amp = hypot_sh(x[2 * k] as f64, x[2 * k + 1] as f64) as f32;
+        spec[2 * k] = amp;
+        if amp > peak {
+            peak = amp;
+        }
+    }
+    if n2 > 0 {
+        let ampn = hypot_sh(x[1] as f64, 0.0) as f32;
+        spec[2 * n2] = ampn;
+        if ampn > peak {
+            peak = ampn;
+        }
+    }
+
+    let thresh = (peak as f64 * under_max) as f32;
+    let a0 = spec[0];
+    if thresh > a0 || min_amp > a0 as f64 {
+        spec[0] = 0.0;
+    } else if a0 == 0.0 {
+        spec[1] = 0.0;
+    } else {
+        spec[1] = -(0.0f32.atan2(x[0]));
+    }
+    for k in 1..n2 {
+        let a = spec[2 * k];
+        if thresh > a || min_amp > a as f64 {
+            spec[2 * k] = 0.0;
+        } else if a == 0.0 {
+            spec[2 * k + 1] = 0.0;
+        } else {
+            spec[2 * k + 1] = -(x[2 * k + 1].atan2(x[2 * k]));
+        }
+    }
+    if n2 > 0 {
+        let an = spec[2 * n2];
+        if thresh > an || min_amp > an as f64 {
+            spec[2 * n2] = 0.0;
+        } else if an == 0.0 {
+            spec[2 * n2 + 1] = 0.0;
+        } else {
+            spec[2 * n2 + 1] = -(0.0f32.atan2(x[1]));
+        }
+    }
+}
+
 /// `SimpleSpectralGate`, as `PvocBlock` has it inlined: a bin under
 /// `under_max` of the frame's peak, or under `min_amp`, is silenced.
+#[cfg(test)]
 fn gate(spec: &mut [f32], n2: usize, under_max: f64, min_amp: f64) {
     let mut peak = 0.0f32;
     for k in 0..=n2 {
@@ -736,6 +927,9 @@ pub struct SoundHackStream {
     cfg: Config,
     version: Version,
     tables: FftTables,
+    /// Unscaled window built once for `cfg.nw` / `cfg.window`, copied into `wa`
+    /// and `ws` whenever `retune` rescales for new hops.
+    base_win: Vec<f32>,
     wa: Vec<f32>,
     ws: Vec<f32>,
     /// The hops the windows were last scaled for.
@@ -778,11 +972,14 @@ impl SoundHackStream {
         let (n, nw) = (cfg.n, cfg.nw);
         let bins = n / 2 + 1;
         let fifo_cap = max_block + nw / 8 + 1;
+        let mut base_win = vec![0.0; nw];
+        get_window(&mut base_win, nw, cfg.window);
         let mut s = SoundHackStream {
             channels,
             cfg,
             version: Version::default(),
-            tables: FftTables::new(),
+            tables: FftTables::for_nc(n / 2),
+            base_win,
             wa: vec![0.0; nw],
             ws: vec![0.0; nw],
             win_for: None,
@@ -828,8 +1025,8 @@ impl SoundHackStream {
         self.scale = scale_of(d, i);
         if self.win_for != Some((d, i)) {
             let nw = self.cfg.nw;
-            get_window(&mut self.wa, nw, self.cfg.window);
-            get_window(&mut self.ws, nw, self.cfg.window);
+            self.wa.copy_from_slice(&self.base_win);
+            self.ws.copy_from_slice(&self.base_win);
             scale_windows(&mut self.wa, &mut self.ws, self.cfg.n, nw, d, i, false);
             self.win_for = Some((d, i));
         }
@@ -883,8 +1080,13 @@ impl SoundHackStream {
             }
             window_fold(&self.inwin, &self.wa, &mut self.frame, self.in_t, n, nw);
             real_fft(&mut self.frame, n2, true, &self.tables);
-            cart_to_polar(&self.frame, &mut self.spec, n2);
-            gate(&mut self.spec, n2, self.cfg.under_max, self.cfg.min_amp);
+            cart_to_polar_gated(
+                &self.frame,
+                &mut self.spec,
+                n2,
+                self.cfg.under_max,
+                self.cfg.min_amp,
+            );
             phase_interpolate(
                 self.version,
                 &mut self.spec,
@@ -1466,6 +1668,83 @@ mod tests {
         for bin in [4.5, 4.693, 20.5] {
             assert!(level(bin, Version::V0888) > 0.3, "{bin}");
             assert!(level(bin, Version::V0896) < 0.02, "{bin}: {}", level(bin, Version::V0896));
+        }
+    }
+
+    /// Precomputed contiguous butterflies are bit-for-bit identical to the
+    /// strided recurrence on every element, forward and inverse.
+    #[test]
+    fn precomputed_fft_matches_strided_recurrence_bit_for_bit() {
+        let fallback = FftTables::for_nc(1); // stages == 0 -> runs the recurrence
+        for nc in [8usize, 64, 512, 1024] {
+            let fast = FftTables::for_nc(nc);
+            let input = busy(nc * 2, 1);
+            for forward in [true, false] {
+                let mut a = input.clone();
+                let mut b = input.clone();
+                real_fft(&mut a, nc, forward, &fallback);
+                real_fft(&mut b, nc, forward, &fast);
+                for (idx, (va, vb)) in a.iter().zip(&b).enumerate() {
+                    assert_eq!(
+                        va.to_bits(),
+                        vb.to_bits(),
+                        "nc={nc} forward={forward} idx={idx}: {va} vs {vb}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fused `cart_to_polar_gated` matches `cart_to_polar` + `gate` bit-for-bit
+    /// once passed through `phase_interpolate` and `polar_to_cart`, including
+    /// negative DC/Nyquist, exact zero bins, and both versions.
+    #[test]
+    fn fused_cart_to_polar_gated_matches_unfused_bit_for_bit() {
+        let n = 1024usize;
+        let n2 = n / 2;
+        let bins = n2 + 1;
+        let t = FftTables::for_nc(n2);
+        let mut frame_in = busy(n, 1);
+        real_fft(&mut frame_in, n2, true, &t);
+        // Exercise negative DC/Nyquist and exact zero bins.
+        frame_in[0] = -frame_in[0].abs().max(0.5);
+        frame_in[1] = -frame_in[1].abs().max(0.25);
+        frame_in[6] = 0.0;
+        frame_in[7] = 0.0;
+
+        for (under_max, min_amp) in [(DEFAULT_CONFIG.under_max, DEFAULT_CONFIG.min_amp), (0.0, 0.0)]
+        {
+            for v in [Version::V0888, Version::V0896] {
+                let mut spec_a = vec![0.0f32; n + 2];
+                let mut spec_b = vec![0.0f32; n + 2];
+                let mut la_a: Vec<f32> = (0..bins).map(|k| (k as f32) * 0.01 - 1.5).collect();
+                let mut ls_a: Vec<f32> = (0..bins).map(|k| (k as f32) * 0.02 - 2.0).collect();
+                let mut la_b = la_a.clone();
+                let mut ls_b = ls_a.clone();
+
+                cart_to_polar(&frame_in, &mut spec_a, n2);
+                gate(&mut spec_a, n2, under_max, min_amp);
+                phase_interpolate(v, &mut spec_a, &mut la_a, &mut ls_a, n2, 1.5);
+
+                cart_to_polar_gated(&frame_in, &mut spec_b, n2, under_max, min_amp);
+                phase_interpolate(v, &mut spec_b, &mut la_b, &mut ls_b, n2, 1.5);
+
+                let mut out_a = vec![0.0f32; n];
+                let mut out_b = vec![0.0f32; n];
+                polar_to_cart(&spec_a, &mut out_a, n2);
+                polar_to_cart(&spec_b, &mut out_b, n2);
+
+                for k in 0..spec_a.len() {
+                    assert_eq!(spec_a[k].to_bits(), spec_b[k].to_bits(), "spec[{k}] {v:?}");
+                }
+                for k in 0..bins {
+                    assert_eq!(la_a[k].to_bits(), la_b[k].to_bits(), "la[{k}] {v:?}");
+                    assert_eq!(ls_a[k].to_bits(), ls_b[k].to_bits(), "ls[{k}] {v:?}");
+                }
+                for k in 0..n {
+                    assert_eq!(out_a[k].to_bits(), out_b[k].to_bits(), "out[{k}] {v:?}");
+                }
+            }
         }
     }
 

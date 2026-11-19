@@ -290,6 +290,11 @@ impl BlockRenderer {
         }
 
         // Sum the voices. Spawn order, so the arithmetic matches offline.
+        let in_frames = src.frames();
+        let in_frames_f = in_frames as f32;
+        let last = in_frames.saturating_sub(1);
+        let src_channels = src.channels;
+        let src_ch_max = src_channels.saturating_sub(1);
         let mut w = 0;
         for v in 0..self.live {
             let voice = self.voices[v];
@@ -305,7 +310,7 @@ impl BlockRenderer {
                 voice.event.index,
                 channels,
             );
-            let skew = voice.shape.envelope;
+            let power = crate::grain::env_power(size, voice.shape.envelope);
             let reverse = voice.shape.reverse;
 
             // Where in this block the grain's next frame lands.
@@ -314,26 +319,56 @@ impl BlockRenderer {
             } else {
                 0
             };
+            let end = frames.min(start + size.saturating_sub(played));
 
-            for f in start..frames {
-                if played >= size {
-                    break;
+            if in_frames == 0 {
+                for f in start..end {
+                    let win = crate::grain::env_at_power(played, size, power);
+                    self.norm[f] += win;
+                    played += 1;
                 }
-                let win = crate::grain::env_at(played, size, skew);
-                let step = if reverse { (size - 1 - played) as f32 } else { played as f32 };
-                let pos = voice.event.src_frame + step * voice.event.rate;
-                for ch in 0..channels {
-                    // The device's channel count is not the file's. A mono file
-                    // on a stereo output feeds both sides; the source must be
-                    // indexed with its own stride, or the read runs off the end.
-                    let sch = ch.min(src.channels.saturating_sub(1));
-                    let pan = if ch == 0 { gl } else { gr };
-                    out[f * channels + ch] +=
-                        sample_at(&src.samples, src.channels, sch, pos, src.frames(), voice.shape.wrap)
-                            * win * pan;
-                }
-                self.norm[f] += win;
-                played += 1;
+            } else if voice.shape.wrap {
+                played = render_grain::<true>(
+                    &src.samples,
+                    src_channels,
+                    src_ch_max,
+                    in_frames,
+                    in_frames_f,
+                    last,
+                    &voice.event,
+                    size,
+                    played,
+                    start,
+                    end,
+                    power,
+                    reverse,
+                    gl,
+                    gr,
+                    channels,
+                    out,
+                    &mut self.norm,
+                );
+            } else {
+                played = render_grain::<false>(
+                    &src.samples,
+                    src_channels,
+                    src_ch_max,
+                    in_frames,
+                    in_frames_f,
+                    last,
+                    &voice.event,
+                    size,
+                    played,
+                    start,
+                    end,
+                    power,
+                    reverse,
+                    gl,
+                    gr,
+                    channels,
+                    out,
+                    &mut self.norm,
+                );
             }
 
             // Keep it only if it has frames left to sound.
@@ -410,35 +445,49 @@ fn shape_of(sp: &StreamParams) -> Shape {
     }
 }
 
-/// Linearly interpolated read, clamped at the edges. Identical to the offline
-/// renderer's.
-#[inline]
-fn sample_at(
-    input: &[f32],
-    channels: usize,
-    ch: usize,
-    pos: f32,
+/// Accumulate one grain into `out` and `norm` with `in_frames`, `power`, and
+/// `WRAP` already hoisted out of the sample loop.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn render_grain<const WRAP: bool>(
+    samples: &[f32],
+    src_channels: usize,
+    src_ch_max: usize,
     in_frames: usize,
-    wrap: bool,
-) -> f32 {
-    if in_frames == 0 {
-        return 0.0;
+    in_frames_f: f32,
+    last: usize,
+    event: &GrainEvent,
+    size: usize,
+    mut played: usize,
+    start: usize,
+    end: usize,
+    power: Option<f32>,
+    reverse: bool,
+    gl: f32,
+    gr: f32,
+    channels: usize,
+    out: &mut [f32],
+    norm: &mut [f32],
+) -> usize {
+    for f in start..end {
+        let win = crate::grain::env_at_power(played, size, power);
+        let step = if reverse { (size - 1 - played) as f32 } else { played as f32 };
+        let pos = event.src_frame + step * event.rate;
+        let (a, b, t) = crate::grain::sample_coords::<WRAP>(pos, in_frames, in_frames_f, last);
+        let a_base = a * src_channels;
+        let b_base = b * src_channels;
+        for ch in 0..channels {
+            // The device's channel count is not the file's. A mono file on a
+            // stereo output feeds both sides; the source must be indexed with
+            // its own stride, or the read runs off the end.
+            let sch = ch.min(src_ch_max);
+            let pan = if ch == 0 { gl } else { gr };
+            let s0 = samples[a_base + sch];
+            let s1 = samples[b_base + sch];
+            out[f * channels + ch] += (s0 + (s1 - s0) * t) * win * pan;
+        }
+        norm[f] += win;
+        played += 1;
     }
-    // Identical to the offline renderer's, wrap included. If these two ever
-    // disagree, what you hear and what gets written stop being the same sound.
-    let p = if wrap {
-        pos.rem_euclid(in_frames as f32)
-    } else {
-        pos.max(0.0)
-    };
-    let i = p.floor() as usize;
-    let t = p - i as f32;
-    let (a, b) = if wrap {
-        (i % in_frames, (i + 1) % in_frames)
-    } else {
-        (i.min(in_frames - 1), (i + 1).min(in_frames - 1))
-    };
-    let s0 = input[a * channels + ch];
-    let s1 = input[b * channels + ch];
-    s0 + (s1 - s0) * t
+    played
 }

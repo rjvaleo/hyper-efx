@@ -973,28 +973,27 @@ pub fn granular_with(
         let even = ((p.hop as u64 * layer as u64) / layers as u64) as f32;
         let offset = (even * spread) as usize;
 
+        let in_frames_f = in_frames as f32;
+        let last = in_frames - 1;
         for e in &grains(in_frames, sample_rate, ratio, semitones, window_ms, &lg) {
             let size = e.size as usize;
             // Stereo placement is per grain, so the cloud has width even from a
             // mono source. Equal power, scaled so the centre is unity and
             // turning the control up does not also turn the level down.
             let (gl, gr) = pan_gains(g, e.index, channels);
-            for i in 0..size {
-                let w = env_at(i, size, skew);
-                let dst = e.out_frame as usize + offset + i;
-                if dst >= p.out_frames + tail {
-                    break;
-                }
-                // The grain still lands where it landed; only the direction it
-                // reads its own span in is reversed.
-                let step = if g.reverse { (size - 1 - i) as f32 } else { i as f32 };
-                let src = e.src_frame + step * e.rate;
-                for ch in 0..channels {
-                    let pan = if ch == 0 { gl } else { gr };
-                    out[dst * channels + ch] +=
-                        sample_at(input, channels, ch, src, in_frames, g.wrap) * w * pan;
-                }
-                norm[dst] += w;
+            let power = env_power(size, skew);
+            let max_i = size.min((p.out_frames + tail).saturating_sub(e.out_frame as usize + offset));
+            let base_dst = e.out_frame as usize + offset;
+            if g.wrap {
+                accumulate_offline::<true>(
+                    input, channels, in_frames, in_frames_f, last, e, size, max_i, base_dst,
+                    power, g.reverse, gl, gr, &mut out, &mut norm,
+                );
+            } else {
+                accumulate_offline::<false>(
+                    input, channels, in_frames, in_frames_f, last, e, size, max_i, base_dst,
+                    power, g.reverse, gl, gr, &mut out, &mut norm,
+                );
             }
         }
     }
@@ -1127,6 +1126,34 @@ fn warp_power(n: usize, skew: f32) -> f32 {
     k.max(k_min.max(0.5))
 }
 
+/// Precompute the per-grain warp exponent once for [`env_at_power`].
+///
+/// Returns `None` when `skew` is symmetric (plain Hann) or `n <= 1`, or
+/// `Some(k)` with the exact exponent [`env_at`] uses for every sample of a
+/// grain of length `n`.
+#[inline]
+pub fn env_power(n: usize, skew: f32) -> Option<f32> {
+    if (skew - 0.5).abs() < 1e-4 || n <= 1 {
+        None
+    } else {
+        Some(warp_power(n, skew))
+    }
+}
+
+/// Same value as [`env_at`], using the per-grain exponent from [`env_power`].
+#[inline]
+pub fn env_at_power(i: usize, n: usize, power: Option<f32>) -> f32 {
+    let Some(k) = power else {
+        return hann_at(i, n);
+    };
+    if n <= 1 {
+        return 1.0;
+    }
+    let t = i as f32 / (n - 1) as f32;
+    let warped = t.powf(k);
+    0.5 - 0.5 * (2.0 * std::f32::consts::PI * warped).cos()
+}
+
 /// The grain envelope, with its peak moved.
 ///
 /// Warping the position before the cosine rather than reaching for a different
@@ -1143,48 +1170,76 @@ fn warp_power(n: usize, skew: f32) -> f32 {
 /// separate calls, and a second implementation is how they start to disagree.
 #[inline]
 pub fn env_at(i: usize, n: usize, skew: f32) -> f32 {
-    if (skew - 0.5).abs() < 1e-4 {
-        return hann_at(i, n);
-    }
-    if n <= 1 {
-        return 1.0;
-    }
-    let t = i as f32 / (n - 1) as f32;
-    let warped = t.powf(warp_power(n, skew));
-    0.5 - 0.5 * (2.0 * std::f32::consts::PI * warped).cos()
+    env_at_power(i, n, env_power(n, skew))
 }
 
-/// Linearly interpolated read, clamped at the edges.
+/// Linear-interpolation frame pair `(a, b)` and fraction `t` for a source read.
+///
+/// `WRAP` and the input length (`in_frames > 0`, `in_frames_f = in_frames as f32`,
+/// `last = in_frames - 1`) are hoisted out of the sample loop, and shared by both
+/// the offline and real-time renderers so they cannot drift apart.
 #[inline]
-fn sample_at(
-    input: &[f32],
-    channels: usize,
-    ch: usize,
+pub(crate) fn sample_coords<const WRAP: bool>(
     pos: f32,
     in_frames: usize,
-    wrap: bool,
-) -> f32 {
-    if in_frames == 0 {
-        return 0.0;
-    }
+    in_frames_f: f32,
+    last: usize,
+) -> (usize, usize, f32) {
     // Wrapped, the end of the file joins its beginning. Clamped, a grain that
     // reads past the end holds its final sample — which is silence with a DC
     // step in front of it, and audibly not the sound.
-    let p = if wrap {
-        pos.rem_euclid(in_frames as f32)
+    let p = if WRAP {
+        pos.rem_euclid(in_frames_f)
     } else {
         pos.max(0.0)
     };
     let i = p.floor() as usize;
     let t = p - i as f32;
-    let (a, b) = if wrap {
+    let (a, b) = if WRAP {
         (i % in_frames, (i + 1) % in_frames)
     } else {
-        (i.min(in_frames - 1), (i + 1).min(in_frames - 1))
+        (i.min(last), (i + 1).min(last))
     };
-    let s0 = input[a * channels + ch];
-    let s1 = input[b * channels + ch];
-    s0 + (s1 - s0) * t
+    (a, b, t)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn accumulate_offline<const WRAP: bool>(
+    input: &[f32],
+    channels: usize,
+    in_frames: usize,
+    in_frames_f: f32,
+    last: usize,
+    e: &GrainEvent,
+    size: usize,
+    max_i: usize,
+    base_dst: usize,
+    power: Option<f32>,
+    reverse: bool,
+    gl: f32,
+    gr: f32,
+    out: &mut [f32],
+    norm: &mut [f32],
+) {
+    for i in 0..max_i {
+        let w = env_at_power(i, size, power);
+        let dst = base_dst + i;
+        // The grain still lands where it landed; only the direction it reads
+        // its own span in is reversed.
+        let step = if reverse { (size - 1 - i) as f32 } else { i as f32 };
+        let pos = e.src_frame + step * e.rate;
+        let (a, b, t) = sample_coords::<WRAP>(pos, in_frames, in_frames_f, last);
+        let a_base = a * channels;
+        let b_base = b * channels;
+        for ch in 0..channels {
+            let pan = if ch == 0 { gl } else { gr };
+            let s0 = input[a_base + ch];
+            let s1 = input[b_base + ch];
+            out[dst * channels + ch] += (s0 + (s1 - s0) * t) * w * pan;
+        }
+        norm[dst] += w;
+    }
 }
 
 #[cfg(test)]
@@ -1608,5 +1663,48 @@ mod drift_clock {
         let b = s.next(&sp).pitch_semis;
         let bound = most_in_a_hop(&sp, 0.5);
         assert!((b - a).abs() <= bound, "a relabel moved the drift by {}; at most {bound} is drift", (b - a).abs());
+    }
+
+    /// Hoisted `env_power` and `sample_coords` produce the exact same bits as
+    /// the unhoisted formulas across symmetric/skewed envelopes and wrap modes.
+    #[test]
+    fn hoisted_env_power_and_sample_coords_are_bit_identical() {
+        for n in [1usize, 2, 16, 257, 1024] {
+            for skew in [0.0f32, 0.15, 0.49995, 0.5, 0.75, 1.0] {
+                let power = env_power(n, skew);
+                for i in 0..n {
+                    let expected = if (skew - 0.5).abs() < 1e-4 {
+                        hann_at(i, n)
+                    } else if n <= 1 {
+                        1.0
+                    } else {
+                        let t = i as f32 / (n - 1) as f32;
+                        let warped = t.powf(warp_power(n, skew));
+                        0.5 - 0.5 * (2.0 * std::f32::consts::PI * warped).cos()
+                    };
+                    let got = env_at_power(i, n, power);
+                    assert_eq!(got.to_bits(), expected.to_bits(), "n={n} skew={skew} i={i}");
+                }
+            }
+        }
+        let in_frames = 100usize;
+        for pos in [-12.3f32, -1e-6, 0.0, 0.5, 42.75, 99.0, 99.6, 100.0, 237.25] {
+            for wrap in [false, true] {
+                let p = if wrap { pos.rem_euclid(in_frames as f32) } else { pos.max(0.0) };
+                let i = p.floor() as usize;
+                let t = p - i as f32;
+                let (ea, eb) = if wrap {
+                    (i % in_frames, (i + 1) % in_frames)
+                } else {
+                    (i.min(in_frames - 1), (i + 1).min(in_frames - 1))
+                };
+                let (ga, gb, gt) = if wrap {
+                    sample_coords::<true>(pos, in_frames, in_frames as f32, in_frames - 1)
+                } else {
+                    sample_coords::<false>(pos, in_frames, in_frames as f32, in_frames - 1)
+                };
+                assert_eq!((ga, gb, gt.to_bits()), (ea, eb, t.to_bits()), "pos={pos} wrap={wrap}");
+            }
+        }
     }
 }
