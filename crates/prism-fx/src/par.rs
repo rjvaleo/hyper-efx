@@ -33,28 +33,16 @@ pub fn hash(left: &[f32], right: &[f32]) -> u64 {
 /// The scenario input: a tone, a burst of noise, a click and silence, different
 /// per side. Fixed for ever: changing it invalidates every golden.
 pub fn input() -> (Vec<f32>, Vec<f32>) {
-    let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut rnd = move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-    };
+    // 16,000 stereo frames, interleaved little-endian f32 (128,000 bytes).
+    // Captured from this function's original MacBook input, before replacing
+    // system sin: every machine must feed the goldens the same sample bits.
+    let bytes = include_bytes!("../tests/fixtures/input.f32");
+    assert_eq!(bytes.len(), FRAMES * 2 * std::mem::size_of::<f32>());
     let mut l = Vec::with_capacity(FRAMES);
     let mut r = Vec::with_capacity(FRAMES);
-    for n in 0..FRAMES {
-        let t = n as f32 / SAMPLE_RATE;
-        let tone = 0.5 * (2.0 * core::f32::consts::PI * 220.0 * t).sin();
-        let tone_r = 0.4 * (2.0 * core::f32::consts::PI * 331.0 * t).sin();
-        let (a, b) = match n / 2000 {
-            0 | 1 => (tone, tone_r),
-            2 => (rnd(), rnd() * 0.8),
-            3 => (if n % 2000 == 0 { 0.9 } else { 0.0 }, if n % 2000 == 7 { -0.9 } else { 0.0 }),
-            4 => (0.9 * tone.signum() * tone.abs().sqrt(), 0.2 * tone_r),
-            _ => (0.0, 0.0),
-        };
-        l.push(a);
-        r.push(b);
+    for frame in bytes.chunks_exact(8) {
+        l.push(f32::from_le_bytes(frame[..4].try_into().unwrap()));
+        r.push(f32::from_le_bytes(frame[4..].try_into().unwrap()));
     }
     (l, r)
 }

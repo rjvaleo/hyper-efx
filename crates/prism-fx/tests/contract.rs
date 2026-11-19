@@ -620,3 +620,34 @@ fn an_inert_control_on_the_panel_is_caught() {
     let errors = contract::check_descriptor(&ON_PANEL);
     assert!(errors.iter().any(|e| e.contains("inert")), "{errors:?}");
 }
+
+#[path = "../../prism-grain/tests/stage1_support/rt.rs"]
+mod rt;
+
+#[test]
+fn every_effect_processes_two_seconds_and_parameter_moves_without_allocating() {
+    rt::verify();
+    let mut results = Vec::new();
+    for entry in CATALOG {
+        let mut kernel = prism_fx::make(entry.descriptor.id, 48_000.0).unwrap();
+        let (mut l, mut r) = ([0.0; 128], [0.0; 128]);
+        rt::start();
+        for block in 0..750 {
+            if let Some(param) = entry.descriptor.params.first() {
+                let phase = (block % 101) as f32 / 100.0;
+                kernel.set_param(0, param.min + (param.max - param.min) * phase);
+            }
+            for i in 0..128 {
+                l[i] = (((block * 128 + i) as f32) * 0.027).sin() * 0.2;
+                r[i] = l[i];
+            }
+            kernel.process(&mut l, &mut r);
+        }
+        let counts = rt::stop();
+        results.push((entry.descriptor.id, counts));
+    }
+    for (name, counts) in &results {
+        println!("CONTRACT_RT|{name}|{}|{}|{}|{}", counts.alloc, counts.free, counts.realloc, counts.blocking);
+    }
+    assert!(results.iter().all(|(_, counts)| *counts == rt::Counts::default()), "callback allocations: {results:?}");
+}
