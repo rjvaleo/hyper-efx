@@ -137,6 +137,15 @@ pub trait Streamer: Send {
 
     /// Output frames produced so far.
     fn position(&self) -> u64;
+
+    /// Read further on (back, if negative), keeping everything the engine
+    /// holds: what a loop does when it goes round, in place of a seek, which
+    /// starts the engine over (`Stretcher::wrap`). The distance comes in both
+    /// forms an engine may keep its place in: `nominal`, frames of the sound
+    /// before Scan (where an anchor works), and `swept`, after it (where a read
+    /// that already moves at Scan's speed works). Nothing is allocated, and the
+    /// output carries on unbroken.
+    fn shift_read(&mut self, nominal: f64, swept: f64);
 }
 
 /// Waveform-similarity overlap-add, a block at a time.
@@ -384,6 +393,15 @@ impl Streamer for WsolaStream {
 
     fn set_octave(&mut self, factor: f64) {
         self.map_octave = factor;
+    }
+
+    fn shift_read(&mut self, nominal: f64, swept: f64) {
+        // The next window reads from the new place, and every one after it,
+        // through the anchor (before Scan, as `nominal` is); the windows already
+        // laid stay, so the splice search joins the two as it joins every window.
+        self.anchor.shift(nominal);
+        self.read = (self.read as f64 + swept).max(0.0) as usize;
+        self.search_job = None;
     }
 
     fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams) {
@@ -1194,6 +1212,14 @@ impl PitchRing {
 }
 
 impl<S: Streamer> Pitched<S> {
+    /// [`Streamer::shift_read`] for the engine inside: `by` is in frames of
+    /// the sound, and the engine reads the copy an octave level down, whose
+    /// frames are that many of the sound's.
+    pub fn shift_read(&mut self, nominal: f64, swept: f64) {
+        let d = crate::octave::factor(self.ring.level()) as f64;
+        self.inner.shift_read(nominal / d, swept / d);
+    }
+
     /// Wrap an engine. The engine is built by the caller because each has its
     /// own idea of what it needs; everything after that is common.
     pub fn new(inner: S, max_block: usize, channels: usize) -> Self {

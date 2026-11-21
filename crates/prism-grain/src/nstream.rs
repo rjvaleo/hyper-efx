@@ -146,6 +146,13 @@ impl NoiseJob {
 }
 
 impl NoiseStream {
+    /// Read `by` source frames further on, keeping everything else: see
+    /// [`crate::stream::Streamer::shift_read`].
+    pub fn shift_read(&mut self, nominal: f64, _swept: f64) {
+        // The anchor is before Scan (`source_at` applies it).
+        self.anchor.shift(nominal);
+    }
+
     pub fn new(max_block: usize, channels: usize) -> Self {
         let channels = channels.max(1);
         let bins = MAX_FFT / 2 + 1;

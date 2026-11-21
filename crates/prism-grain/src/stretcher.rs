@@ -46,6 +46,17 @@ pub struct LayerBank {
 }
 
 impl LayerBank {
+    /// Layer `i`'s engine reads `by` frames of the sound further on, keeping
+    /// all it holds: a loop going round (`Stretcher::wrap`).
+    pub fn shift_read(&mut self, i: usize, nominal: f64, by: f64) {
+        match self.algorithm {
+            Algorithm::Wsola => { if let Some(e) = self.wsola.get_mut(i) { e.shift_read(nominal, by) } }
+            Algorithm::Vocoder => { if let Some(e) = self.vocoder.get_mut(i) { e.shift_read(nominal, by) } }
+            Algorithm::Hybrid => { if let Some(e) = self.hybrid.get_mut(i) { e.shift_read(nominal, by) } }
+            Algorithm::Granular | Algorithm::SoundHack | Algorithm::Pvsola => {}
+        }
+    }
+
     /// Build the extra layers for one engine. Allocates; never call this from
     /// the audio thread.
     pub fn build(
@@ -636,6 +647,98 @@ impl Stretcher {
             if sp.cloud || self.standing_in() {
                 self.grain.rescale(out_frame, sp);
             }
+        }
+    }
+
+    /// A loop going round: the playhead goes back to `out_frame`, the loop's
+    /// start, and every engine reads from there on **without starting over**
+    /// (RJ, 21 Nov 2026; `WORK DIR/idmlab-move/LOOPS.md`). A seek here was
+    /// heard at every wrap: it re-primes the engine, about 4 ms for PVSOLA,
+    /// longer than a 128-frame block, so every lap dropped a block, and it is
+    /// why a loop could not be shorter than 64 frames. Now the grain cloud
+    /// carries its sounding grains over (`BlockRenderer::rescale`), and the
+    /// splice and spectral engines move their read by the same distance in the
+    /// sound (`Streamer::shift_read`), keeping their rings, windows and phases.
+    /// WSOLA reading through a transient map, and a switch of engine still
+    /// fading, are the two that still seek. Allocates and frees nothing.
+    pub fn wrap(&mut self, out_frame: u64, sp: &StreamParams) {
+        let mapped = self.current == Algorithm::Wsola && sp.wsola.preserve_transients;
+        // PVSOLA builds its rounds ahead (about 150 ms of reading at its
+        // defaults), so moving its read would only be heard after the rounds
+        // already built play out, past the loop's end. It seeks, which keeps
+        // its laps exact, and goes round no faster than once a round
+        // (`shortest_lap`), so the seek's cost stays a few percent.
+        if self.fading.is_some() || mapped || self.current == Algorithm::Pvsola {
+            self.seek(out_frame, sp);
+            return;
+        }
+        let delta = out_frame as i64 - self.position as i64;
+        let ratio = sp.ratio.clamp(0.01, 100.0) as f64;
+        let scan = sp.grain.scan.clamp(-4.0, 4.0) as f64;
+        // The read moves through the sound as the playhead's place in it does:
+        // before Scan, and after it.
+        let nominal = delta as f64 / ratio;
+        let by = nominal * scan;
+        self.position = out_frame;
+        match self.current {
+            Algorithm::Wsola => {
+                if let Some(e) = self.wsola.as_mut() {
+                    e.shift_read(nominal, by);
+                }
+            }
+            Algorithm::Vocoder => {
+                if let Some(e) = self.vocoder.as_mut() {
+                    e.shift_read(nominal, by);
+                }
+            }
+            Algorithm::Hybrid => {
+                if let Some(e) = self.hybrid.as_mut() {
+                    e.shift_read(nominal, by);
+                }
+            }
+            Algorithm::SoundHack => {
+                if let Some(e) = self.soundhack.as_mut() {
+                    e.shift_read(nominal, by);
+                }
+            }
+            Algorithm::Granular | Algorithm::Pvsola => {}
+        }
+        if self.current == Algorithm::Granular || sp.cloud || self.standing_in() {
+            self.grain.rescale(out_frame, sp);
+        }
+        // The extra layers go round with it, each from where it is.
+        let bank = self.bank.as_mut();
+        if let Some(bank) = bank {
+            for (i, v) in self.layer_at.iter_mut().enumerate() {
+                if *v == u64::MAX {
+                    continue;
+                }
+                *v = (*v as i64 + delta).max(0) as u64;
+                bank.shift_read(i, nominal, by);
+            }
+        }
+    }
+
+    /// Whether a lap of a loop is a seek under these settings (see `wrap`):
+    /// PVSOLA, and WSOLA reading through a transient map. Only those want the
+    /// seam faded; every other engine reads on unbroken.
+    pub fn lap_seeks(sp: &StreamParams) -> bool {
+        let alg = resolve(sp.algorithm);
+        alg == Algorithm::Pvsola || (alg == Algorithm::Wsola && sp.wsola.preserve_transients)
+    }
+
+    /// The fewest output frames between two laps of a loop. A loop shorter
+    /// than this goes round once every this many frames rather than every
+    /// sample: the engines read windows of tens of milliseconds, so a grain
+    /// held at the loop's start sounds the same, and a render call per sample
+    /// would cost far more. PVSOLA's lap is one of its rounds, since each of
+    /// its laps is a seek (see `wrap`).
+    pub fn shortest_lap(&self, sp: &StreamParams) -> usize {
+        if resolve(sp.algorithm) == Algorithm::Pvsola {
+            let n = crate::stretch::fft_size_for(sp.vocoder.window_ms, sp.sample_rate);
+            (sp.pvsola.anchor_frames.clamp(1, 64) as usize) * (n / 4).max(1)
+        } else {
+            32
         }
     }
 

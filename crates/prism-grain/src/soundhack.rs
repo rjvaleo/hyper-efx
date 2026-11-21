@@ -1156,6 +1156,12 @@ impl Streamer for SoundHackStream {
         self.start(out_frame, p.ratio, p.soundhack.version, Some(LIVE_PREROLL));
     }
 
+    fn shift_read(&mut self, nominal: f64, _swept: f64) {
+        // Its analysis reads `origin + in_t` on: moving the origin moves every
+        // read after it, and the phases carry on. It has no Scan of its own.
+        self.origin += nominal.round() as i64;
+    }
+
     fn position(&self) -> u64 {
         self.position
     }

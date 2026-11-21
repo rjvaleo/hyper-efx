@@ -42,6 +42,12 @@ impl Anchor {
         self.ratio = r;
     }
 
+    /// Read `by` source frames further on (back, if negative) from here on:
+    /// a loop going round moves the read without anything else starting over.
+    pub fn shift(&mut self, by: f64) {
+        self.off += by;
+    }
+
     /// Where `frame` reads from in the source at `ratio`.
     #[inline]
     pub fn source(&self, frame: f64, ratio: f32) -> f64 {

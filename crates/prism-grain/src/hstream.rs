@@ -95,6 +95,16 @@ pub struct HybridStream {
 }
 
 impl HybridStream {
+    /// Read `by` source frames further on, keeping everything else: see
+    /// [`crate::stream::Streamer::shift_read`].
+    pub fn shift_read(&mut self, nominal: f64, swept: f64) {
+        use crate::stream::Streamer;
+        self.harmonic.shift_read(nominal, swept);
+        self.percussive.shift_read(nominal, swept);
+        self.residual.shift_read(nominal, swept);
+        self.residual_wsola.shift_read(nominal, swept);
+    }
+
     pub fn new(max_block: usize, channels: usize, sample_rate: u32) -> Self {
         let channels = channels.max(1);
         let mut residual = NoiseStream::new(max_block, channels);
@@ -405,6 +415,12 @@ pub struct PitchedHybrid {
 }
 
 impl PitchedHybrid {
+    /// [`HybridStream::shift_read`], `by` in frames of the sound.
+    pub fn shift_read(&mut self, nominal: f64, swept: f64) {
+        let d = crate::octave::factor(self.ring.level()) as f64;
+        self.inner.shift_read(nominal / d, swept / d);
+    }
+
     pub fn new(max_block: usize, channels: usize, sample_rate: u32) -> Self {
         let channels = channels.max(1);
         PitchedHybrid {

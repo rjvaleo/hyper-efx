@@ -288,12 +288,27 @@ impl Streamer for VocoderStream {
     fn seek(&mut self, out_frame: u64, input_frames: usize, p: &StretchParams) {
         VocoderStream::seek(self, out_frame, input_frames, p)
     }
+    fn shift_read(&mut self, nominal: f64, swept: f64) {
+        VocoderStream::shift_read(self, nominal, swept)
+    }
     fn render(&mut self, out: &mut [f32], channels: usize, input: &[f32], p: &StretchParams) {
         VocoderStream::render(self, out, channels, input, p)
     }
 }
 
 impl VocoderStream {
+    /// Read `by` source frames further on, keeping everything else: see
+    /// [`crate::stream::Streamer::shift_read`].
+    pub fn shift_read(&mut self, _nominal: f64, swept: f64) {
+        // Its read already moves at Scan's speed.
+        self.read = (self.read + swept).max(0.0);
+        // A jump, as its own wrap is: no hop is measured across it, and the
+        // phases carry on, so the seam is phase-continuous.
+        self.prev_start = -1;
+        self.ended = false;
+        self.job = None;
+    }
+
     pub fn new(max_block: usize, channels: usize) -> Self {
         let channels = channels.max(1);
         let bins = MAX_FFT / 2 + 1;
